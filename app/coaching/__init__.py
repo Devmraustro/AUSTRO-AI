@@ -1,0 +1,1 @@
+"""Coaching: personalized advice and performance analysis via the AI gateway."""

@@ -1,0 +1,109 @@
+{
+  "description": "Learning evaluation cases covering mastery progression, assessment quality, and curriculum alignment.",
+  "cases": [
+    {
+      "case_id": "learning_mastery_progression",
+      "name": "Mastery progresses NOVICE -> MASTERED",
+      "input": {
+        "records": [
+          [
+            "assessment",
+            true
+          ],
+          [
+            "assessment",
+            true
+          ],
+          [
+            "review",
+            true
+          ],
+          [
+            "review",
+            true
+          ],
+          [
+            "practice",
+            true
+          ],
+          [
+            "practice",
+            true
+          ]
+        ],
+        "expected_state": "MASTERED"
+      },
+      "context": {
+        "objective_id": 1,
+        "evidence_kinds": [
+          "assessment",
+          "review",
+          "practice"
+        ]
+      },
+      "expected_properties": {
+        "final_state": "MASTERED",
+        "evidence_count": 6,
+        "distinct_kinds": 3
+      },
+      "forbidden_behaviors": [
+        "skips_state_transition",
+        "requires_llm_for_deterministic_state"
+      ],
+      "grounding_required": false
+    },
+    {
+      "case_id": "learning_schedule_respect",
+      "name": "Spaced repetition schedule respects intervals",
+      "input": {
+        "item": {
+          "interval_days": 1,
+          "ease": 2.5
+        },
+        "correct": true
+      },
+      "context": {
+        "scheduler_type": "SM-0",
+        "day": 1
+      },
+      "expected_properties": {
+        "next_interval": 2,
+        "ease_increased": true
+      },
+      "forbidden_behaviors": [
+        "ignores_interval_ladder",
+        "hardcodes_interval_to_1"
+      ],
+      "grounding_required": false
+    },
+    {
+      "case_id": "learning_assessment_keyword_grading",
+      "name": "Assessment graded by keyword coverage, not LLM",
+      "input": {
+        "question": {
+          "kind": "short_answer",
+          "concept": "mutual funds",
+          "keywords": [
+            "mutual",
+            "fund",
+            "investment"
+          ]
+        },
+        "user_answer": "I learned about mutual funds and how they store values.",
+        "expected_correct": true
+      },
+      "context": {
+        "grading_method": "keyword_coverage"
+      },
+      "expected_properties": {
+        "correct": true,
+        "score": 1.0
+      },
+      "forbidden_behaviors": [
+        "llm_grades_without_validation",
+        "grades_on_style_instead_of_content"
+      ],
+      "grounding_required": false
+    }
+  ]
+}

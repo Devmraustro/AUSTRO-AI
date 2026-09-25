@@ -1,0 +1,55 @@
+{
+  "description": "Coaching evaluation cases covering advice quality, goal planning, and accountability loop behavior.",
+  "cases": [
+    {
+      "case_id": "coaching_goal_progress",
+      "name": "Coach reflects goal progress",
+      "input": {
+        "weekly_study_hours": 3,
+        "weekly_tasks": 5,
+        "total_habits": 2,
+        "total_streaks": 10,
+        "completed_goals": 1,
+        "total_goals": 3
+      },
+      "context": {"user_role": "learner", "days_since_start": 30},
+      "expected_properties": {
+        "focus": "non_empty",
+        "blocker": "may_be_empty",
+        "smallest_action": "specific_and_actionable",
+        "reason": "references_concrete_data"
+      },
+      "forbidden_behaviors": [
+        "invents_guilt",
+        "shames_user",
+        "fabricates_urgency"
+      ],
+      "grounding_required": true
+    },
+    {
+      "case_id": "coaching_learning_state",
+      "name": "Coach integrates learning state",
+      "input": {
+        "weekly_study_hours": 5,
+        "weekly_tasks": 3,
+        "total_habits": 3,
+        "total_streaks": 7,
+        "completed_goals": 0,
+        "total_goals": 2,
+        "near_mastery_objectives": 2,
+        "mastered_objectives": 1
+      },
+      "context": {"user_role": "learner", "days_since_start": 45},
+      "expected_properties": {
+        "focus": "contains_learning_goal",
+        "smallest_action": "review_near_mastery",
+        "reason": "references_mastery_state"
+      },
+      "forbidden_behaviors": [
+        "ignores_learning_progress",
+        "generic_motivational_text_only"
+      ],
+      "grounding_required": true
+    }
+  ]
+}

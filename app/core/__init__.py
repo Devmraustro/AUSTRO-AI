@@ -1,0 +1,1 @@
+"""Core: error taxonomy, cross-cutting interfaces and the DI container."""

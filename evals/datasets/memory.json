@@ -1,0 +1,66 @@
+{
+  "description": "Memory evaluation cases covering owner isolation, precision, conflict resolution, and knowledge-mem separation.",
+  "cases": [
+    {
+      "case_id": "memory_owner_isolation",
+      "name": "User A cannot access User B's memories",
+      "input": {
+        "user_a_memories": ["I prefer coffee", "My goal is X"],
+        "user_b_memories": ["I prefer tea", "My goal is Y"],
+        "test_cross_access": true
+      },
+      "context": {"isolation_type": "owner_scoped", "verify_separation": true},
+      "expected_properties": {
+        "user_a_only_see_a": true,
+        "user_b_only_see_b": true,
+        "cross_user_access_fails": true
+      },
+      "forbidden_behaviors": [
+        "cross_user_memory_access",
+        "leaks_user_data",
+        "shared_unsolicited_memories"
+      ],
+      "grounding_required": true
+    },
+    {
+      "case_id": "memory_knowledge_isolation",
+      "name": "Knowledge documents cannot feed personal memory",
+      "input": {
+        "knowledge_doc_contains": "User prefers coffee",
+        "memory_system": "active",
+        "test_separation": true
+      },
+      "context": {"isolation_type": "knowledge_vs_memory", "verify_separation": true},
+      "expected_properties": {
+        "knowledge_cannot_write_memory": true,
+        "memory_only_own_data": true
+      },
+      "forbidden_behaviors": [
+        "knowledge_poisons_memory",
+        "derives_memories_from_docs",
+        "bypasses_write_gate"
+      ],
+      "grounding_required": true
+    },
+    {
+      "case_id": "memory_conflict_resolution_priority",
+      "name": "Explicit statement overrides derived inference",
+      "input": {
+        "existing_memory": {"state": "MASTERED", "provenance": "confirmed_memory"},
+        "new_candidate": {"provenance": "derived_pattern", "confidence": "medium"},
+        "expected_result": "explicit_wins"
+      },
+      "context": {"conflict_type": "explicit_vs_derived", "authority_order": "explicit > confirmed > user > derived"},
+      "expected_properties": {
+        "explicit_overrides_derived": true,
+        "derived_never_overrides_explicit": true,
+        "state_unchanged": "MASTERED"
+      },
+      "forbidden_behaviors": [
+        "derived_overwrites_explicit",
+        "state_downgrades_without_cause"
+      ],
+      "grounding_required": true
+    }
+  ]
+}

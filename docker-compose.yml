@@ -1,0 +1,81 @@
+# AUSTRO AI — PRODUCTION APPLICATION STACK
+#
+# ARCHITECTURE (selected explicitly): B — EXTERNALLY MANAGED PostgreSQL.
+# The application container connects to a separately provisioned PostgreSQL
+# (managed service or dedicated host) identified by DB_HOST/DB_PORT/DB_NAME/
+# DB_USER/DB_PASSWORD. There is NO application-embedded database volume.
+#
+# The optional `docker-compose.infra.yml` provides a LOCAL-ONLY PostgreSQL for
+# development / DR drills and must NOT be used for production persistence.
+#
+# Run: docker compose --env-file .env up -d
+# REQUIRED .env values: BOT_TOKEN, GEMINI_API_KEY, DB_PASSWORD, WEBHOOK_URL,
+#                       WEBHOOK_SECRET, DB_HOST
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: austro-app
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      AUSTRO_ENVIRONMENT: production
+      AUSTRO_LOG_LEVEL: WARNING
+      USE_LOCAL_FALLBACK: "false"
+      WEBHOOK_URL: ${WEBHOOK_URL}
+      WEBHOOK_PORT: ${WEBHOOK_PORT:-8443}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET}
+      # Externally-managed PostgreSQL connection (architecture B)
+      DB_ENGINE: postgresql
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT:-5432}
+      DB_NAME: ${DB_NAME:-austro_ai}
+      DB_USER: ${DB_USER:-austro}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+      DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-30}
+      DB_POOL_RECYCLE: ${DB_POOL_RECYCLE:-1800}
+    ports:
+      - "${WEBHOOK_PORT:-8443}:${WEBHOOK_PORT:-8443}"
+    volumes:
+      - knowledge_storage:/app/knowledge_storage
+      - logs:/app/logs
+      - backups:/app/backups
+    restart: unless-stopped
+    # Startup ordering / DB readiness is handled by docker-entrypoint.sh
+    # (poll DB_HOST until reachable, then apply migrations before boot).
+
+  # LOCAL-ONLY reference PostgreSQL (dev / DR drills). Wire-production must
+  # point DB_HOST at the externally managed instance instead.
+  postgres:
+    image: postgres:16-alpine
+    container_name: austro-postgres
+    profiles: ["local-infra"]
+    environment:
+      POSTGRES_DB: ${DB_NAME:-austro_ai}
+      POSTGRES_USER: ${DB_USER:-austro}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-austro} -d ${DB_NAME:-austro_ai}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  knowledge_storage:
+  logs:
+  backups:
+  postgres_data:
+
+networks:
+  default:
+    name: austro-network

@@ -1,0 +1,1 @@
+"""Domain: typed DTOs used across layers (entities, context, AI)."""

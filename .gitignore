@@ -1,0 +1,38 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Virtual environments
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Test runtime
+.pytest_tmp/
+
+# Runtime databases
+app.db
+*.db
+*.sqlite
+*.sqlite3
+database/*.db
+
+# Runtime storage
+knowledge_storage/
+backups/
+logs/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Generated runtime outputs
+audit-report.json
+baseline-results.json

@@ -1,0 +1,1 @@
+"""Observability: logging setup with secret redaction."""

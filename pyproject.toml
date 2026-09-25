@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "austro-ai"
+version = "0.1.0"
+description = "AUSTRO AI personal accountability and productivity Telegram bot"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "python-telegram-bot[job-queue]>=22.8,<23",
+    "python-dotenv>=1.0,<2",
+    "requests>=2.31,<3",
+    "pypdf>=6.1.3,<7",
+]
+
+[tool.setuptools]
+py-modules = ["main", "handlers", "config", "database", "reminder_scheduler", "redaction"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.pyflakes]
+# Run with: python -m pyflakes main.py handlers.py config.py database.py reminder_scheduler.py redaction.py app tests

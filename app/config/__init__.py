@@ -1,0 +1,1 @@
+"""Config: validated environment settings + static prompt/resource library."""

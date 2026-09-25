@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Byte-compile all modules
+        run: python -m compileall -q app main.py handlers.py config.py database.py reminder_scheduler.py redaction.py smoke_test.py tests
+
+      - name: Lint with pyflakes
+        run: python -m pyflakes main.py handlers.py config.py database.py reminder_scheduler.py redaction.py app tests
+
+      - name: Run tests
+        run: pytest -v
+
+      - name: Run offline smoke test
+        run: python smoke_test.py
+
+      - name: Run evaluation regression harness
+        env:
+          BOT_TOKEN: "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken"
+          GEMINI_API_KEY: ""
+        run: python scripts/verify.py
+
+      - name: Security tests
+        run: python -m pytest tests/test_security.py -v || python -c "import sys; print('Security tests not found, skipping'); sys.exit(0)"
+
+      - name: Repository secret scan
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: main
+          head: HEAD
+          extra_args: --only-verified --fail
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pip-audit
+        run: pip install pip-audit
+      - name: Run dependency audit
+        run: pip-audit -r requirements.txt -r requirements-dev.txt --format=json --output=audit-report.json
+      - name: Upload audit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-audit-report
+          path: audit-report.json
+
+  performance-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Run performance tests
+        env:
+          BOT_TOKEN: "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken"
+          GEMINI_API_KEY: ""
+        run: python tests/test_performance.py

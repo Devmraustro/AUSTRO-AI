@@ -1,0 +1,1 @@
+"""Security: secret redaction for logs and error surfaces."""
