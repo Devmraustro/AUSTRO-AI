@@ -50,14 +50,19 @@ jobs:
       - name: Run offline smoke test
         run: python smoke_test.py
 
-      - name: Run evaluation regression harness
+      - name: Run PostgreSQL integration tests
         env:
-          DB_ENGINE: postgresql
           DB_HOST: localhost
           DB_PORT: 5432
-          DB_NAME: austro_ai
           DB_USER: austro
           DB_PASSWORD: austro_ci
+          DB_TEST_NAME: austro_ai_pgtest
+          DB_ADMIN_USER: postgres
+          DB_ADMIN_PASSWORD: austro_ci
+        run: python -m pytest tests/test_repositories_pg.py -v
+
+      - name: Run evaluation regression harness
+        env:
           BOT_TOKEN: "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken"
           GEMINI_API_KEY: ""
         run: python scripts/verify.py
