@@ -8,9 +8,26 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      BOT_TOKEN: "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken"
+      GEMINI_API_KEY: ""
     strategy:
       matrix:
         python-version: ["3.12"]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: austro_ai
+          POSTGRES_USER: austro
+          POSTGRES_PASSWORD: austro_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U austro -d austro_ai"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
     steps:
       - uses: actions/checkout@v4
 
@@ -35,6 +52,12 @@ jobs:
 
       - name: Run evaluation regression harness
         env:
+          DB_ENGINE: postgresql
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_NAME: austro_ai
+          DB_USER: austro
+          DB_PASSWORD: austro_ci
           BOT_TOKEN: "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken"
           GEMINI_API_KEY: ""
         run: python scripts/verify.py
