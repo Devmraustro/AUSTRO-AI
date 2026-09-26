@@ -57,9 +57,14 @@ jobs:
           DB_USER: austro
           DB_PASSWORD: austro_ci
           DB_TEST_NAME: austro_ai_pgtest
-          DB_ADMIN_USER: postgres
+          DB_ADMIN_USER: austro
           DB_ADMIN_PASSWORD: austro_ci
-        run: python -m pytest tests/test_repositories_pg.py -v
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_repositories_pg.py -q --tb=short 2>&1 | tee /tmp/pg_results.log
+          grep -q "18 passed" /tmp/pg_results.log || { echo "ERROR: Expected 18 passed"; exit 1; }
+          grep -q "skipped" /tmp/pg_results.log && { echo "ERROR: Tests were skipped"; exit 1; } || true
+          echo "PostgreSQL integration tests: 18 passed, 0 skipped"
 
       - name: Run evaluation regression harness
         env:

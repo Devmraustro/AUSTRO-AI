@@ -16,6 +16,7 @@ import json
 import os
 import sys
 from datetime import datetime
+from typing import Any, Dict
 
 # Set required environment variables BEFORE any app imports
 os.environ["BOT_TOKEN"] = "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken"
@@ -75,13 +76,12 @@ def run_all() -> Dict[str, Any]:
     overall_rate = sum(1 for v in checks.values() if v) / len(checks) if checks else 1.0
 
     # Load existing baseline
-    baseline = None
     if os.path.exists(BASELINE_PATH):
         try:
             with open(BASELINE_PATH, "r", encoding="utf-8") as f:
-                baseline = json.load(f)
+                _ = json.load(f)
         except Exception:
-            baseline = None
+            pass
 
     # Write current results as baseline
     baseline_payload = {
@@ -119,17 +119,14 @@ def main():
     output = run_all()
 
     # Print human-readable summary
-    print(f"\n=== AUSTRO AI Phase F Regression Harness ===")
+    print("\n=== AUSTRO AI Phase F Regression Harness ===")
     print(f"Timestamp: {output['results']['rag']['timestamp']}")
     print()
 
-    all_suite_passed = True
     for suite_name, suite_result in output["results"].items():
         passed = suite_result["passed"]
         threshold = suite_result["threshold"]
         status = "PASS" if passed else "FAIL"
-        if not passed:
-            all_suite_passed = False
         v_preview = suite_result["violations"][:3]
         print(f"  {suite_name:8s}: {status} (/{threshold:.0f} threshold) — "
               f"{', '.join(v_preview) if v_preview else ''}")
