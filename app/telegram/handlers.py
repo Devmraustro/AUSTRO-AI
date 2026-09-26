@@ -25,6 +25,7 @@ from app.config.prompts import ARABIC_RESPONSES
 from app.core.container import get_services
 from app.core.errors import ValidationError
 from app.domain.entities import DailyReviewData, NewGoal, NewHabit, NewPlan
+from app.security.rate_limiter import get_rate_limit_middleware
 
 import io
 import json
@@ -522,6 +523,16 @@ async def study_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def study_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle topic and generate the explanation via the learning service."""
+    _rl = get_rate_limit_middleware()
+    user_id = update.effective_user.id
+    allowed, msg = await _rl.check_ai_limit(user_id)
+    if not allowed:
+        await update.message.reply_text(msg)
+        return
+    allowed, msg = await _rl.check_global_ai_limit()
+    if not allowed:
+        await update.message.reply_text(msg)
+        return
     services = get_services(context)
     concept = context.user_data.get("study_subject")
     subject = update.message.text
@@ -557,6 +568,16 @@ async def study_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def study_duration(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle test topic and generate the test via the learning service."""
+    _rl = get_rate_limit_middleware()
+    user_id = update.effective_user.id
+    allowed, msg = await _rl.check_ai_limit(user_id)
+    if not allowed:
+        await update.message.reply_text(msg)
+        return
+    allowed, msg = await _rl.check_global_ai_limit()
+    if not allowed:
+        await update.message.reply_text(msg)
+        return
     services = get_services(context)
     topic = update.message.text
 
@@ -600,6 +621,16 @@ async def menu_english(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def english_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generate an English lesson via the learning service."""
+    _rl = get_rate_limit_middleware()
+    user_id = update.effective_user.id
+    allowed, msg = await _rl.check_ai_limit(user_id)
+    if not allowed:
+        await update.callback_query.answer(msg, show_alert=True)
+        return
+    allowed, msg = await _rl.check_global_ai_limit()
+    if not allowed:
+        await update.callback_query.answer(msg, show_alert=True)
+        return
     services = get_services(context)
     query = update.callback_query
     await query.answer()
@@ -634,6 +665,16 @@ async def english_correct(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def english_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle English text correction via the learning service."""
+    _rl = get_rate_limit_middleware()
+    user_id = update.effective_user.id
+    allowed, msg = await _rl.check_ai_limit(user_id)
+    if not allowed:
+        await update.message.reply_text(msg)
+        return
+    allowed, msg = await _rl.check_global_ai_limit()
+    if not allowed:
+        await update.message.reply_text(msg)
+        return
     services = get_services(context)
     text = update.message.text
 
@@ -699,6 +740,16 @@ async def code_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def code_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle code review via the learning service."""
+    _rl = get_rate_limit_middleware()
+    user_id = update.effective_user.id
+    allowed, msg = await _rl.check_ai_limit(user_id)
+    if not allowed:
+        await update.message.reply_text(msg)
+        return
+    allowed, msg = await _rl.check_global_ai_limit()
+    if not allowed:
+        await update.message.reply_text(msg)
+        return
     services = get_services(context)
     code = update.message.text
     language = context.user_data.get("code_language", "python")
@@ -933,6 +984,16 @@ async def menu_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_coach(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show coach menu."""
+    _rl = get_rate_limit_middleware()
+    user_id = update.effective_user.id
+    allowed, msg = await _rl.check_ai_limit(user_id)
+    if not allowed:
+        await update.callback_query.answer(msg, show_alert=True)
+        return
+    allowed, msg = await _rl.check_global_ai_limit()
+    if not allowed:
+        await update.callback_query.answer(msg, show_alert=True)
+        return
     services = get_services(context)
     query = update.callback_query
     await query.answer()
@@ -963,6 +1024,16 @@ async def menu_coach(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def coach_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show performance analysis."""
+    _rl = get_rate_limit_middleware()
+    user_id = update.effective_user.id
+    allowed, msg = await _rl.check_ai_limit(user_id)
+    if not allowed:
+        await update.callback_query.answer(msg, show_alert=True)
+        return
+    allowed, msg = await _rl.check_global_ai_limit()
+    if not allowed:
+        await update.callback_query.answer(msg, show_alert=True)
+        return
     services = get_services(context)
     query = update.callback_query
     await query.answer()
@@ -1551,8 +1622,13 @@ async def knowledge_settings(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def knowledge_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle a book file uploaded by the user (presentation adapter)."""
+    _rl = get_rate_limit_middleware()
     services = get_services(context)
     user_id = update.effective_user.id
+    allowed, msg = await _rl.check_upload_limit(user_id)
+    if not allowed:
+        await update.message.reply_text(msg)
+        return
     document = update.message.document
     if document is None:
         return
@@ -1591,6 +1667,11 @@ async def knowledge_document(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if result.get("duplicate"):
         await update.message.reply_text("📚 هذا الكتاب موجود في مكتبتك بالفعل.")
+        return
+
+    allowed, msg = await _rl.check_ingestion_limit(user_id)
+    if not allowed:
+        await update.message.reply_text(msg)
         return
 
     source_id = result.get("source_id")
@@ -1643,12 +1724,17 @@ async def _ingest_book(context: ContextTypes.DEFAULT_TYPE, user_id: int,
 
 async def knowledge_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Answer a question about the user's books (only in ask mode)."""
+    _rl = get_rate_limit_middleware()
+    user_id = update.effective_user.id
+    allowed, msg = await _rl.check_ai_limit(user_id)
+    if not allowed:
+        await update.message.reply_text(msg)
+        return
     if context.user_data.get("knowledge_mode") != "ask":
         return
     context.user_data["knowledge_mode"] = None
 
     services = get_services(context)
-    user_id = update.effective_user.id
     question = update.message.text or ""
     await update.message.reply_text("🔍 جاري البحث في كتبك...")
     try:
@@ -2130,6 +2216,16 @@ async def _learning_curriculum(services, user_id: int) -> dict:
 
 async def menu_learn_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start / continue the next lesson."""
+    _rl = get_rate_limit_middleware()
+    user_id = update.effective_user.id
+    allowed, msg = await _rl.check_ai_limit(user_id)
+    if not allowed:
+        await update.callback_query.answer(msg, show_alert=True)
+        return
+    allowed, msg = await _rl.check_global_ai_limit()
+    if not allowed:
+        await update.callback_query.answer(msg, show_alert=True)
+        return
     query = update.callback_query
     await query.answer()
     services = get_services(context)
@@ -2514,6 +2610,16 @@ async def learn_goal_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def learn_objectives_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _rl = get_rate_limit_middleware()
+    user_id = update.effective_user.id
+    allowed, msg = await _rl.check_ai_limit(user_id)
+    if not allowed:
+        await update.message.reply_text(msg)
+        return
+    allowed, msg = await _rl.check_global_ai_limit()
+    if not allowed:
+        await update.message.reply_text(msg)
+        return
     services = get_services(context)
     user_id = update.effective_user.id
     text = (update.message.text or "").strip()

@@ -295,28 +295,41 @@ class RateLimitMiddleware:
     
     async def check_command_limit(self, user_id: int) -> tuple[bool, str]:
         """Check command rate limit, return (allowed, error_message)."""
-        result = await check_command_rate_limit(user_id)
+        result = self.limiter.check_limit(user_id, "command")
         if not result.allowed:
-            return False, f"⚡ Too many commands. Try again in {result.retry_after:.0f}s."
+            return False, f"⚠️ وصلت إلى حد الأوامر. حاول مرة أخرى بعد {result.retry_after:.0f} ثانية."
         return True, ""
-    
+
     async def check_ai_limit(self, user_id: int) -> tuple[bool, str]:
         """Check AI request limit."""
-        result = await check_ai_request_rate_limit(user_id)
+        result = self.limiter.check_limit(user_id, "ai_request")
         if not result.allowed:
-            return False, f"⚡ Too many AI requests. Try again in {result.retry_after:.0f}s."
+            return False, f"⚠️ وصلت إلى حد الطلبات الذكية. حاول مرة أخرى بعد {result.retry_after:.0f} ثانية."
         return True, ""
-    
+
+    async def check_global_ai_limit(self) -> tuple[bool, str]:
+        """Check global AI request limit."""
+        result = self.limiter.check_global_ai_limit()
+        if not result.allowed:
+            return False, f"⚠️ وصلت إلى الحد الأقصى للاستخدام الذكي عالمياً. حاول مرة أخرى بعد {result.retry_after:.0f} ثانية."
+        return True, ""
+
     async def check_upload_limit(self, user_id: int) -> tuple[bool, str]:
-        result = await check_upload_rate_limit(user_id)
+        result = self.limiter.check_limit(user_id, "upload")
         if not result.allowed:
-            return False, f"⚡ Upload limit reached. Try again in {result.retry_after:.0f}s."
+            return False, f"⚠️ وصلت إلى حد الرفع. حاول مرة أخرى بعد {result.retry_after:.0f} ثانية."
         return True, ""
-    
+
     async def check_ingestion_limit(self, user_id: int) -> tuple[bool, str]:
-        result = await check_ingestion_rate_limit(user_id)
+        result = self.limiter.check_limit(user_id, "ingestion")
         if not result.allowed:
-            return False, f"⚡ Too many ingestions. Try again in {result.retry_after:.0f}s."
+            return False, f"⚠️ وصلت إلى حد معالجة الكتب. حاول مرة أخرى بعد {result.retry_after:.0f} ثانية."
+        return True, ""
+
+    async def check_expensive_limit(self, user_id: int) -> tuple[bool, str]:
+        result = self.limiter.check_limit(user_id, "expensive")
+        if not result.allowed:
+            return False, f"⚠️ وصلت إلى حد العمليات المكلفة. حاول مرة أخرى بعد {result.retry_after:.0f} ثانية."
         return True, ""
 
 
