@@ -14,7 +14,7 @@ import logging
 import time
 from typing import Optional
 
-from app.ai.gemini import GeminiProvider
+from app.ai.gemini import GeminiProvider, fallback_status
 from app.ai.local import LocalProvider
 from app.ai.telemetry import AITelemetry
 from app.config.settings import Settings
@@ -76,7 +76,10 @@ class AIGateway:
                     started, attempt, text, True, None,
                 )
             except RateLimitError as exc:
-                logger.warning(f"Rate limit hit for {request.capability}: {exc}. Using local AI.")
+                logger.warning(
+                    f"Rate limit hit for {request.capability}: {exc}. "
+                    f"{fallback_status(self._settings)}"
+                )
                 last_error = exc
                 break
             except (AIProviderError, asyncio.TimeoutError) as exc:
@@ -137,9 +140,11 @@ class AIGateway:
         return AIResponse(text=text, metadata=metadata)
 
     def status_text(self) -> str:
-        """Arabic quota status (mirrors the original settings view)."""
+        """Arabic quota/status view (mirrors the original settings view)."""
         if not self.provider.is_available:
-            return "⚠️ Gemini غير متاح - يستخدم الردود المحلية"
+            if self._settings.use_local_fallback:
+                return "⚠️ Gemini غير متاح - الردود المحلية مفعلة"
+            return "⚠️ Gemini غير متاح - الردود المحلية معطلة؛ سيتم إرجاع الرد الآمن الجاهز"
         remaining = self._settings.max_requests_per_day - self.provider.request_count
         percentage = (remaining / self._settings.max_requests_per_day) * 100
         return (

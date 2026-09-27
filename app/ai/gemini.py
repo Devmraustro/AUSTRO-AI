@@ -21,6 +21,21 @@ from app.domain.ai import AIRequest
 
 logger = logging.getLogger(__name__)
 
+
+def fallback_status(settings_: Settings) -> str:
+    """One-line statement of the configured fallback state for logs.
+
+    Reports whether local fallback is enabled/available without claiming it has
+    already executed.
+    """
+    if settings_.use_local_fallback:
+        return "Local AI fallback is enabled."
+    return (
+        "Local AI fallback is disabled; the gateway will return its safe "
+        "built-in response if Gemini is unavailable."
+    )
+
+
 _HARM_CATEGORIES = [
     ("HARM_CATEGORY_HARASSMENT", "BLOCK_MEDIUM_AND_ABOVE"),
     ("HARM_CATEGORY_HATE_SPEECH", "BLOCK_MEDIUM_AND_ABOVE"),
@@ -40,7 +55,7 @@ class GeminiProvider(AIProvider):
         self.request_count: int = 0
         self.last_request_time: float = 0.0
         if not settings_.has_gemini_key:
-            logger.warning("Gemini API key not set. Using local AI fallback.")
+            logger.warning(f"Gemini API key not set. {fallback_status(settings_)}")
         else:
             self._available = self.health_check()
 
@@ -80,16 +95,25 @@ class GeminiProvider(AIProvider):
                 )
             except Exception:  # noqa: BLE001 - non-blocking diagnostic
                 error_msg = f"Status {response.status_code}"
-            logger.warning(f"Gemini API error: {error_msg}. Using local fallback.")
+            logger.warning(
+                f"Gemini API error: {error_msg}. {fallback_status(self._settings)}"
+            )
             return False
         except requests.exceptions.Timeout:
-            logger.warning("Gemini connection timed out. Using local fallback.")
+            logger.warning(
+                f"Gemini connection timed out. {fallback_status(self._settings)}"
+            )
             return False
         except requests.exceptions.ConnectionError:
-            logger.warning("No internet connection. Using local fallback.")
+            logger.warning(
+                f"No internet connection. {fallback_status(self._settings)}"
+            )
             return False
         except Exception as exc:  # noqa: BLE001 - keep the loop alive
-            logger.warning(f"Gemini connection failed: {exc}. Using local fallback.")
+            logger.warning(
+                f"Gemini connection failed: {type(exc).__name__}. "
+                f"{fallback_status(self._settings)}"
+            )
             return False
 
     async def _rate_limit(self) -> None:
@@ -162,7 +186,7 @@ class GeminiProvider(AIProvider):
 
             if response.status_code == 429:
                 self._available = False
-                raise RateLimitError("Quota exceeded - switching to local AI")
+                raise RateLimitError("Quota exceeded")
 
             if response.status_code == 400:
                 error_data = response.json()

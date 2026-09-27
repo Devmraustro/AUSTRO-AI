@@ -7,10 +7,13 @@ round-trip through the application services. No network, no real Telegram API.
 """
 
 import dataclasses
+import logging
 
 import pytest
+import requests
 
 from app.ai.gateway import AIGateway
+from app.ai.gemini import GeminiProvider, fallback_status
 from app.config.settings import settings
 from app.core.container import build_container, get_services
 from app.core.errors import (
@@ -43,6 +46,7 @@ class _FakeProvider(AIProvider):
         self.calls = 0
 
     model = "fake-model"
+    request_count = 0
 
     @property
     def is_available(self):
@@ -219,6 +223,143 @@ async def test_gateway_local_fallback_never_raises_when_provider_duck_type():
     response = await gateway.generate(AIRequest(capability="chat", prompt="hi"))
     assert response.metadata.success is False
     assert response.text == "عذراً، الخدمة غير متاحة حالياً. حاول لاحقاً."
+
+
+# ================== FALLBACK LOGGING / STATUS ACCURACY ==================
+
+
+class _FakeHttpResponse:
+    def __init__(self, status_code, payload=None):
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {}
+
+    def json(self):
+        return self._payload
+
+
+@pytest.mark.parametrize("use_local_fallback", [True, False])
+def test_gemini_startup_no_key_reports_accurate_fallback_state(use_local_fallback, caplog):
+    provider_settings = _test_settings(
+        gemini_api_key="", use_local_fallback=use_local_fallback
+    )
+    with caplog.at_level(logging.WARNING, logger="app.ai.gemini"):
+        GeminiProvider(provider_settings)
+    if use_local_fallback:
+        assert "Local AI fallback is enabled." in caplog.text
+    else:
+        assert "Local AI fallback is disabled;" in caplog.text
+        assert "safe built-in response" in caplog.text
+    assert "Using local AI fallback." not in caplog.text
+
+
+def test_fallback_status_describes_setting():
+    assert fallback_status(_test_settings(use_local_fallback=True)) == \
+        "Local AI fallback is enabled."
+    disabled_note = fallback_status(_test_settings(use_local_fallback=False))
+    assert "disabled" in disabled_note
+    assert "safe built-in response" in disabled_note
+
+
+@pytest.mark.parametrize("use_local_fallback", [True, False])
+def test_gemini_health_check_api_error_reports_fallback_state(
+    use_local_fallback, monkeypatch, caplog
+):
+    def _api_error(*args, **kwargs):
+        return _FakeHttpResponse(500, {"error": {"message": "upstream boom"}})
+
+    monkeypatch.setattr("app.ai.gemini.requests.post", _api_error)
+    with caplog.at_level(logging.WARNING, logger="app.ai.gemini"):
+        provider = GeminiProvider(_test_settings(use_local_fallback=use_local_fallback))
+    assert provider.is_available is False
+    assert "Gemini API error: upstream boom." in caplog.text
+    if use_local_fallback:
+        assert "Local AI fallback is enabled." in caplog.text
+    else:
+        assert "Local AI fallback is disabled;" in caplog.text
+        assert "safe built-in response" in caplog.text
+    assert "Using local fallback." not in caplog.text
+
+
+@pytest.mark.parametrize("use_local_fallback", [True, False])
+def test_gemini_health_check_timeout_reports_fallback_state(
+    use_local_fallback, monkeypatch, caplog
+):
+    def _timeout(*args, **kwargs):
+        raise requests.exceptions.Timeout("slow upstream")
+
+    monkeypatch.setattr("app.ai.gemini.requests.post", _timeout)
+    with caplog.at_level(logging.WARNING, logger="app.ai.gemini"):
+        GeminiProvider(_test_settings(use_local_fallback=use_local_fallback))
+    assert "Gemini connection timed out." in caplog.text
+    if use_local_fallback:
+        assert "Local AI fallback is enabled." in caplog.text
+    else:
+        assert "Local AI fallback is disabled;" in caplog.text
+        assert "safe built-in response" in caplog.text
+    assert "Using local fallback." not in caplog.text
+
+
+@pytest.mark.parametrize("use_local_fallback", [True, False])
+def test_gemini_health_check_connection_error_reports_fallback_state(
+    use_local_fallback, monkeypatch, caplog
+):
+    def _no_net(*args, **kwargs):
+        raise requests.exceptions.ConnectionError("network unreachable")
+
+    monkeypatch.setattr("app.ai.gemini.requests.post", _no_net)
+    with caplog.at_level(logging.WARNING, logger="app.ai.gemini"):
+        GeminiProvider(_test_settings(use_local_fallback=use_local_fallback))
+    assert "No internet connection." in caplog.text
+    if use_local_fallback:
+        assert "Local AI fallback is enabled." in caplog.text
+    else:
+        assert "Local AI fallback is disabled;" in caplog.text
+        assert "safe built-in response" in caplog.text
+    assert "Using local fallback." not in caplog.text
+
+
+@pytest.mark.parametrize("use_local_fallback", [True, False])
+async def test_gateway_rate_limit_log_reports_fallback_state(use_local_fallback, caplog):
+    gateway = AIGateway(
+        settings_=_test_settings(
+            ai_max_retries=2, use_local_fallback=use_local_fallback
+        ),
+        provider=_FakeProvider(raise_rate_limit=True),
+    )
+    with caplog.at_level(logging.WARNING, logger="app.ai.gateway"):
+        await gateway.generate(AIRequest(capability="chat", prompt="hi"))
+    assert "Rate limit hit for chat" in caplog.text
+    if use_local_fallback:
+        assert "Local AI fallback is enabled." in caplog.text
+    else:
+        assert "Local AI fallback is disabled;" in caplog.text
+        assert "safe built-in response" in caplog.text
+
+
+@pytest.mark.parametrize("use_local_fallback", [True, False])
+def test_gateway_status_text_reflects_fallback_setting(use_local_fallback):
+    gateway = AIGateway(
+        settings_=_test_settings(use_local_fallback=use_local_fallback),
+        provider=_FakeProvider(available=False),
+    )
+    text = gateway.status_text()
+    assert "Gemini غير متاح" in text
+    if use_local_fallback:
+        assert "الردود المحلية مفعلة" in text
+        assert "يستخدم الردود المحلية" not in text
+    else:
+        assert "معطلة" in text
+        assert "الرد الآمن" in text
+        assert "يستخدم الردود المحلية" not in text
+
+
+def test_gateway_status_text_reports_quota_when_available():
+    gateway = AIGateway(
+        settings_=_test_settings(), provider=_FakeProvider(available=True)
+    )
+    text = gateway.status_text()
+    assert "Gemini غير متاح" not in text
+    assert "متبقي" in text
 
 
 # ============================ CONVERSATION MEMORY ============================
