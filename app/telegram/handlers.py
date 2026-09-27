@@ -1629,6 +1629,14 @@ async def knowledge_document(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not allowed:
         await update.message.reply_text(msg)
         return
+
+    # Check ingestion budget BEFORE download/validate/register so a blocked
+    # request can never leave an orphaned pending knowledge source behind.
+    allowed, msg = await _rl.check_ingestion_limit(user_id)
+    if not allowed:
+        await update.message.reply_text(msg)
+        return
+
     document = update.message.document
     if document is None:
         return
@@ -1667,11 +1675,6 @@ async def knowledge_document(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if result.get("duplicate"):
         await update.message.reply_text("📚 هذا الكتاب موجود في مكتبتك بالفعل.")
-        return
-
-    allowed, msg = await _rl.check_ingestion_limit(user_id)
-    if not allowed:
-        await update.message.reply_text(msg)
         return
 
     source_id = result.get("source_id")

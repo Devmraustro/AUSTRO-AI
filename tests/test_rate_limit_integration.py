@@ -10,11 +10,15 @@ Prove that:
 - ConversationHandler state transitions remain intact
 - callback queries are handled correctly
 - background scheduler jobs are not incorrectly rate limited
+- real handlers do not invoke protected operations when rate-limited
+- real handlers invoke protected operations when allowed
 """
 
+import asyncio
 import os
 import pathlib
 import tempfile
+from unittest.mock import AsyncMock, Mock
 
 os.environ.setdefault("BOT_TOKEN", "123456789:TEST-rate-limit-integration-token")
 os.environ["GEMINI_API_KEY"] = ""
@@ -437,6 +441,306 @@ def test_all_limit_buckets_present():
         assert config is not None, f"Missing bucket: {bucket}"
         assert config.max_requests > 0
         assert config.window_seconds > 0
+
+
+# ============================================================================
+# 11. Real handler execution: blocked requests never reach protected ops
+# ============================================================================
+#
+# These tests drive the ACTUAL Telegram handlers with monkeypatched middleware
+# and service container. A spy records whether the protected operation ran:
+#   - blocked command    -> start() returns before user profile lookup
+#   - blocked AI request -> study_topic() returns before explain_concept()
+#   - blocked upload     -> knowledge_document() returns before register_upload()
+#   - blocked ingestion  -> knowledge_document() returns before any upload record
+#   - blocked callback   -> english_lesson() returns before english_lesson()
+# Conversely, allowed requests DO invoke the protected operations.
+
+
+class _FakeUser:
+    def __init__(self, user_id):
+        self.id = user_id
+        self.username = "tester"
+        self.first_name = "Test"
+        self.last_name = "er"
+
+
+class _FakeDocument:
+    def __init__(self):
+        self.file_id = "FILE_DOC_1"
+        self.file_name = "book.pdf"
+        self.mime_type = "application/pdf"
+        self.file_size = 1000
+
+
+class _FakeFileBytes:
+    async def download_as_bytearray(self):
+        return b"%PDF-1.4 fake content"
+
+
+class _FakeBot:
+    async def get_file(self, file_id):  # noqa: ARG001
+        return _FakeFileBytes()
+
+    async def send_message(self, **kwargs):  # noqa: ARG001
+        return None
+
+
+class _FakeMessage:
+    def __init__(self, text="", document=None):
+        self.text = text
+        self.document = document
+        self.chat_id = 111
+        self.reply_text = AsyncMock(return_value=None)
+
+
+class _FakeCallbackQuery:
+    def __init__(self):
+        self.answer = AsyncMock(return_value=None)
+        self.edit_message_text = AsyncMock(return_value=None)
+
+
+class _FakeUpdate:
+    def __init__(self, user_id=42, message=None, callback_query=None):
+        self.effective_user = _FakeUser(user_id)
+        self.message = message or _FakeMessage()
+        self.callback_query = callback_query
+
+
+class _FakeApplication:
+    def __init__(self):
+        self.tasks = []
+
+    def create_task(self, coroutine):
+        self.tasks.append(coroutine)
+        task = asyncio.get_running_loop().create_task(coroutine)
+        return task
+
+
+class _FakeContext:
+    def __init__(self, container=None):
+        self.bot_data = {"container": container}
+        self.user_data = {}
+        self.chat_data = {}
+        self.application = _FakeApplication()
+        self.bot = _FakeBot()
+
+
+class _FakeService:
+    def __init__(self, **methods):
+        for name, method in methods.items():
+            setattr(self, name, method)
+
+
+def _fake_container():
+    """A fake service container where every protected operation is a spy."""
+    return _FakeService(
+        users=_FakeService(
+            profile=Mock(return_value=None),
+            ensure_user=Mock(),
+        ),
+        learning=_FakeService(
+            explain_concept=AsyncMock(return_value="شرح مفصل"),
+            english_lesson=AsyncMock(return_value="درس إنجليزي"),
+        ),
+        knowledge=_FakeService(
+            settings_info=Mock(return_value={"max_file_size_mb": 50, "max_pages": 100}),
+            register_upload=Mock(return_value={"source_id": 7, "duplicate": False}),
+            process_source=AsyncMock(return_value=_FakeService(status="completed", error=None)),
+        ),
+    )
+
+
+def _tight_limiter():
+    """A deterministic limiter where one request fills the whole budget."""
+    return RateLimiter(limits={
+        "command": RateLimitConfig(max_requests=1, window_seconds=60),
+        "ai_request": RateLimitConfig(max_requests=1, window_seconds=60),
+        "upload": RateLimitConfig(max_requests=1, window_seconds=3600),
+        "ingestion": RateLimitConfig(max_requests=1, window_seconds=3600),
+        "expensive": RateLimitConfig(max_requests=1, window_seconds=3600),
+        "global_ai": RateLimitConfig(max_requests=1, window_seconds=60),
+    })
+
+
+async def _run(handler, module_name, mw, services, update, context):
+    """Run one handler after monkeypatching middleware + services in its module."""
+    import importlib
+    module = importlib.import_module(module_name)
+    orig_middleware = module.get_rate_limit_middleware
+    orig_services = module.get_services
+    module.get_rate_limit_middleware = lambda: mw
+    module.get_services = lambda ctx: services
+    try:
+        return await handler(update, context)
+    finally:
+        module.get_rate_limit_middleware = orig_middleware
+        module.get_services = orig_services
+
+
+async def test_blocked_command_does_not_execute_handler():
+    """A rate-limited command returns before the protected business logic runs."""
+    from app.telegram.main import start
+
+    mw = get_rate_limit_middleware()
+    mw.limiter = _tight_limiter()
+    mw.limiter.check_limit(42, "command")  # consume the single command slot
+
+    services = _fake_container()
+    update = _FakeUpdate(user_id=42)
+    context = _FakeContext(container=services)
+
+    await _run(start, "app.telegram.main", mw, services, update, context)
+
+    services.users.profile.assert_not_called()
+    update.message.reply_text.assert_awaited_once()
+
+
+async def test_allowed_command_executes_handler():
+    """An allowed command reaches the protected business logic."""
+    from app.telegram.main import start
+
+    mw = get_rate_limit_middleware()
+    mw.limiter = _tight_limiter()
+
+    services = _fake_container()
+    update = _FakeUpdate(user_id=42)
+    context = _FakeContext(container=services)
+
+    await _run(start, "app.telegram.main", mw, services, update, context)
+
+    services.users.profile.assert_called_once()
+    services.users.profile.assert_called_with(42)
+
+
+async def test_blocked_ai_request_does_not_generate():
+    """A rate-limited AI request never reaches the AI-producing operation."""
+    from app.telegram.handlers import study_topic
+
+    mw = get_rate_limit_middleware()
+    mw.limiter = _tight_limiter()
+    mw.limiter.check_limit(42, "ai_request")
+
+    services = _fake_container()
+    update = _FakeUpdate(user_id=42, message=_FakeMessage(text="التفاضل والتكامل"))
+    context = _FakeContext(container=services)
+    context.user_data = {"study_subject": "الرياضيات"}
+
+    await _run(study_topic, "app.telegram.handlers", mw, services, update, context)
+
+    services.learning.explain_concept.assert_not_awaited()
+    update.message.reply_text.assert_awaited_once()
+
+
+async def test_allowed_ai_request_generates():
+    """An allowed AI request does invoke the AI-producing operation."""
+    from app.telegram.handlers import study_topic
+
+    mw = get_rate_limit_middleware()
+    mw.limiter = _tight_limiter()
+
+    services = _fake_container()
+    update = _FakeUpdate(user_id=42, message=_FakeMessage(text="التفاضل والتكامل"))
+    context = _FakeContext(container=services)
+    context.user_data = {"study_subject": "الرياضيات"}
+
+    await _run(study_topic, "app.telegram.handlers", mw, services, update, context)
+
+    services.learning.explain_concept.assert_awaited_once()
+
+
+async def test_blocked_upload_does_not_register():
+    """A rate-limited upload is rejected before upload registration runs."""
+    from app.telegram.handlers import knowledge_document
+
+    mw = get_rate_limit_middleware()
+    mw.limiter = _tight_limiter()
+    mw.limiter.check_limit(42, "upload")
+
+    services = _fake_container()
+    update = _FakeUpdate(user_id=42, message=_FakeMessage(document=_FakeDocument()))
+    context = _FakeContext(container=services)
+
+    await _run(knowledge_document, "app.telegram.handlers", mw, services, update, context)
+
+    services.knowledge.register_upload.assert_not_called()
+    assert context.application.tasks == []
+    update.message.reply_text.assert_awaited_once()
+
+
+async def test_blocked_ingestion_does_not_start_and_no_orphan_source():
+    """A rate-limited ingestion is rejected BEFORE any pending source is created.
+
+    Guards the upload->ingestion ordering: when the ingestion budget is
+    exhausted, no upload record and no background ingestion may exist.
+    """
+    from app.telegram.handlers import knowledge_document
+
+    mw = get_rate_limit_middleware()
+    mw.limiter = _tight_limiter()
+    mw.limiter.check_limit(42, "ingestion")
+
+    services = _fake_container()
+    update = _FakeUpdate(user_id=42, message=_FakeMessage(document=_FakeDocument()))
+    context = _FakeContext(container=services)
+
+    await _run(knowledge_document, "app.telegram.handlers", mw, services, update, context)
+
+    services.knowledge.register_upload.assert_not_called()
+    assert context.application.tasks == []
+    update.message.reply_text.assert_awaited_once()
+
+
+async def test_allowed_upload_registers_and_starts_ingestion():
+    """An allowed upload is registered and background ingestion is started."""
+    from app.telegram.handlers import knowledge_document
+
+    mw = get_rate_limit_middleware()
+    mw.limiter = _tight_limiter()
+
+    services = _fake_container()
+    update = _FakeUpdate(user_id=42, message=_FakeMessage(document=_FakeDocument()))
+    context = _FakeContext(container=services)
+
+    await _run(knowledge_document, "app.telegram.handlers", mw, services, update, context)
+    await asyncio.sleep(0.01)
+
+    services.knowledge.register_upload.assert_called_once()
+    assert len(context.application.tasks) == 1
+
+
+async def test_blocked_callback_does_not_execute_business_handler():
+    """A rate-limited callback answers with an alert and never runs the handler body."""
+    from app.telegram.handlers import english_lesson
+
+    mw = get_rate_limit_middleware()
+    mw.limiter = _tight_limiter()
+    mw.limiter.check_limit(42, "ai_request")
+
+    services = _fake_container()
+    update = _FakeUpdate(user_id=42, callback_query=_FakeCallbackQuery())
+    context = _FakeContext(container=services)
+
+    await _run(english_lesson, "app.telegram.handlers", mw, services, update, context)
+
+    services.learning.english_lesson.assert_not_awaited()
+    update.callback_query.answer.assert_awaited_once()
+
+
+async def test_allowed_callback_executes_business_handler():
+    """An allowed callback runs the protected business handler."""
+    from app.telegram.handlers import english_lesson
+
+    mw = get_rate_limit_middleware()
+    mw.limiter = _tight_limiter()
+
+    services = _fake_container()
+    update = _FakeUpdate(user_id=42, callback_query=_FakeCallbackQuery())
+    context = _FakeContext(container=services)
+
+    await _run(english_lesson, "app.telegram.handlers", mw, services, update, context)
+
+    services.learning.english_lesson.assert_awaited_once()
 
 
 if __name__ == "__main__":
