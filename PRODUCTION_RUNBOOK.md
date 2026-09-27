@@ -60,14 +60,33 @@ booting the bot, so schema is applied before first traffic.
 
 See `DISASTER_RECOVERY.md` (drill-verified on real PostgreSQL):
 
-- Backup (logical, gzip level 6, SHA-256 manifest):
-  `python scripts/pg_backup.py --engine postgresql`
-  Outputs `backups/austro_ai_backup_<UTC>.sql.gz` + `.manifest.json`.
-  Schedule daily 02:00 UTC; retention 7 days (30 monthly). RPO 24h, RTO ≤ 30 min.
-- Verify integrity + restore drill:
-  `python scripts/pg_restore_drill.py`.
+- **Automated daily backup (independent container):** the `backup` Compose
+  service runs `scripts/backup_scheduler.py`, which triggers the one-shot
+  `scripts/pg_backup.py` every day at **02:00 UTC** and writes into the shared
+  `backups` volume. It is never started inside the Telegram update loop.
+  ```bash
+  docker compose --env-file .env up -d app backup
+  docker compose logs -f backup          # expect "6/6: SUCCESS backup=..." ~02:00 UTC
+  docker compose run --rm backup python scripts/pg_backup.py /app/backups   # manual
+  ```
+  Missed runs are recovered on start-up (if today's slot passed with no backup
+  for today, it runs immediately); a lock file prevents duplicate concurrent
+  runs, and a failed day is retried on a bounded backoff
+  (`BACKUP_RETRY_MINUTES`, default 60) rather than in a hot loop.
+  `Dockerfile.backup` pins `postgresql-client-16` so `pg_dump` matches the
+  production PostgreSQL 16 server, and credentials are passed via `PGPASSFILE`
+  so the password never appears in argv or logs.
+- Retention: newest 7 backups + the newest backup of each UTC month for up to
+  30 further months, applied **only after** the new archive/manifest pair is
+  published and verified. Details: `DISASTER_RECOVERY.md` §2.3.
+- Verify integrity + restore drill (destructive, disposable DB only):
+  `python scripts/pg_restore_drill.py <archive> <manifest>`.
 - Restore to a production-like target uses `pg_dump --clean --if-exists
   --no-owner --no-acl` piped into `psql`, then the app reconnect path.
+- RPO 24h, RTO <= 30 min. Status: automation implemented and unit-tested, but
+  **not yet installed on the production host** — do not mark the nightly
+  backup as active until `docker compose logs backup` shows a real 02:00 UTC
+  success (see release checklist item 10).
 
 ## 5. Monitoring & alerting
 

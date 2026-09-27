@@ -1,0 +1,56 @@
+# AUSTRO AI - Backup worker image (PostgreSQL 16 client)
+#
+# Purpose: run the automated, one-shot logical backup
+# (scripts/pg_backup.py) on a UTC schedule (scripts/backup_scheduler.py) as an
+# INDEPENDENT container. It is never part of the Telegram update loop.
+#
+# Why a dedicated image: the application image (Dockerfile) intentionally ships
+# no PostgreSQL client binaries. The backup job needs a pg_dump whose major
+# version matches the production server (PostgreSQL 16), so `postgresql-client-16`
+# is installed from the official PGDG apt repository. `pg_dump` refuses to dump
+# from a NEWER server than its own major version, so this pin is what makes the
+# job production-safe against the PostgreSQL 16 target.
+#
+# Build:  docker build -f Dockerfile.backup -t austro-backup:latest .
+# Run:    docker compose --env-file .env up -d backup
+#
+# Secrets: DB_PASSWORD is supplied at run time (env/secret file), never baked
+# into the image. pg_dump receives it through a 0600 .pgpass file created at
+# run time - never in command arguments, never in logs.
+
+FROM python:3.12-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# PostgreSQL 16 client (pg_dump + psql) from PGDG, plus a gzip/tar-free base.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        gnupg \
+    && install -d /usr/share/postgresql-common/pgdg \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+        -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+    && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends postgresql-client-16 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Only the driver the backup job needs (keeps the image small and free of
+# Telegram/bot dependencies; this worker never boots the bot).
+RUN pip install --no-cache-dir "psycopg2-binary>=2.9,<3"
+
+WORKDIR /app
+COPY scripts/ ./scripts/
+
+RUN useradd --create-home --shell /bin/bash austro \
+    && mkdir -p /app/backups \
+    && chown -R austro:austro /app
+
+USER austro
+
+# Default: the UTC scheduler. Override for a one-shot manual backup, e.g.
+#   docker compose run --rm backup python scripts/pg_backup.py /app/backups
+ENTRYPOINT ["python", "scripts/backup_scheduler.py"]

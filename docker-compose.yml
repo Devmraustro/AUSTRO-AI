@@ -48,6 +48,48 @@ services:
     # Startup ordering / DB readiness is handled by docker-entrypoint.sh
     # (poll DB_HOST until reachable, then apply migrations before boot).
 
+  # AUTOMATED POSTGRESQL BACKUP WORKER (independent of the bot).
+  #
+  # Runs the one-shot logical backup once a day at 02:00 UTC
+  # (scripts/backup_scheduler.py -> scripts/pg_backup.py) against the SAME
+  # externally managed database, writing into the shared `backups` volume.
+  # It is a separate container: backup cost or failure can never affect the
+  # Telegram update loop, and `docker compose stop app` does not stop it.
+  #
+  # Uses Dockerfile.backup, which pins postgresql-client-16 so pg_dump matches
+  # the production PostgreSQL 16 server.
+  #
+  # Start:  docker compose --env-file .env up -d app backup
+  # Logs:   docker compose logs -f backup
+  # Manual: docker compose run --rm backup python scripts/pg_backup.py /app/backups
+  #
+  # NOTE: installing this service does not by itself prove a scheduled run
+  # happened - verify the first successful run (see DISASTER_RECOVERY.md §2).
+  backup:
+    build:
+      context: .
+      dockerfile: Dockerfile.backup
+    container_name: austro-backup
+    environment:
+      # Same externally managed PostgreSQL as the app (architecture B)
+      DB_ENGINE: postgresql
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT:-5432}
+      DB_NAME: ${DB_NAME:-austro_ai}
+      DB_USER: ${DB_USER:-austro}
+      DB_PASSWORD: ${DB_PASSWORD}
+      BACKUP_OUTDIR: /app/backups
+      # Explicit UTC schedule + retention
+      BACKUP_SCHEDULE_UTC_HOUR: ${BACKUP_SCHEDULE_UTC_HOUR:-2}
+      BACKUP_SCHEDULE_UTC_MINUTE: ${BACKUP_SCHEDULE_UTC_MINUTE:-0}
+      BACKUP_DAILY_KEEP: ${BACKUP_DAILY_KEEP:-7}
+      BACKUP_MONTHLY_KEEP: ${BACKUP_MONTHLY_KEEP:-30}
+      # After a failed day the worker re-checks this often (never a hot loop)
+      BACKUP_RETRY_MINUTES: ${BACKUP_RETRY_MINUTES:-60}
+    volumes:
+      - backups:/app/backups
+    restart: unless-stopped
+
   # LOCAL-ONLY reference PostgreSQL (dev / DR drills). Wire-production must
   # point DB_HOST at the externally managed instance instead.
   postgres:

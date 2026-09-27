@@ -58,6 +58,16 @@ Each step lists the command or file to use and what "done" means.
 - [ ] **10. Configure daily backup cron** (02:00 UTC) + retention per
   `DISASTER_RECOVERY.md`; run `scripts/pg_backup.py` nightly and one restore
   drill per release.
+  - ✅ **Code side done (2026-09-27):** the schedule is now an independent
+    `backup` Compose service (`Dockerfile.backup` + `scripts/backup_scheduler.py`
+    → one-shot `scripts/pg_backup.py`), daily 02:00 UTC, 7 daily + 30 monthly
+    retention, `PGPASSFILE` auth, lock + missed-run recovery, 31 tests in
+    `tests/test_backup.py`. See `DISASTER_RECOVERY.md` §2.
+  - ⬜ **Still open (needs the host):** start the service in production
+    (`docker compose --env-file .env up -d app backup`) and observe one real
+    `6/6: SUCCESS` at 02:00 UTC (`DISASTER_RECOVERY.md` §2.4), then run the
+    destructive restore drill against a disposable DB once per release. Until
+    then item 10 is **not operationally complete**.
 - [ ] **11. Release a dry run on a staging slot first**: `AUSTRO_ENVIRONMENT`
   staging config, then full smoke (`scripts/smoke_test.py`) + healthcheck
   (`scripts/healthcheck.py` → HEALTHY, exit 0).
