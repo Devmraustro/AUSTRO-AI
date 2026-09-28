@@ -15,6 +15,7 @@ from typing import Dict, List
 
 from dotenv import load_dotenv
 
+from app.config.deployment_validation import validate_deployment_safety
 from app.core.errors import ConfigurationError
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -82,6 +83,8 @@ class Settings:
     webhook_url: str = ""
     webhook_port: int = 8443
     webhook_secret: str = ""
+    telegram_transport: str = "polling"  # "polling" | "webhook"
+    staging_id: str = ""
 
     # Database settings
     db_engine: str = "sqlite"  # "sqlite" | "postgresql"
@@ -269,6 +272,8 @@ def load_settings() -> Settings:
         webhook_url=os.getenv("WEBHOOK_URL", ""),
         webhook_port=int(os.getenv("WEBHOOK_PORT", "8443")),
         webhook_secret=os.getenv("WEBHOOK_SECRET", ""),
+        telegram_transport=os.getenv("TELEGRAM_TRANSPORT", "polling").strip().lower(),
+        staging_id=os.getenv("AUSTRO_STAGING_ID", "").strip(),
         db_engine=os.getenv("DB_ENGINE", "sqlite"),
         db_host=os.getenv("DB_HOST", "localhost"),
         db_port=int(os.getenv("DB_PORT", "5432")),
@@ -293,33 +298,11 @@ def load_settings() -> Settings:
         rate_limit_global_ai_window=float(os.getenv("RATE_LIMIT_GLOBAL_AI_WINDOW", "60")),
     )
 
-    # Production environment validation
-    prod_violations = []
-    if settings.environment == "production":
-        if settings.log_level not in ("WARNING", "ERROR"):
-            prod_violations.append(
-                f"production environment requires log_level WARNING or ERROR, "
-                f"got '{settings.log_level}'"
-            )
-        if not settings.webhook_url:
-            prod_violations.append(
-                "production environment requires WEBHOOK_URL to be set"
-            )
-        if not settings.webhook_secret:
-            prod_violations.append(
-                "production environment requires WEBHOOK_SECRET to be set"
-            )
-        if settings.use_local_fallback:
-            prod_violations.append(
-                "production environment should not use local fallback (USE_LOCAL_FALLBACK=false)"
-            )
-        if settings.gemini_api_key == "":
-            prod_violations.append(
-                "production environment requires GEMINI_API_KEY to be set"
-            )
-    if prod_violations:
+    # Deployment safety validation (production + staging)
+    violations = validate_deployment_safety(settings)
+    if violations:
         raise ConfigurationError(
-            "❌ " + " ".join(prod_violations)
+            "❌ " + " ".join(violations)
         )
 
     # Development/local information
@@ -347,4 +330,5 @@ __all__: List[str] = [
     "settings",
     "BASE_DIR",
     "ConfigurationError",
+    "validate_deployment_safety",
 ]

@@ -53,8 +53,19 @@ BOT_TOKEN, DB reachability (`SELECT 1` on PostgreSQL / SQLite), and that
 knowledge_storage + logs are writable.
 
 `docker-entrypoint.sh` waits for the database (`pg_isready` when
-`DB_ENGINE=postgresql`) and runs `DatabaseManager()` + `apply_migrations()` before
-booting the bot, so schema is applied before first traffic.
+`DB_ENGINE=postgresql`, bounded by `DB_WAIT_TIMEOUT_SECONDS`, default 120s, then
+fails fast with a clear message) and runs `DatabaseManager()` +
+`apply_migrations()` before booting the bot, so schema is applied before first
+traffic. The app image ships `postgresql-client` so `pg_isready` exists; before
+that the wait loop could never succeed.
+
+### Staging is a separate stack, never this one
+
+Dry runs happen in a completely separate stack: `docker-compose.staging.yml`
+(project `austro-staging`, its own containers, network and volumes, a dedicated
+staging database, a second @BotFather bot and separate webhook settings). Every
+command in this section uses `docker-compose.yml` implicitly and must never be
+run against the staging file or vice versa. See `STAGING_RUNBOOK.md`.
 
 ## 4. Backup & restore
 

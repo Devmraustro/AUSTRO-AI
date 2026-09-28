@@ -460,6 +460,10 @@ def main() -> None:
     logger.info("=" * 50)
     logger.info("AI Engine: Google Gemini Flash 2.5 (FREE)")
     logger.info("Cost: 1500 requests/day FREE")
+    logger.info("Environment: %s", settings.environment)
+    # The runtime long-polls; WEBHOOK_URL/WEBHOOK_SECRET are validated config
+    # only (see app/config/deployment_validation.py).
+    logger.info("Telegram transport: %s", settings.telegram_transport)
     logger.info("=" * 50)
 
     # Build and run the application

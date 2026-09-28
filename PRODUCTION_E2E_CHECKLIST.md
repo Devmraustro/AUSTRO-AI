@@ -61,6 +61,27 @@ Legend: ✅ VERIFIED · ⛔ BLOCKED · ⚠️ PARTIAL / EXTERNAL REQUIRED
 | 4.7 | Logs writable | ✅ VERIFIED | smoke check 7 |
 | 4.8 | Restart recovery | ✅ VERIFIED | smoke check 8 |
 
+## 4b. Staging dry run (isolated slot — release-checklist item 11)
+
+Full procedure: `STAGING_RUNBOOK.md`. Harness: `scripts/staging_validate.py`.
+
+| # | Check | Status | Evidence |
+|---|-------|--------|----------|
+| 4b.1 | Isolated compose stack exists | ✅ VERIFIED | `docker-compose.staging.yml`, project `austro-staging`, own containers/network/volumes (`tests/test_staging.py`) |
+| 4b.2 | Staging config template, real env ignored | ✅ VERIFIED | `.env.staging.example` committed with no secrets; `.env.staging` git-ignored |
+| 4b.3 | Fail-closed staging rules | ✅ VERIFIED | `app/config/deployment_validation.py` — dedicated staging DB, credentials, staging id, polling transport, non-placeholder token |
+| 4b.4 | No credential shared with production | ✅ VERIFIED (static) | `scripts/staging_validate.py --static`; refuses reuse without printing values |
+| 4b.5 | Cold start + startup migrations on staging | ⛔ BLOCKED | needs Docker + a dedicated staging PostgreSQL |
+| 4b.6 | Healthcheck HEALTHY (exit 0) in staging | ⛔ BLOCKED | needs the staging slot |
+| 4b.7 | Full smoke battery in staging mode | ⛔ BLOCKED | needs staging PostgreSQL (fails closed on a non-PG staging config, verified) |
+| 4b.8 | Telegram startup (dedicated bot, polling) | ⛔ BLOCKED | offline contract verified; live `getMe` needs the second bot |
+| 4b.9 | Persistent storage + logs across restart | ⛔ BLOCKED | needs the staging slot |
+| 4b.10 | Staging rollback to a verified image | ⛔ BLOCKED (guards ✅) | `scripts/staging_rollback.py` refuses production, unidentified images and restores |
+| 4b.11 | Compose + image builds | ⛔ BLOCKED locally / ✅ in CI | no Docker CLI on this host; CI builds both images and resolves both compose files |
+
+`BLOCKED` means **not verified**, never "passed". Production promotion stays gated
+on 4b.5–4b.9.
+
 ## 5. Live Telegram E2E (credential-dependent)
 
 | # | Scenario | Status | Evidence |

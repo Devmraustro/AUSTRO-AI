@@ -56,15 +56,20 @@ def main() -> int:
     # production forbids local fallback; must be explicitly disabled (default is true)
     os.environ["USE_LOCAL_FALLBACK"] = "0"
     os.environ.setdefault("GEMINI_API_KEY", "smoke-gemini-key-0000000000")
+    # The same battery is reused for staging; it must assert the environment it
+    # was asked to validate (production by default - unchanged behaviour).
+    expected_environment = os.environ["AUSTRO_ENVIRONMENT"]
 
-    # 1. production config loads
+    # 1. deployment configuration loads
     def _config():
         from app.config.settings import settings as s
-        if s.environment != "production":
-            raise AssertionError(s.environment)
+        if s.environment != expected_environment:
+            raise AssertionError(
+                f"expected environment={expected_environment}, got {s.environment}"
+            )
         return f"environment={s.environment} db_engine={s.db_engine} log_level={s.log_level}"
 
-    step("production configuration validation", _config)
+    step(f"{expected_environment} configuration validation", _config)
 
     # 2. readiness healthcheck
     def _health():
@@ -191,7 +196,8 @@ def main() -> int:
     if failed:
         print(f"SMOKE RESULT: {len(RESULTS) - len(failed)}/{len(RESULTS)} PASSED — FAILURES PRESENT")
         return 1
-    print(f"SMOKE RESULT: ALL {len(RESULTS)} PRODUCTION COLD-START CHECKS PASSED")
+    print(f"SMOKE RESULT: ALL {len(RESULTS)} COLD-START CHECKS PASSED "
+          f"({expected_environment})")
     return 0
 
 

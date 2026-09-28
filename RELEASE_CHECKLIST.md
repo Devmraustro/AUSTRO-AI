@@ -68,9 +68,34 @@ Each step lists the command or file to use and what "done" means.
     `6/6: SUCCESS` at 02:00 UTC (`DISASTER_RECOVERY.md` §2.4), then run the
     destructive restore drill against a disposable DB once per release. Until
     then item 10 is **not operationally complete**.
-- [ ] **11. Release a dry run on a staging slot first**: `AUSTRO_ENVIRONMENT`
-  staging config, then full smoke (`scripts/smoke_test.py`) + healthcheck
-  (`scripts/healthcheck.py` → HEALTHY, exit 0).
+- [x] **11. Release a dry run on a staging slot first** — code ready, live deploy
+  still open:
+  - ✅ `docker-compose.staging.yml`: standalone, `name: austro-staging`, staging
+    containers/network/volumes, `TELEGRAM_TRANSPORT=polling`,
+    `USE_LOCAL_FALLBACK=false`, staging-marked DB required, staging-only
+    profile-gated backup worker and local PostgreSQL 16.
+  - ✅ `.env.staging.example` (committed, no secrets) + `.env.staging`
+    (git-ignored); `scripts/staging_validate.py` refuses any credential shared
+    with production, without printing values.
+  - ✅ Fail-closed staging rules in `app/config/deployment_validation.py`
+    (dedicated staging DB, credentials, staging id, supported transport,
+    non-placeholder token). Production's rules are unchanged.
+  - ✅ `scripts/staging_validate.py`: 10-step plan/execute harness (compose,
+    isolation, build, cold start + migrations, healthcheck, smoke, Telegram
+    startup, DB isolation, persistent storage/logs, restart recovery).
+  - ✅ `scripts/smoke_test.py` reusable for staging (production default
+    unchanged).
+  - ✅ `scripts/staging_rollback.py`: staging-only, identifiable verified image,
+    health-gated, forward-only migrations, restore refused.
+  - ✅ `tests/test_staging.py` (66 tests) + CI job validating both compose files,
+    building both images and proving the isolation/rollback guards.
+  - ✅ Procedure: `STAGING_RUNBOOK.md`.
+  - ⬜ **Still open (needs the host):** provision a staging PostgreSQL, a second
+    @BotFather bot and a staging webhook URL/secret, then run
+    `python scripts/staging_validate.py --execute` and record the 10 results.
+    Docker, the staging database and the bot are not available on this host, so
+    no live staging deployment has happened yet — item 11 is **not operationally
+    complete**.
 
 ## GO-LIVE (production)
 

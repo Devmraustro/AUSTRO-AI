@@ -4,9 +4,13 @@ FROM python:3.12-slim
 WORKDIR /app
 
 # Install system dependencies
+# postgresql-client provides `pg_isready`, which docker-entrypoint.sh uses to
+# wait for the database before applying migrations. Without it the wait loop
+# spins forever on "command not found" and the container never starts.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libpq-dev \
+    postgresql-client \
     curl \
     && rm -rf /var/lib/apt/lists/*
 

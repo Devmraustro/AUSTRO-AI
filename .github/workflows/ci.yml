@@ -41,10 +41,10 @@ jobs:
         run: pip install -r requirements-dev.txt
 
       - name: Byte-compile all modules
-        run: python -m compileall -q app main.py handlers.py config.py database.py reminder_scheduler.py redaction.py smoke_test.py tests
+        run: python -m compileall -q app main.py handlers.py config.py database.py reminder_scheduler.py redaction.py smoke_test.py scripts tests
 
       - name: Lint with pyflakes
-        run: python -m pyflakes main.py handlers.py config.py database.py reminder_scheduler.py redaction.py app tests
+        run: python -m pyflakes main.py handlers.py config.py database.py reminder_scheduler.py redaction.py app tests scripts/staging_validate.py scripts/staging_rollback.py
 
       - name: Run tests
         run: pytest -v
@@ -84,6 +84,116 @@ jobs:
           base: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
           head: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           extra_args: --only-verified
+
+  staging:
+    name: Staging stack (compose + images)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      # Non-secret stand-ins so `${VAR:?}` interpolation resolves. Never a real
+      # credential: CI only needs compose to resolve and Docker to build.
+      - name: Create a sanitized staging env file for CI
+        run: |
+          cp .env.staging.example .env.staging
+          cat >> .env.staging <<'EOF'
+          AUSTRO_ENVIRONMENT=staging
+          BOT_TOKEN=000000000:CI-placeholder-not-a-real-token
+          GEMINI_API_KEY=ci-placeholder-key
+          DB_HOST=staging-db.internal.example
+          DB_NAME=austro_ai_staging
+          DB_USER=austro_staging
+          DB_PASSWORD=ci-placeholder-password
+          WEBHOOK_SECRET=ci-placeholder-webhook-secret
+          EOF
+          echo "sanitized .env.staging created (placeholder values only)"
+
+      # A synthetic production env file so the isolation check has something to
+      # compare against. Placeholder values only, and deliberately different.
+      - name: Create a sanitized production env stand-in for comparison
+        run: |
+          cat > .env <<'EOF'
+          AUSTRO_ENVIRONMENT=production
+          BOT_TOKEN=111111111:CI-production-placeholder-token
+          GEMINI_API_KEY=ci-production-placeholder-key
+          DB_HOST=prod-db.internal.example
+          DB_NAME=austro_ai
+          DB_USER=austro
+          DB_PASSWORD=ci-production-placeholder-password
+          WEBHOOK_URL=https://example.com/webhook
+          WEBHOOK_SECRET=ci-production-placeholder-webhook-secret
+          EOF
+          echo "sanitized .env stand-in created (placeholder values only)"
+
+      - name: Validate the staging and production compose files
+        run: |
+          docker compose -f docker-compose.staging.yml -p austro-staging \
+            --env-file .env.staging config -q
+          docker compose -f docker-compose.staging.yml -p austro-staging \
+            --env-file .env.staging config --services
+          echo "staging compose config: OK"
+
+      - name: Staging env file must stay untracked
+        run: |
+          if git check-ignore -q .env.staging; then
+            echo ".env.staging is git-ignored: OK"
+          else
+            echo "ERROR: .env.staging is not git-ignored"; exit 1
+          fi
+          if git check-ignore -q .env.staging.example; then
+            echo "ERROR: .env.staging.example must be trackable"; exit 1
+          fi
+          echo ".env.staging.example is trackable: OK"
+
+      - name: Staging isolation preflight (no Docker needed)
+        run: python scripts/staging_validate.py --env-file .env.staging --static
+
+      - name: Staging isolation preflight must reject shared production secrets
+        run: |
+          cp .env.staging .env.staging.bak
+          echo "BOT_TOKEN=111111111:CI-production-placeholder-token" >> .env.staging
+          if python scripts/staging_validate.py --env-file .env.staging --static; then
+            echo "ERROR: a token shared with production was not rejected"; exit 1
+          fi
+          mv .env.staging.bak .env.staging
+          echo "shared-secret rejection: OK"
+
+      - name: Build the staging app image
+        run: |
+          docker compose -f docker-compose.staging.yml -p austro-staging \
+            --env-file .env.staging build app
+
+      - name: Build the staging backup image
+        run: |
+          docker compose -f docker-compose.staging.yml -p austro-staging \
+            --env-file .env.staging build backup
+
+      - name: Print the staging validation plan
+        run: python scripts/staging_validate.py
+
+      - name: Staging rollback is refused outside staging
+        run: |
+          printf 'AUSTRO_ENVIRONMENT=production\n' > .env.prod-guard
+          if python scripts/staging_rollback.py --env-file .env.prod-guard \
+               --image austro-staging-app:5f0d604 --plan; then
+            echo "ERROR: a non-staging environment was not refused"; exit 1
+          fi
+          if python scripts/staging_rollback.py --env-file .env.staging \
+               --image austro-ai-app:main --plan; then
+            echo "ERROR: a production image was not refused"; exit 1
+          fi
+          if python scripts/staging_rollback.py --env-file .env.staging \
+               --image austro-staging-app:local --plan; then
+            echo "ERROR: an unidentifiable image was not refused"; exit 1
+          fi
+          echo "rollback guards: OK"
 
   dependency-audit:
     runs-on: ubuntu-latest

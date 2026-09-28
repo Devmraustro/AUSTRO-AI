@@ -1,0 +1,160 @@
+# AUSTRO AI — ISOLATED STAGING STACK (release-checklist item 11)
+#
+# This file is STANDALONE on purpose. It is NOT an override of
+# docker-compose.yml, so the production stack cannot be mutated, reconfigured
+# or stopped by anything done here. Every name below is staging-scoped:
+#
+#   project   : austro-staging   (docker compose -p, set below)
+#   containers: austro-staging-app / -backup / -db
+#   network   : austro-staging-network   (production uses austro-network)
+#   volumes   : austro-staging_{knowledge_storage,logs,backups,postgres_data}
+#
+# Nothing in this file references the production `.env`. Real staging secrets
+# live in `.env.staging` (git-ignored); the committed template is
+# `.env.staging.example`.
+#
+# ---------------------------------------------------------------------------
+# USAGE (on the staging host)
+#   cp .env.staging.example .env.staging      # then fill in real values
+#   docker compose -f docker-compose.staging.yml --env-file .env.staging config -q
+#   docker compose -f docker-compose.staging.yml --env-file .env.staging up -d --build app
+#   docker compose -f docker-compose.staging.yml ps
+#   docker compose -f docker-compose.staging.yml down          # stops staging ONLY
+#
+# Fully automated validation (compose config, build, cold start, health,
+# smoke, isolation, storage, restart):
+#   python scripts/staging_validate.py --env-file .env.staging --execute
+# Rollback: python scripts/staging_rollback.py --env-file .env.staging --plan
+#
+# ---------------------------------------------------------------------------
+# DATABASE: production runs on an EXTERNALLY MANAGED PostgreSQL. Staging must
+# point at a DIFFERENT, dedicated database (DB_NAME must be staging-marked —
+# enforced by app/config/deployment_validation.py). The optional
+# `staging-db` service below is a LOCAL-ONLY PostgreSQL 16 for dry runs; it is
+# profile-gated so it is never started by accident and it can never be the
+# production database.
+#
+# BACKUP: the staging backup worker is profile-gated (`staging-backup`) and
+# reads ONLY staging DB_* values. It is never started by `up -d app` and must
+# never be pointed at the production database.
+
+name: austro-staging
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: austro-staging-app:${STAGING_TAG:-local}
+    container_name: austro-staging-app
+    environment:
+      # --- staging identity (never production) ---------------------------
+      AUSTRO_ENVIRONMENT: staging
+      AUSTRO_STAGING_ID: ${STAGING_ID:?set STAGING_ID in .env.staging}
+      # Staging keeps INFO so a dry run is diagnosable; this is the ONLY
+      # intentional difference from the production validation rules.
+      AUSTRO_LOG_LEVEL: ${STAGING_LOG_LEVEL:-INFO}
+      # Production-like security parity: real provider path, no local fallback.
+      USE_LOCAL_FALLBACK: "false"
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?set GEMINI_API_KEY in .env.staging}
+      # Dedicated staging bot (from @BotFather) - never the production token.
+      BOT_TOKEN: ${BOT_TOKEN:?set the staging BOT_TOKEN in .env.staging}
+      # Dedicated staging webhook URL + secret (configuration only today:
+      # the runtime long-polls, see app/config/deployment_validation.py).
+      TELEGRAM_TRANSPORT: polling
+      WEBHOOK_URL: ${WEBHOOK_URL:?set the staging WEBHOOK_URL in .env.staging}
+      WEBHOOK_PORT: ${WEBHOOK_PORT:-9443}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:?set the staging WEBHOOK_SECRET}
+      # --- dedicated staging database (never the production DB) ----------
+      DB_ENGINE: postgresql
+      DB_HOST: ${DB_HOST:?set the staging DB_HOST in .env.staging}
+      DB_PORT: ${DB_PORT:-5432}
+      DB_NAME: ${DB_NAME:?set a staging-marked DB_NAME in .env.staging}
+      DB_USER: ${DB_USER:?set the staging DB_USER in .env.staging}
+      DB_PASSWORD: ${DB_PASSWORD:?set the staging DB_PASSWORD in .env.staging}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+      DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-30}
+      DB_POOL_RECYCLE: ${DB_POOL_RECYCLE:-1800}
+      # Bounded database wait so a wrong DB_HOST fails fast instead of
+      # hanging the container in a restart loop.
+      DB_WAIT_TIMEOUT_SECONDS: ${DB_WAIT_TIMEOUT_SECONDS:-120}
+    ports:
+      - "${STAGING_WEBHOOK_BIND:-127.0.0.1}:${WEBHOOK_PORT:-9443}:${WEBHOOK_PORT:-9443}"
+    volumes:
+      - knowledge_storage:/app/knowledge_storage
+      - logs:/app/logs
+      - backups:/app/backups
+    networks:
+      - staging
+    restart: unless-stopped
+    # Health: config + DB reachable + storage writable (scripts/healthcheck.py).
+    healthcheck:
+      test: ["CMD", "python", "scripts/healthcheck.py"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # Optional staging-only backup worker. Profile-gated: `up -d app` never starts
+  # it. It can only ever dump the staging database (DB_* come from
+  # .env.staging), so production data is out of reach.
+  backup:
+    build:
+      context: .
+      dockerfile: Dockerfile.backup
+    image: austro-staging-backup:${STAGING_TAG:-local}
+    container_name: austro-staging-backup
+    profiles: ["staging-backup"]
+    environment:
+      DB_ENGINE: postgresql
+      DB_HOST: ${DB_HOST:?set the staging DB_HOST in .env.staging}
+      DB_PORT: ${DB_PORT:-5432}
+      DB_NAME: ${DB_NAME:?set a staging-marked DB_NAME in .env.staging}
+      DB_USER: ${DB_USER:?set the staging DB_USER in .env.staging}
+      DB_PASSWORD: ${DB_PASSWORD:?set the staging DB_PASSWORD in .env.staging}
+      BACKUP_OUTDIR: /app/backups
+      BACKUP_SCHEDULE_UTC_HOUR: ${BACKUP_SCHEDULE_UTC_HOUR:-2}
+      BACKUP_SCHEDULE_UTC_MINUTE: ${BACKUP_SCHEDULE_UTC_MINUTE:-0}
+      BACKUP_DAILY_KEEP: ${BACKUP_DAILY_KEEP:-7}
+      BACKUP_MONTHLY_KEEP: ${BACKUP_MONTHLY_KEEP:-30}
+      BACKUP_RETRY_MINUTES: ${BACKUP_RETRY_MINUTES:-60}
+    volumes:
+      - backups:/app/backups
+    networks:
+      - staging
+    restart: unless-stopped
+
+  # LOCAL-ONLY staging PostgreSQL 16 (profile-gated dry-run database).
+  # Creates a DEDICATED staging database/role; it is not and cannot be the
+  # production database. For a real staging slot prefer an externally managed
+  # staging instance and leave this service unused.
+  staging-db:
+    image: postgres:16-alpine
+    container_name: austro-staging-db
+    profiles: ["local-staging-db"]
+    environment:
+      POSTGRES_DB: ${DB_NAME:-austro_ai_staging}
+      POSTGRES_USER: ${DB_USER:-austro_staging}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set the staging DB_PASSWORD in .env.staging}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - staging
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-austro_staging} -d ${DB_NAME:-austro_ai_staging}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  knowledge_storage:
+  logs:
+  backups:
+  postgres_data:
+
+networks:
+  staging:
+    name: austro-staging-network
