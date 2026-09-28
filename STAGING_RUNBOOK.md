@@ -188,12 +188,16 @@ before, so these were latent in production too:
    docker-entrypoint.sh` as the non-root user on a root-owned file, so
    `docker build` failed with "Operation not permitted". The script is now copied
    with `COPY --chmod=0755` before the user switch.
-3. **Unpinned PGDG suite in `Dockerfile.backup`.** The apt source line lacked the
-   PostgreSQL 16 component, so apt selected `libpq5` 18.x, whose
-   `libldap-2.5-0` dependency does not exist on bookworm, and the image could not
-   be built at all. The line now pins `bookworm-pgdg main 16`, exactly as the
-   official `postgres:16` image does, and CI asserts the image really reports
-   `pg_dump (PostgreSQL) 16.x`.
+3. **Unbuildable backup image.** `Dockerfile.backup` installed
+   `postgresql-client-16` from the PGDG apt repository on `python:3.12-slim`.
+   Without a PostgreSQL component pin, apt also sees every other major, selects
+   `libpq5` 18.x, and the build dies because `libldap-2.5-0` does not exist on
+   bookworm. The image is now based on the official `postgres:16-bookworm`, so
+   the client comes from Docker Hub (rebuilt for every PG 16 patch release) and
+   no third-party apt repository is involved. The build asserts
+   `pg_dump (PostgreSQL) 16.x`, and CI runs the image to check it again. The
+   backup scripts are unchanged; they now run on the base image's Python 3.11
+   (plain, version-agnostic code), while the application image stays 3.12.
 
 None of these change application behaviour; they only make the images buildable
 and able to start. The backup scheduler's Python code is unchanged.

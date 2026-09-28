@@ -92,8 +92,9 @@ Each step lists the command or file to use and what "done" means.
   - ✅ Procedure: `STAGING_RUNBOOK.md`.
   - ✅ CI builds the real images, which exposed three latent build blockers in
     the shared `Dockerfile`/`Dockerfile.backup` (missing `postgresql-client` for
-    `pg_isready`; a `chmod` that ran as the non-root user; an unpinned PGDG apt
-    suite in the backup image). All three fixed — see `STAGING_RUNBOOK.md` §7.
+    `pg_isready`; a `chmod` that ran as the non-root user; an unresolvable PGDG
+    apt dependency in the backup image). All three fixed — see
+    `STAGING_RUNBOOK.md` §7.
   - ⬜ **Still open (needs the host):** provision a staging PostgreSQL, a second
     @BotFather bot and a staging webhook URL/secret, then run
     `python scripts/staging_validate.py --execute` and record the 10 results.

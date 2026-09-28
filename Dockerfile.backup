@@ -4,12 +4,23 @@
 # (scripts/pg_backup.py) on a UTC schedule (scripts/backup_scheduler.py) as an
 # INDEPENDENT container. It is never part of the Telegram update loop.
 #
-# Why a dedicated image: the application image (Dockerfile) intentionally ships
-# no PostgreSQL client binaries. The backup job needs a pg_dump whose major
-# version matches the production server (PostgreSQL 16), so `postgresql-client-16`
-# is installed from the official PGDG apt repository. `pg_dump` refuses to dump
-# from a NEWER server than its own major version, so this pin is what makes the
-# job production-safe against the PostgreSQL 16 target.
+# Why a dedicated image: the application image (Dockerfile) ships no PostgreSQL
+# server/client suite. The backup job needs a pg_dump whose major version
+# matches the production server (PostgreSQL 16): `pg_dump` refuses to dump from
+# a NEWER server than its own major version, so this pin is what makes the job
+# safe against the PostgreSQL 16 target. The version is asserted at build time.
+#
+# Why this base image: the previous build installed `postgresql-client-16` from
+# the PGDG apt repository on `python:3.12-slim` and could not be built at all.
+# Without a PostgreSQL component pin, apt also sees every other major, selects
+# the newest `libpq5` (18.x), and the build dies with
+#   libpq5:amd64=18.6-1.pgdg12+2 Depends libldap-2.5-0 (>= 2.5.4)
+#   but none of the choices are installable
+# because that dependency does not exist on bookworm. Basing the image on the
+# official `postgres:16-bookworm` takes the client from Docker Hub, where it is
+# rebuilt and verified for every PostgreSQL 16 patch release, and removes the
+# third-party apt repository (and its key) from the build entirely. The cost is
+# a larger image: this worker never runs the server, only the client tools.
 #
 # Build:  docker build -f Dockerfile.backup -t austro-backup:latest .
 # Run:    docker compose --env-file .env up -d backup
@@ -18,37 +29,33 @@
 # into the image. pg_dump receives it through a 0600 .pgpass file created at
 # run time - never in command arguments, never in logs.
 
-FROM python:3.12-slim
+FROM postgres:16-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# PostgreSQL 16 client (pg_dump + psql) from PGDG, plus a gzip/tar-free base.
-#
-# The trailing `16` in the sources line is REQUIRED, not decoration: it pins the
-# apt "suite" to the PostgreSQL 16 component. Without it apt also sees every
-# other major, selects the newest `libpq5` (18.x), and the build dies with
-# "libpq5:amd64=18.6-1.pgdg12+2 Depends libldap-2.5-0 (>= 2.5.4) but none of
-# the choices are installable" because that dependency does not exist on
-# bookworm. The official postgres:16 image uses the same component pin.
+# Python for the two backup scripts. The base image already puts
+# /usr/lib/postgresql/16/bin (pg_dump, psql) on PATH; this only adds the
+# interpreter and the driver, all from Debian bookworm's own repositories.
+# The scripts are plain, version-agnostic code (3.9+ features only), so the
+# distribution's Python 3.11 is sufficient; the application image remains 3.12.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates \
-        curl \
-        gnupg \
-    && install -d /usr/share/postgresql-common/pgdg \
-    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-        -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
-    && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
-http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main 16" \
-        > /etc/apt/sources.list.d/pgdg.list \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends postgresql-client-16 \
-    && pg_dump --version \
-    && rm -rf /var/lib/apt/lists/*
+        python3 \
+        python3-venv \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m venv /opt/backup-venv \
+    && /opt/backup-venv/bin/pip install --no-cache-dir "psycopg2-binary>=2.9,<3"
 
-# Only the driver the backup job needs (keeps the image small and free of
-# Telegram/bot dependencies; this worker never boots the bot).
-RUN pip install --no-cache-dir "psycopg2-binary>=2.9,<3"
+ENV PATH="/opt/backup-venv/bin:$PATH"
+
+# The client major version is a production-safety property, so fail the build
+# rather than ship an image that cannot dump the PostgreSQL 16 target.
+RUN pg_dump --version | grep -Eq "pg_dump \(PostgreSQL\) 16\." \
+    && python3 -c "import psycopg2; print('psycopg2', psycopg2.__version__)"
+
+# Note: this base image declares VOLUME /var/lib/postgresql/data. The worker
+# never runs the server, so that path is unused; the only data that matters is
+# /app/backups, which the compose service mounts explicitly.
 
 WORKDIR /app
 COPY scripts/ ./scripts/
