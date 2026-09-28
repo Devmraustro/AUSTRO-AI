@@ -56,8 +56,10 @@ knowledge_storage + logs are writable.
 `DB_ENGINE=postgresql`, bounded by `DB_WAIT_TIMEOUT_SECONDS`, default 120s, then
 fails fast with a clear message) and runs `DatabaseManager()` +
 `apply_migrations()` before booting the bot, so schema is applied before first
-traffic. The app image ships `postgresql-client` so `pg_isready` exists; before
-that the wait loop could never succeed.
+traffic. Two build/start blockers were fixed in the same change: the app image
+now ships `postgresql-client` (so `pg_isready` exists) and the entrypoint is
+copied with `COPY --chmod=0755` before the `USER austro` switch (a `RUN chmod`
+there fails with "Operation not permitted" and made the image unbuildable).
 
 ### Staging is a separate stack, never this one
 

@@ -24,15 +24,17 @@ COPY . .
 # Create non-root user
 RUN useradd --create-home --shell /bin/bash austro
 RUN chown -R austro:austro /app
+
+# Startup script. This MUST happen before `USER austro`: `--chmod` is applied by
+# the builder as root, whereas a later `RUN chmod +x` executes as `austro` and
+# fails with "Operation not permitted" on this root-owned file.
+COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/
+
 USER austro
 
 # Health check: config + database reachable (readiness)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD python scripts/healthcheck.py
-
-# Startup script
-COPY docker-entrypoint.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["python", "main.py"]

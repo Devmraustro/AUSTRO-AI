@@ -2,3 +2,5 @@
 pytest>=9.0.3,<10
 pytest-asyncio>=0.24,<2
 pyflakes>=3.2,<4
+# tests/test_staging.py parses the compose files to assert staging isolation
+PyYAML>=6.0,<7

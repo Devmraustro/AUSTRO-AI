@@ -172,3 +172,22 @@ Guarantees, all enforced in code:
   startup are validated.
 * `scripts/staging_validate.py --execute` has not been run end to end, so treat
   the live checks as untested code until the first staging deploy.
+
+---
+
+## 7. Two boot/build blockers this work found in the shared image
+
+Both were found by the CI `staging` job, which builds the real `Dockerfile`; the
+app image had never been built in CI before, so these were latent in production
+too:
+
+1. **Missing `postgresql-client`.** `docker-entrypoint.sh` calls `pg_isready`,
+   which was not installed, so the database wait could never succeed. The wait is
+   now bounded (`DB_WAIT_TIMEOUT_SECONDS`, default 120) and fails fast.
+2. **`chmod` after `USER austro`.** The image ran `RUN chmod +x
+   docker-entrypoint.sh` as the non-root user on a root-owned file, so
+   `docker build` failed with "Operation not permitted". The script is now copied
+   with `COPY --chmod=0755` before the user switch.
+
+Neither change alters application behaviour; both only make the image buildable
+and able to start.
