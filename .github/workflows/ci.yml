@@ -175,6 +175,16 @@ jobs:
           docker compose -f docker-compose.staging.yml -p austro-staging \
             --env-file .env.staging build backup
 
+      - name: The backup image ships a matching pg_dump
+        run: |
+          set -o pipefail
+          docker compose -f docker-compose.staging.yml -p austro-staging \
+            --env-file .env.staging run --rm --no-deps \
+            --entrypoint sh backup -c "pg_dump --version" | tee /tmp/pgdump.txt
+          grep -qE "pg_dump \(PostgreSQL\) 16\." /tmp/pgdump.txt || {
+            echo "ERROR: pg_dump must match the PostgreSQL 16 target"; exit 1; }
+          echo "backup image pg_dump: OK"
+
       - name: Print the staging validation plan
         run: python scripts/staging_validate.py
 

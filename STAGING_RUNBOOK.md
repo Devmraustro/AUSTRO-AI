@@ -175,11 +175,11 @@ Guarantees, all enforced in code:
 
 ---
 
-## 7. Two boot/build blockers this work found in the shared image
+## 7. Three boot/build blockers this work found in the shared images
 
-Both were found by the CI `staging` job, which builds the real `Dockerfile`; the
-app image had never been built in CI before, so these were latent in production
-too:
+All three were found by the CI `staging` job, which builds the real
+`Dockerfile` and `Dockerfile.backup`; neither image had ever been built in CI
+before, so these were latent in production too:
 
 1. **Missing `postgresql-client`.** `docker-entrypoint.sh` calls `pg_isready`,
    which was not installed, so the database wait could never succeed. The wait is
@@ -188,6 +188,12 @@ too:
    docker-entrypoint.sh` as the non-root user on a root-owned file, so
    `docker build` failed with "Operation not permitted". The script is now copied
    with `COPY --chmod=0755` before the user switch.
+3. **Unpinned PGDG suite in `Dockerfile.backup`.** The apt source line lacked the
+   PostgreSQL 16 component, so apt selected `libpq5` 18.x, whose
+   `libldap-2.5-0` dependency does not exist on bookworm, and the image could not
+   be built at all. The line now pins `bookworm-pgdg main 16`, exactly as the
+   official `postgres:16` image does, and CI asserts the image really reports
+   `pg_dump (PostgreSQL) 16.x`.
 
-Neither change alters application behaviour; both only make the image buildable
-and able to start.
+None of these change application behaviour; they only make the images buildable
+and able to start. The backup scheduler's Python code is unchanged.

@@ -23,6 +23,13 @@ FROM python:3.12-slim
 ENV DEBIAN_FRONTEND=noninteractive
 
 # PostgreSQL 16 client (pg_dump + psql) from PGDG, plus a gzip/tar-free base.
+#
+# The trailing `16` in the sources line is REQUIRED, not decoration: it pins the
+# apt "suite" to the PostgreSQL 16 component. Without it apt also sees every
+# other major, selects the newest `libpq5` (18.x), and the build dies with
+# "libpq5:amd64=18.6-1.pgdg12+2 Depends libldap-2.5-0 (>= 2.5.4) but none of
+# the choices are installable" because that dependency does not exist on
+# bookworm. The official postgres:16 image uses the same component pin.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -32,10 +39,11 @@ RUN apt-get update \
     && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
         -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
     && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
-http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main 16" \
         > /etc/apt/sources.list.d/pgdg.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends postgresql-client-16 \
+    && pg_dump --version \
     && rm -rf /var/lib/apt/lists/*
 
 # Only the driver the backup job needs (keeps the image small and free of
