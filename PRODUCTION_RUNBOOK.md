@@ -56,10 +56,14 @@ knowledge_storage + logs are writable.
 `DB_ENGINE=postgresql`, bounded by `DB_WAIT_TIMEOUT_SECONDS`, default 120s, then
 fails fast with a clear message) and runs `DatabaseManager()` +
 `apply_migrations()` before booting the bot, so schema is applied before first
-traffic. Two build/start blockers were fixed in the same change: the app image
-now ships `postgresql-client` (so `pg_isready` exists) and the entrypoint is
+traffic. Three build/start blockers were fixed in the same change: the app image
+now ships `postgresql-client` (so `pg_isready` exists); the entrypoint is
 copied with `COPY --chmod=0755` before the `USER austro` switch (a `RUN chmod`
-there fails with "Operation not permitted" and made the image unbuildable).
+there fails with "Operation not permitted" and made the image unbuildable); and
+`Dockerfile.backup` is now based on the official `postgres:16-bookworm` image
+instead of installing `postgresql-client-16` from PGDG, which could not resolve
+on bookworm and made the backup image unbuildable. CI now builds both images and
+asserts `pg_dump (PostgreSQL) 16.x` in the backup image. See `STAGING_RUNBOOK.md` §7.
 
 ### Staging is a separate stack, never this one
 
