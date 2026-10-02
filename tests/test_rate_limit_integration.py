@@ -564,18 +564,32 @@ def _tight_limiter():
 
 
 async def _run(handler, module_name, mw, services, update, context):
-    """Run one handler after monkeypatching middleware + services in its module."""
+    """Run one handler after monkeypatching middleware + services in its module.
+
+    The rate-limit guards now live in `app.telegram.handlers`, so the limiter
+    must be injected there even when the handler itself is a slash command in
+    `app.telegram.main`. Both modules are patched so either layout works.
+    """
     import importlib
-    module = importlib.import_module(module_name)
-    orig_middleware = module.get_rate_limit_middleware
-    orig_services = module.get_services
-    module.get_rate_limit_middleware = lambda: mw
-    module.get_services = lambda ctx: services
+
+    modules = [importlib.import_module(name) for name in
+               (module_name, "app.telegram.handlers")]
+    orig_mw = [(m, getattr(m, "get_rate_limit_middleware", None)) for m in modules]
+    orig_svc = [(m, getattr(m, "get_services", None)) for m in modules]
+    for module in modules:
+        if hasattr(module, "get_rate_limit_middleware"):
+            module.get_rate_limit_middleware = lambda: mw
+        if hasattr(module, "get_services"):
+            module.get_services = lambda ctx: services
     try:
         return await handler(update, context)
     finally:
-        module.get_rate_limit_middleware = orig_middleware
-        module.get_services = orig_services
+        for module, saved in orig_mw:
+            if saved is not None:
+                module.get_rate_limit_middleware = saved
+        for module, saved in orig_svc:
+            if saved is not None:
+                module.get_services = saved
 
 
 async def test_blocked_command_does_not_execute_handler():

@@ -30,10 +30,11 @@ from app.core.errors import public_message
 from app.domain.context import UserContext
 from app.infrastructure.scheduler import ReminderScheduler
 from app.observability.logging_config import setup_logging
-from app.security.rate_limiter import get_rate_limit_middleware
 from app.telegram.handlers import (
     _knowledge_menu_content_for,
     get_accountability_handlers,
+    guard_ai_action,
+    guard_command_action,
     get_english_handlers,
     get_goal_handlers,
     get_habit_handlers,
@@ -56,13 +57,10 @@ logger = logging.getLogger(__name__)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start command"""
+    if not await guard_command_action(update, context):
+        return
     user = update.effective_user
     user_id = user.id
-    _rl = get_rate_limit_middleware()
-    allowed, msg = await _rl.check_command_limit(user_id)
-    if not allowed:
-        await update.message.reply_text(msg)
-        return
     services = get_services(context)
 
     try:
@@ -117,10 +115,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /help command"""
-    _rl = get_rate_limit_middleware()
-    allowed, msg = await _rl.check_command_limit(update.effective_user.id)
-    if not allowed:
-        await update.message.reply_text(msg)
+    if not await guard_command_action(update, context):
         return
     help_text = (
         "🆘 **المساعدة**\n\n"
@@ -142,10 +137,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Quick access to today's plan"""
-    _rl = get_rate_limit_middleware()
-    allowed, msg = await _rl.check_command_limit(update.effective_user.id)
-    if not allowed:
-        await update.message.reply_text(msg)
+    if not await guard_command_action(update, context):
         return
     user_id = update.effective_user.id
     services = get_services(context)
@@ -174,10 +166,7 @@ async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def goals_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Quick access to goals"""
-    _rl = get_rate_limit_middleware()
-    allowed, msg = await _rl.check_command_limit(update.effective_user.id)
-    if not allowed:
-        await update.message.reply_text(msg)
+    if not await guard_command_action(update, context):
         return
     user_id = update.effective_user.id
     services = get_services(context)
@@ -201,10 +190,7 @@ async def goals_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def habits_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Quick access to habits"""
-    _rl = get_rate_limit_middleware()
-    allowed, msg = await _rl.check_command_limit(update.effective_user.id)
-    if not allowed:
-        await update.message.reply_text(msg)
+    if not await guard_command_action(update, context):
         return
     user_id = update.effective_user.id
     services = get_services(context)
@@ -227,10 +213,7 @@ async def habits_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def progress_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Quick access to progress"""
-    _rl = get_rate_limit_middleware()
-    allowed, msg = await _rl.check_command_limit(update.effective_user.id)
-    if not allowed:
-        await update.message.reply_text(msg)
+    if not await guard_command_action(update, context):
         return
     user_id = update.effective_user.id
     services = get_services(context)
@@ -247,10 +230,7 @@ async def progress_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def review_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Quick access to daily review"""
-    _rl = get_rate_limit_middleware()
-    allowed, msg = await _rl.check_command_limit(update.effective_user.id)
-    if not allowed:
-        await update.message.reply_text(msg)
+    if not await guard_command_action(update, context):
         return
     keyboard = [
         [InlineKeyboardButton("🌙 بدء المحاسبة", callback_data="review_daily")],
@@ -266,22 +246,18 @@ async def review_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def coach_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Quick access to AI coach"""
-    _rl = get_rate_limit_middleware()
-    user_id = update.effective_user.id
-    allowed, msg = await _rl.check_command_limit(user_id)
-    if not allowed:
-        await update.message.reply_text(msg)
+    """Quick access to AI coach.
+
+    A command that also spends AI, so it is charged against both budgets: one
+    `command` slot for the slash command itself and the AI budgets for the
+    coaching call it makes.
+    """
+    if not await guard_command_action(update, context):
         return
-    allowed, msg = await _rl.check_ai_limit(user_id)
-    if not allowed:
-        await update.message.reply_text(msg)
-        return
-    allowed, msg = await _rl.check_global_ai_limit()
-    if not allowed:
-        await update.message.reply_text(msg)
+    if not await guard_ai_action(update, context):
         return
     services = get_services(context)
+    user_id = update.effective_user.id
     stats = services.dashboard.stats(user_id)
 
     await update.message.reply_text("⏳ جاري تحليل أدائك...")
@@ -293,10 +269,7 @@ async def coach_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Quick access to dashboard"""
-    _rl = get_rate_limit_middleware()
-    allowed, msg = await _rl.check_command_limit(update.effective_user.id)
-    if not allowed:
-        await update.message.reply_text(msg)
+    if not await guard_command_action(update, context):
         return
     user_id = update.effective_user.id
     services = get_services(context)
@@ -326,10 +299,7 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Quick access to settings"""
-    _rl = get_rate_limit_middleware()
-    allowed, msg = await _rl.check_command_limit(update.effective_user.id)
-    if not allowed:
-        await update.message.reply_text(msg)
+    if not await guard_command_action(update, context):
         return
     keyboard = [
         [InlineKeyboardButton("👤 تعديل الملف الشخصي", callback_data="settings_profile")],
@@ -353,10 +323,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def knowledge_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Quick access to the knowledge library menu."""
-    _rl = get_rate_limit_middleware()
-    allowed, msg = await _rl.check_command_limit(update.effective_user.id)
-    if not allowed:
-        await update.message.reply_text(msg)
+    if not await guard_command_action(update, context):
         return
     services = get_services(context)
     text, markup = _knowledge_menu_content_for(

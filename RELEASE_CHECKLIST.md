@@ -41,20 +41,73 @@ Each step lists the command or file to use and what "done" means.
   endpoint, DB connection alerts, AI provider alerts, backup-failed alert, disk/
   memory thresholds. Wire alertmanager to the ops Slack/Telegram.
 
-- [ ] **8. Wire rate-limit guards into handler entry points.**
-  `app/security/rate_limiter.py` exposes `check_command_rate_limit`,
-  `check_ai_rate_limit`, `check_upload_rate_limit`, `check_ingestion_rate_limit`,
-  `check_expensive_operation_limit`, `check_global_ai_limit`, and
-  `RateLimitMiddleware`. Add the guard + `RateLimitError` → friendly reply at each
-  public conversation entry before the state machines (recommend: top of
-  `app/telegram/handlers.py` command/state entry functions and
-  `app/telegram/main.py` message router).
+- [x] **8. Wire rate-limit guards into handler entry points.** ✅ **Code side
+  done (2026-10-02).** Every user-facing entry point now declares its bucket and
+  is guarded before it touches services, state, or a provider.
+  - ✅ **Shared guards** in `app/telegram/handlers.py`:
+    `guard_command_action` spends the per-user `command` budget;
+    `guard_ai_action` spends **both** the per-user `ai_request` budget **and** the
+    shared `global_ai` budget, so one noisy user cannot exhaust provider capacity
+    for everyone; `guard_expensive_action` spends the `expensive` budget. Plus
+    `notify_rate_limited`, which answers a blocked callback query with
+    `show_alert=True` so the button never spins, and replies safely on messages.
+  - ✅ **Explicit entry-point → bucket map**: `ENTRY_POINT_RATELIMITS`
+    (73 handlers, `handlers.py`) and `MAIN_COMMAND_RATELIMITS`
+    (12 slash commands, `main.py`). Both maps are validated against the real
+    `build_application()` handler graph and against the guards actually present
+    in each function body, so a stale entry fails the suite instead of silently
+    becoming a bypass. `UNGUARDED_CONVERSATION_STATES` documents the 29
+    intermediate steps that must **not** be charged.
+  - ✅ **Charge-once-per-started-flow**: the guard sits at the flow/menu/action
+    entry, never at each `ConversationHandler` state, so a five-step goal
+    conversation spends one `command` slot, not five.
+  - ✅ **Ordering fix**: `knowledge_question` is a global `TEXT` handler, so it
+    checked the AI budget *before* its ask-mode gate — draining the AI quota for
+    every unrelated message and for messages owned by another flow. The gate now
+    runs first, so only real questions are charged.
+  - ✅ **`memory_export`** reads the whole memory store and pushes a file; added
+    to the `command` bucket (the map-coverage test caught this gap).
+  - ✅ **Deliberately unguarded**, so a throttled user can always recover:
+    `/cancel`, conversation fallbacks, and the background `_ingest_book` task
+    (already charged at the upload entry point — charging twice would halve the
+    effective ingestion budget).
+  - ✅ **`settings_ai_reconnect`** uses the `expensive` bucket because
+    `AIGateway.reconnect()` issues a real, billable provider health request.
+  - ✅ **Bug found and fixed while testing**: `memory_text` built its reply
+    keyboard as a flat list, which python-telegram-bot rejects — every branch
+    (search/edit/forget) raised `ValueError`, so the memory flow was entirely
+    non-functional. Pre-existing in the baseline; now `[[button]]`.
+  - ✅ **Tests** — `tests/test_rate_limit_guards.py` (30) and
+    `tests/test_rate_limit_commands.py` (28) are deterministic: no live Telegram,
+    no live AI, no network. Each drives the **real** handler with a fake update
+    and a limiter pinned to a budget of 1, then asserts either
+    *allowed → protected logic ran exactly once*, or
+    *blocked → safe user-facing reply, zero provider calls, zero DB writes, zero
+    state transitions, zero background tasks, and the callback query answered*.
+    Also covered: per-user isolation for `command` and `expensive`, a different
+    user draining `global_ai`, background ingestion not charged twice, blocked
+    callbacks never calling `edit_message_text`, `/cancel` and fallbacks working
+    at zero budget, and the throttle message leaking no credential.
+  - ✅ Full suite green: **363 passed / 18 skipped**; `pyflakes` (CI scope) exit
+    0, `compileall` exit 0, `git diff --check` clean, `scripts/verify.py` 100%.
+  - ℹ️ Method-name note: the checklist previously cited
+    `check_*_rate_limit`; the actual API is `check_command_limit`,
+    `check_ai_limit`, `check_upload_limit`, `check_ingestion_limit`,
+    `check_expensive_limit`, `check_global_ai_limit` behind
+    `RateLimitMiddleware`.
 
 ## HARDENING (after E2E passes)
 
-- [ ] **9. Fix the misleading "Using local fallback." warning** in
-  `app/ai/gemini.py` (lines 83–92) so provider errors don't imply fallback when
-  `USE_LOCAL_FALLBACK=0`.
+- [x] **9. Fix the misleading "Using local fallback." warning** in
+  `app/ai/gemini.py` — ✅ **verified done (2026-10-02)**.
+  `fallback_status()` now reports the *configured* state instead of claiming a
+  fallback already happened: `"Local AI fallback is enabled."` when
+  `USE_LOCAL_FALLBACK` is on, otherwise an explicit
+  `"Local AI fallback is disabled; the gateway will return its safe built-in
+  response if Gemini is unavailable."` The string `"Using local fallback."` no
+  longer exists in the codebase. Covered by `tests/test_architecture.py` for
+  the enabled case, the disabled case, and for timeout / connection / error
+  paths not logging a false fallback claim.
 - [ ] **10. Configure daily backup cron** (02:00 UTC) + retention per
   `DISASTER_RECOVERY.md`; run `scripts/pg_backup.py` nightly and one restore
   drill per release.

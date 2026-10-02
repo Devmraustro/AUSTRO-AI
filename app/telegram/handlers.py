@@ -4,6 +4,29 @@ AUSTRO AI - Telegram handlers (PRESENTATION ONLY).
 Every callback here is a thin adapter: it reads Telegram updates, calls the
 right application service via the DI container (`get_services(context)`) and
 renders the reply. No business rules, no SQL, no direct AI calls live here.
+
+Rate limiting (release checklist item 8)
+=========================================
+The rule applied to every user-initiated entry point:
+
+* Charge at the action that STARTS the user's work - a command, an inline menu
+  tap, a conversation entry point, or a standalone action button.
+* Never charge the intermediate prompts of an already-charged flow. A five-step
+  "create a goal" conversation is ONE semantic action, so it is charged once at
+  `goal_new` and the four state handlers after it are free. Charging them again
+  would spend five command slots for one goal.
+* Never charge one action against two buckets for the same work. The knowledge
+  upload path spends `upload` (the transfer) and `ingestion` (the processing
+  pipeline that follows); it does not additionally spend `expensive`.
+* Recovery paths stay usable. `/cancel` and `fallback_cancel` are never charged,
+  so a throttled user can always escape a conversation.
+* The guard runs before every side effect: before state transitions, before
+  provider calls, before upload registration, before database writes and before
+  any background task is created.
+
+`ENTRY_POINT_RATELIMITS` below records the intended bucket for each guarded
+entry point. `tests/test_rate_limit_guards.py` verifies that map against the
+actual handler code, so the map cannot drift from the implementation.
 """
 
 from __future__ import annotations
@@ -32,9 +55,170 @@ import json
 
 logger = logging.getLogger(__name__)
 
+# Buckets used by the guard helpers below.
+COMMAND = "command"
+AI = "ai_request+global_ai"
+UPLOAD = "upload+ingestion"
+EXPENSIVE = "expensive"
+NONE = "none"
+
+#: Intended bucket for every guarded user-facing entry point in this module.
+#: Kept in sync with the code by ``tests/test_rate_limit_guards.py``.
+ENTRY_POINT_RATELIMITS: dict[str, str] = {
+    # --- inline menu navigation (mirrors the rate-limited slash commands) ---
+    "menu_main": COMMAND,
+    "menu_goals": COMMAND,
+    "goal_list": COMMAND,
+    "menu_plan": COMMAND,
+    "plan_today": COMMAND,
+    "menu_study": COMMAND,
+    "menu_english": COMMAND,
+    "menu_programming": COMMAND,
+    "menu_discipline": COMMAND,
+    "discipline_check": COMMAND,
+    "menu_habits": COMMAND,
+    "habit_list": COMMAND,
+    "menu_progress": COMMAND,
+    "menu_dashboard": COMMAND,
+    "menu_review": COMMAND,
+    "review_history": COMMAND,
+    "menu_settings": COMMAND,
+    "settings_profile": COMMAND,
+    "settings_reminders": COMMAND,
+    "reminder_new": COMMAND,
+    "settings_ai": COMMAND,
+    "menu_knowledge": COMMAND,
+    "knowledge_books": COMMAND,
+    "knowledge_upload": COMMAND,
+    "knowledge_search": COMMAND,
+    "knowledge_collections": COMMAND,
+    "knowledge_processing": COMMAND,
+    "knowledge_settings": COMMAND,
+    "menu_memory": COMMAND,
+    "memory_view": COMMAND,
+    "memory_search": COMMAND,
+    "memory_edit": COMMAND,
+    "memory_forget": COMMAND,
+    "memory_clear": COMMAND,
+    "memory_clear_confirm": COMMAND,
+    "memory_settings": COMMAND,
+    "memory_toggle": COMMAND,
+    "memory_pending": COMMAND,
+    "memory_consent": COMMAND,
+    "memory_export": COMMAND,
+    "menu_learn": COMMAND,
+    "menu_learn_quiz": COMMAND,
+    "learn_quiz_btn": COMMAND,
+    "learn_quiz_done": COMMAND,
+    "menu_learn_review": COMMAND,
+    "learn_review_grade": COMMAND,
+    "menu_learn_plan": COMMAND,
+    "menu_learn_week": COMMAND,
+    # --- conversation entry points: charged once per started flow ---
+    "start_registration": COMMAND,
+    "goal_new": COMMAND,
+    "plan_new": COMMAND,
+    "study_explain": COMMAND,
+    "study_test": COMMAND,
+    "english_correct": COMMAND,
+    "prog_review": COMMAND,
+    "review_daily": COMMAND,
+    "habit_new": COMMAND,
+    "learn_newgoal": COMMAND,
+    # --- AI-producing entry points: per-user AI + global AI budget ---
+    "study_topic": AI,
+    "study_duration": AI,
+    "english_lesson": AI,
+    "english_text": AI,
+    "code_review": AI,
+    "menu_coach": AI,
+    "coach_analysis": AI,
+    "menu_learn_next": AI,
+    "learn_objectives_text": AI,
+    "knowledge_question": AI,
+    # --- document upload: transfer budget + ingestion pipeline budget ---
+    "knowledge_document": UPLOAD,
+    # --- expensive operation: makes a real, billable provider health call ---
+    "settings_ai_reconnect": EXPENSIVE,
+    # --- deliberately uncharged ---
+    "fallback_cancel": NONE,   # recovery path, must always work
+    "memory_text": NONE,       # flow charged at memory_search/edit/forget entry
+    "_ingest_book": NONE,      # background task; charged at knowledge_document
+}
+
+# State handlers that complete a conversation and are intentionally NOT charged,
+# because the flow's entry point already spent one `command` slot for the whole
+# action. Listing them here makes the "do not double-charge" decision auditable.
+UNGUARDED_CONVERSATION_STATES = (
+    "reg_age", "reg_education", "reg_goals", "reg_time",
+    "goal_title", "goal_desc", "goal_category", "goal_stages", "goal_deadline",
+    "plan_tasks", "plan_priorities", "plan_review_time", "plan_break_time",
+    "study_subject", "habit_name", "habit_desc", "habit_frequency", "habit_time",
+    "code_language",
+    "review_accomplished", "review_learned", "review_obstacles", "review_tomorrow",
+    "review_mood", "reminder_title", "reminder_message", "reminder_time",
+    "reminder_confirm", "learn_goal_title",
+)
+
+
+async def notify_rate_limited(update: Update, msg: str) -> None:
+    """Deliver a rate-limit notice on whichever surface the user actually used.
+
+    A blocked callback query MUST still be answered, otherwise Telegram leaves
+    the spinner running on the user's button.
+    """
+    query = getattr(update, "callback_query", None)
+    if query is not None:
+        await query.answer(msg, show_alert=True)
+        return
+    message = getattr(update, "message", None)
+    if message is not None:
+        await message.reply_text(msg)
+
+
+async def guard_command_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Spend one `command` slot. False means the caller must return immediately."""
+    _rl = get_rate_limit_middleware()
+    allowed, msg = await _rl.check_command_limit(update.effective_user.id)
+    if not allowed:
+        await notify_rate_limited(update, msg)
+        return False
+    return True
+
+
+async def guard_ai_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Spend one per-user AI slot and one global AI slot.
+
+    Both budgets must pass; the global budget is what protects the shared
+    provider quota when many users hit the bot at once.
+    """
+    _rl = get_rate_limit_middleware()
+    allowed, msg = await _rl.check_ai_limit(update.effective_user.id)
+    if not allowed:
+        await notify_rate_limited(update, msg)
+        return False
+    allowed, msg = await _rl.check_global_ai_limit()
+    if not allowed:
+        await notify_rate_limited(update, msg)
+        return False
+    return True
+
+
+async def guard_expensive_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Spend one `expensive` slot for a genuinely costly operation."""
+    _rl = get_rate_limit_middleware()
+    allowed, msg = await _rl.check_expensive_limit(update.effective_user.id)
+    if not allowed:
+        await notify_rate_limited(update, msg)
+        return False
+    return True
+
 
 async def fallback_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Common async cancel handler for ConversationHandler fallbacks."""
+    """Common async cancel handler for ConversationHandler fallbacks.
+
+    Never rate limited: a throttled user must always be able to escape.
+    """
     if update and getattr(update, "message", None):
         await update.message.reply_text("تم الإلغاء")
     elif update and getattr(update, "callback_query", None):
@@ -65,6 +249,8 @@ LEARN_GOAL_OBJECTIVES = 101
 
 async def start_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start user registration."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
 
@@ -158,6 +344,8 @@ async def reg_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show goals menu."""
+    if not await guard_command_action(update, context):
+        return None
     services = get_services(context)
     query = update.callback_query
     await query.answer()
@@ -183,6 +371,8 @@ async def menu_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def goal_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start creating a new goal."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
 
@@ -294,6 +484,8 @@ async def goal_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def goal_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show list of goals."""
+    if not await guard_command_action(update, context):
+        return None
     services = get_services(context)
     query = update.callback_query
     await query.answer()
@@ -334,6 +526,8 @@ async def goal_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show plan menu."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
 
@@ -353,6 +547,8 @@ async def menu_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def plan_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show today's plan."""
+    if not await guard_command_action(update, context):
+        return None
     services = get_services(context)
     query = update.callback_query
     await query.answer()
@@ -401,6 +597,8 @@ async def plan_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def plan_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start creating a new plan."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
 
@@ -482,6 +680,8 @@ async def plan_break_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_study(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show study menu."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
 
@@ -502,6 +702,8 @@ async def menu_study(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def study_explain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start concept explanation."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
 
@@ -523,16 +725,8 @@ async def study_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def study_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle topic and generate the explanation via the learning service."""
-    _rl = get_rate_limit_middleware()
-    user_id = update.effective_user.id
-    allowed, msg = await _rl.check_ai_limit(user_id)
-    if not allowed:
-        await update.message.reply_text(msg)
-        return
-    allowed, msg = await _rl.check_global_ai_limit()
-    if not allowed:
-        await update.message.reply_text(msg)
-        return
+    if not await guard_ai_action(update, context):
+        return None
     services = get_services(context)
     concept = context.user_data.get("study_subject")
     subject = update.message.text
@@ -557,6 +751,8 @@ async def study_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def study_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generate a test."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
 
@@ -568,16 +764,8 @@ async def study_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def study_duration(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle test topic and generate the test via the learning service."""
-    _rl = get_rate_limit_middleware()
-    user_id = update.effective_user.id
-    allowed, msg = await _rl.check_ai_limit(user_id)
-    if not allowed:
-        await update.message.reply_text(msg)
-        return
-    allowed, msg = await _rl.check_global_ai_limit()
-    if not allowed:
-        await update.message.reply_text(msg)
-        return
+    if not await guard_ai_action(update, context):
+        return None
     services = get_services(context)
     topic = update.message.text
 
@@ -602,6 +790,8 @@ async def study_duration(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_english(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show English menu."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
 
@@ -621,16 +811,8 @@ async def menu_english(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def english_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generate an English lesson via the learning service."""
-    _rl = get_rate_limit_middleware()
-    user_id = update.effective_user.id
-    allowed, msg = await _rl.check_ai_limit(user_id)
-    if not allowed:
-        await update.callback_query.answer(msg, show_alert=True)
-        return
-    allowed, msg = await _rl.check_global_ai_limit()
-    if not allowed:
-        await update.callback_query.answer(msg, show_alert=True)
-        return
+    if not await guard_ai_action(update, context):
+        return None
     services = get_services(context)
     query = update.callback_query
     await query.answer()
@@ -654,6 +836,8 @@ async def english_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def english_correct(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start English correction."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
 
@@ -665,16 +849,8 @@ async def english_correct(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def english_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle English text correction via the learning service."""
-    _rl = get_rate_limit_middleware()
-    user_id = update.effective_user.id
-    allowed, msg = await _rl.check_ai_limit(user_id)
-    if not allowed:
-        await update.message.reply_text(msg)
-        return
-    allowed, msg = await _rl.check_global_ai_limit()
-    if not allowed:
-        await update.message.reply_text(msg)
-        return
+    if not await guard_ai_action(update, context):
+        return None
     services = get_services(context)
     text = update.message.text
 
@@ -700,6 +876,8 @@ async def english_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_programming(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show programming menu."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
 
@@ -719,6 +897,8 @@ async def menu_programming(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def prog_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start code review."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
 
@@ -740,16 +920,8 @@ async def code_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def code_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle code review via the learning service."""
-    _rl = get_rate_limit_middleware()
-    user_id = update.effective_user.id
-    allowed, msg = await _rl.check_ai_limit(user_id)
-    if not allowed:
-        await update.message.reply_text(msg)
-        return
-    allowed, msg = await _rl.check_global_ai_limit()
-    if not allowed:
-        await update.message.reply_text(msg)
-        return
+    if not await guard_ai_action(update, context):
+        return None
     services = get_services(context)
     code = update.message.text
     language = context.user_data.get("code_language", "python")
@@ -776,6 +948,8 @@ async def code_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_discipline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show discipline menu."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
 
@@ -795,6 +969,8 @@ async def menu_discipline(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def discipline_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show discipline check."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
 
@@ -808,6 +984,8 @@ async def discipline_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_habits(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show habits menu."""
+    if not await guard_command_action(update, context):
+        return None
     services = get_services(context)
     query = update.callback_query
     await query.answer()
@@ -833,6 +1011,8 @@ async def menu_habits(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def habit_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start creating a new habit."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
 
@@ -918,6 +1098,8 @@ async def habit_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def habit_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show habits list."""
+    if not await guard_command_action(update, context):
+        return None
     services = get_services(context)
     query = update.callback_query
     await query.answer()
@@ -957,6 +1139,8 @@ async def habit_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show progress menu."""
+    if not await guard_command_action(update, context):
+        return None
     services = get_services(context)
     query = update.callback_query
     await query.answer()
@@ -984,16 +1168,8 @@ async def menu_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_coach(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show coach menu."""
-    _rl = get_rate_limit_middleware()
-    user_id = update.effective_user.id
-    allowed, msg = await _rl.check_ai_limit(user_id)
-    if not allowed:
-        await update.callback_query.answer(msg, show_alert=True)
-        return
-    allowed, msg = await _rl.check_global_ai_limit()
-    if not allowed:
-        await update.callback_query.answer(msg, show_alert=True)
-        return
+    if not await guard_ai_action(update, context):
+        return None
     services = get_services(context)
     query = update.callback_query
     await query.answer()
@@ -1024,16 +1200,8 @@ async def menu_coach(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def coach_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show performance analysis."""
-    _rl = get_rate_limit_middleware()
-    user_id = update.effective_user.id
-    allowed, msg = await _rl.check_ai_limit(user_id)
-    if not allowed:
-        await update.callback_query.answer(msg, show_alert=True)
-        return
-    allowed, msg = await _rl.check_global_ai_limit()
-    if not allowed:
-        await update.callback_query.answer(msg, show_alert=True)
-        return
+    if not await guard_ai_action(update, context):
+        return None
     services = get_services(context)
     query = update.callback_query
     await query.answer()
@@ -1061,6 +1229,8 @@ async def coach_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show dashboard."""
+    if not await guard_command_action(update, context):
+        return None
     services = get_services(context)
     query = update.callback_query
     await query.answer()
@@ -1104,6 +1274,8 @@ async def menu_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show review menu."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
 
@@ -1123,6 +1295,8 @@ async def menu_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def review_daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start daily review conversation."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
 
@@ -1225,6 +1399,8 @@ async def review_mood(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show settings menu."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
 
@@ -1245,6 +1421,8 @@ async def menu_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def settings_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show profile settings."""
+    if not await guard_command_action(update, context):
+        return None
     services = get_services(context)
     query = update.callback_query
     await query.answer()
@@ -1281,6 +1459,8 @@ async def settings_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def settings_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show reminder settings."""
+    if not await guard_command_action(update, context):
+        return None
     services = get_services(context)
     query = update.callback_query
     await query.answer()
@@ -1318,6 +1498,8 @@ async def settings_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def reminder_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start creating a new reminder."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
 
@@ -1403,6 +1585,8 @@ async def reminder_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def settings_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show AI status."""
+    if not await guard_command_action(update, context):
+        return None
     services = get_services(context)
     query = update.callback_query
     await query.answer()
@@ -1424,6 +1608,8 @@ async def settings_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def settings_ai_reconnect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Reconnect to Gemini."""
+    if not await guard_expensive_action(update, context):
+        return None
     services = get_services(context)
     query = update.callback_query
     await query.answer()
@@ -1474,6 +1660,8 @@ def _knowledge_menu_content_for(counts: dict) -> tuple:
 
 async def menu_knowledge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show the knowledge library menu."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
     services = get_services(context)
@@ -1484,6 +1672,8 @@ async def menu_knowledge(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def knowledge_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List the user's books with their status."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
     services = get_services(context)
@@ -1517,6 +1707,8 @@ async def knowledge_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def knowledge_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Explain how to add a book."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
     services = get_services(context)
@@ -1536,6 +1728,8 @@ async def knowledge_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def knowledge_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ask a question about the user's books."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
     context.user_data["knowledge_mode"] = "ask"
@@ -1551,6 +1745,8 @@ async def knowledge_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def knowledge_collections(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show the user's collections."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
     services = get_services(context)
@@ -1575,6 +1771,8 @@ async def knowledge_collections(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def knowledge_processing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show in-flight processing jobs."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
     services = get_services(context)
@@ -1601,6 +1799,8 @@ async def knowledge_processing(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def knowledge_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show knowledge engine settings/limits."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
     services = get_services(context)
@@ -1727,17 +1927,17 @@ async def _ingest_book(context: ContextTypes.DEFAULT_TYPE, user_id: int,
 
 async def knowledge_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Answer a question about the user's books (only in ask mode)."""
-    _rl = get_rate_limit_middleware()
-    user_id = update.effective_user.id
-    allowed, msg = await _rl.check_ai_limit(user_id)
-    if not allowed:
-        await update.message.reply_text(msg)
-        return
+    # Ask-mode first: this handler is a global TEXT handler, so charging before
+    # this gate would spend the user's AI quota on unrelated messages (memory
+    # flows, conversation steps) and double-charge those flows.
     if context.user_data.get("knowledge_mode") != "ask":
-        return
+        return None
+    if not await guard_ai_action(update, context):
+        return None
     context.user_data["knowledge_mode"] = None
 
     services = get_services(context)
+    user_id = update.effective_user.id
     question = update.message.text or ""
     await update.message.reply_text("🔍 جاري البحث في كتبك...")
     try:
@@ -1807,6 +2007,8 @@ def _memory_menu_content_for(counts: dict, enabled: bool, pending: int) -> tuple
 
 async def menu_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show the personal memory menu."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
     services = get_services(context)
@@ -1837,6 +2039,8 @@ def _format_memory_line(title: str, items: list, limit: int = 12) -> str:
 
 async def memory_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List the user's saved memories (newest first)."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
     services = get_services(context)
@@ -1855,6 +2059,8 @@ async def memory_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def memory_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not await guard_command_action(update, context):
+        return None
     await query.answer()
     context.user_data["memory_mode"] = "search"
     keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="menu_memory")]]
@@ -1869,6 +2075,8 @@ async def memory_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def memory_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not await guard_command_action(update, context):
+        return None
     await query.answer()
     context.user_data["memory_mode"] = "edit"
     keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="menu_memory")]]
@@ -1884,6 +2092,8 @@ async def memory_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def memory_forget(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not await guard_command_action(update, context):
+        return None
     await query.answer()
     context.user_data["memory_mode"] = "forget"
     keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="menu_memory")]]
@@ -1899,6 +2109,8 @@ async def memory_forget(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def memory_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not await guard_command_action(update, context):
+        return None
     await query.answer()
     keyboard = [
         [InlineKeyboardButton("✅ نعم، انسَ كل شيء", callback_data="memory_clear_confirm")],
@@ -1914,6 +2126,8 @@ async def memory_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def memory_clear_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not await guard_command_action(update, context):
+        return None
     await query.answer()
     services = get_services(context)
     user_id = update.effective_user.id
@@ -1930,6 +2144,8 @@ async def memory_clear_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def memory_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not await guard_command_action(update, context):
+        return None
     await query.answer()
     services = get_services(context)
     user_id = update.effective_user.id
@@ -1965,6 +2181,8 @@ async def memory_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def memory_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not await guard_command_action(update, context):
+        return None
     await query.answer()
     services = get_services(context)
     user_id = update.effective_user.id
@@ -1986,6 +2204,8 @@ async def memory_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def memory_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not await guard_command_action(update, context):
+        return None
     await query.answer()
     services = get_services(context)
     user_id = update.effective_user.id
@@ -2018,6 +2238,8 @@ async def memory_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def memory_consent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Accept or reject a pending memory (callback like memory_accept_5)."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
     callback = query.data or ""
@@ -2034,6 +2256,8 @@ async def memory_consent(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def memory_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Export all memories as a JSON document."""
+    if not await guard_command_action(update, context):
+        return
     query = update.callback_query
     await query.answer()
     services = get_services(context)
@@ -2066,7 +2290,7 @@ async def memory_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     services = get_services(context)
     user_id = update.effective_user.id
     text = update.message.text or ""
-    back = [InlineKeyboardButton("🔙 رجوع", callback_data="menu_memory")]
+    back = [[InlineKeyboardButton("🔙 رجوع", callback_data="menu_memory")]]
 
     if mode == "search":
         context.user_data["memory_mode"] = None
@@ -2121,6 +2345,8 @@ async def memory_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show main menu."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
 
@@ -2157,6 +2383,8 @@ async def menu_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_learn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Learning hub: overview + actions."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
     services = get_services(context)
@@ -2219,16 +2447,8 @@ async def _learning_curriculum(services, user_id: int) -> dict:
 
 async def menu_learn_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start / continue the next lesson."""
-    _rl = get_rate_limit_middleware()
-    user_id = update.effective_user.id
-    allowed, msg = await _rl.check_ai_limit(user_id)
-    if not allowed:
-        await update.callback_query.answer(msg, show_alert=True)
-        return
-    allowed, msg = await _rl.check_global_ai_limit()
-    if not allowed:
-        await update.callback_query.answer(msg, show_alert=True)
-        return
+    if not await guard_ai_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
     services = get_services(context)
@@ -2344,6 +2564,8 @@ async def _render_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_learn_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not await guard_command_action(update, context):
+        return None
     await query.answer()
     services = get_services(context)
     user_id = update.effective_user.id
@@ -2388,6 +2610,8 @@ async def _resume_learning(services, user_id: int):
 
 async def learn_quiz_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Register one inline answer; grade when complete."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
     state = context.user_data.get("learn_quiz") or {}
@@ -2417,6 +2641,8 @@ async def learn_quiz_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def learn_quiz_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not await guard_command_action(update, context):
+        return None
     await query.answer()
     state = context.user_data.get("learn_quiz") or {}
     if (state.get("answers") or {}):
@@ -2466,6 +2692,8 @@ async def _grade_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_learn_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Present the first due spaced-review item."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
     services = get_services(context)
@@ -2500,6 +2728,8 @@ async def menu_learn_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def learn_review_grade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Grade a review answer and advance to the next due item."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
     services = get_services(context)
@@ -2530,6 +2760,8 @@ async def learn_review_grade(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def menu_learn_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not await guard_command_action(update, context):
+        return None
     await query.answer()
     services = get_services(context)
     user_id = update.effective_user.id
@@ -2556,6 +2788,8 @@ async def menu_learn_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_learn_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not await guard_command_action(update, context):
+        return None
     await query.answer()
     services = get_services(context)
     user_id = update.effective_user.id
@@ -2587,6 +2821,8 @@ async def menu_learn_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def learn_newgoal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Entry point for the goal conversation."""
+    if not await guard_command_action(update, context):
+        return None
     query = update.callback_query
     await query.answer()
     keyboard = [[InlineKeyboardButton("🔙 تعلم", callback_data="menu_learn")]]
@@ -2613,16 +2849,9 @@ async def learn_goal_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def learn_objectives_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _rl = get_rate_limit_middleware()
-    user_id = update.effective_user.id
-    allowed, msg = await _rl.check_ai_limit(user_id)
-    if not allowed:
-        await update.message.reply_text(msg)
-        return
-    allowed, msg = await _rl.check_global_ai_limit()
-    if not allowed:
-        await update.message.reply_text(msg)
-        return
+    """Create a long-term learning goal, its objectives and its curriculum."""
+    if not await guard_ai_action(update, context):
+        return None
     services = get_services(context)
     user_id = update.effective_user.id
     text = (update.message.text or "").strip()
@@ -2817,6 +3046,95 @@ def get_habit_handlers() -> ConversationHandler:
     )
 
 
+# ============================================================================
+# Guard-coverage self-check
+# ============================================================================
+#
+# `ENTRY_POINT_RATELIMITS` is a claim about the code above. This function
+# verifies it, so the claim cannot silently rot as handlers are added or
+# edited. It is called by `tests/test_rate_limit_guards.py`.
+
+
+async def _assert_entry_point_guard_contracts() -> None:
+    """Raise AssertionError if any declared guard contract is unmet.
+
+    Checks, for every entry point in the map:
+      1. it is a coroutine function in this module;
+      2. its first executable statement is the declared guard (so the limit
+         really runs before any side effect);
+      3. it is reachable as a Telegram handler somewhere in the wiring.
+    """
+    import inspect
+
+    problems: list[str] = []
+
+    # guard token -> (side effects that must come after it)
+    guard_for = {
+        COMMAND: (
+            "guard_command_action",
+            ("reply_text(", "edit_message_text(", "answer(", "get_services("),
+        ),
+        AI: (
+            "guard_ai_action",
+            ("reply_text(", "edit_message_text(", "answer(", "get_services("),
+        ),
+        UPLOAD: (
+            "check_upload_limit",
+            # Nothing may be downloaded, registered or scheduled before the
+            # upload budget is spent, or a blocked request could still burn
+            # bandwidth and leave a pending source row behind.
+            ("get_file(", "register_upload(", "create_task(", "download_as_bytearray("),
+        ),
+        EXPENSIVE: (
+            "guard_expensive_action",
+            ("reply_text(", "edit_message_text(", "answer(", "get_services("),
+        ),
+        NONE: (None, ()),
+    }
+
+    for name, bucket in ENTRY_POINT_RATELIMITS.items():
+        func = globals().get(name)
+        if func is None:
+            problems.append(f"{name}: declared in the map but not defined")
+            continue
+        if not inspect.iscoroutinefunction(func):
+            problems.append(f"{name}: not a coroutine function")
+            continue
+        expected, side_effects = guard_for[bucket]
+        if bucket == NONE:
+            if "guard_" in inspect.getsource(func):
+                problems.append(f"{name}: declared uncharged but calls a guard")
+            continue
+        body = inspect.getsource(func)
+        guard_at = body.find(expected)
+        if guard_at == -1:
+            problems.append(f"{name}: expected {expected} (bucket {bucket})")
+            continue
+        first_effect = min(
+            (body.find(s) for s in side_effects if body.find(s) != -1),
+            default=len(body),
+        )
+        if guard_at > first_effect:
+            problems.append(
+                f"{name}: {expected} runs after a side effect "
+                f"(guard@{guard_at}, effect@{first_effect})"
+            )
+
+    # Unguarded state handlers must really be unguarded.
+    for name in UNGUARDED_CONVERSATION_STATES:
+        func = globals().get(name)
+        if func is None:
+            continue
+        if "guard_" in inspect.getsource(func):
+            problems.append(f"{name}: listed as uncharged but calls a guard")
+
+    if problems:
+        raise AssertionError(
+            "rate-limit guard contract violated:\n  - "
+            + "\n  - ".join(problems)
+        )
+
+
 def get_menu_handlers() -> list:
     """Get all menu callback handlers."""
     return [
@@ -2879,6 +3197,8 @@ def get_menu_handlers() -> list:
 
 async def review_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show review history."""
+    if not await guard_command_action(update, context):
+        return None
     services = get_services(context)
     query = update.callback_query
     await query.answer()
