@@ -6,6 +6,9 @@ Bounded, deterministic retrieval builds a short context pack for the AI:
   current task and a type boost for standing instructions.
 - Low-confidence memories are NEVER treated as facts: they only surface when
   the current request textually overlaps them.
+- Only `automatic` and `explicit` consent states are retrievable. `pending`
+  (awaiting the user's decision) and `denied` (refused by the user) memories
+  are dropped before ranking, so an unapproved claim can never reach a prompt.
 - The final pack caps at ``budget_chars`` and is rendered as labelled DATA,
   so memory can inform but never override the current user request.
 """
@@ -18,6 +21,7 @@ from typing import List, Optional
 
 from app.config.settings import Settings
 from app.memory.models import (
+    CONSENT_STATES,
     MemoryContextPack,
     MemoryItem,
     TaskContext,
@@ -26,6 +30,15 @@ from app.memory.models import (
 from app.memory.repositories import MemoryStore
 
 logger = logging.getLogger(__name__)
+
+# Only these consent states may be used as AI context. `pending` is an
+# unapproved candidate awaiting the user's decision; `denied` is one the user
+# actively refused. Derived from CONSENT_STATES so a new state added there
+# cannot silently become retrievable: anything not named here fails closed.
+CONSENT_ALLOWED_FOR_CONTEXT = frozenset({"automatic", "explicit"})
+assert CONSENT_ALLOWED_FOR_CONTEXT.issubset(set(CONSENT_STATES)), (
+    "retrievable consent states must be a subset of the declared CONSENT_STATES"
+)
 
 _CONFIDENCE_WEIGHT = {"high": 1.0, "medium": 0.55, "low": 0.15}
 _TYPE_BOOST = {
@@ -70,6 +83,20 @@ class MemoryRetrieval:
         keywords = task.keywords()
         scored = []
         for memory in window:
+            # Consent gate. The audit reproduced a `pending` memory and a
+            # `denied` memory both reaching the AI prompt: `list(status=
+            # "active")` filtered nothing, so an unapproved candidate and a
+            # user-rejected memory were injected as if they were facts.
+            # `pending` means the user has not yet approved; `denied` means
+            # they actively refused. Neither may be used as context.
+            if memory.consent_state not in CONSENT_ALLOWED_FOR_CONTEXT:
+                # Unknown consent states fail closed: an unrecognised value is
+                # treated as not-approved rather than silently included.
+                logger.debug(
+                    f"Memory {memory.memory_id} excluded from context "
+                    f"(consent_state={memory.consent_state!r})"
+                )
+                continue
             score, eligible = self._score(memory, keywords)
             if not eligible:
                 continue

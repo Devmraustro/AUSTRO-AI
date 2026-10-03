@@ -332,9 +332,35 @@ async def knowledge_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
 
 
+def _update_label(update: Update) -> str:
+    """Identify an update WITHOUT logging its message text.
+
+    `repr(update)` / `str(update)` renders the full `Update` object including
+    `message.text` / `message.caption`, so every unhandled exception wrote the
+    user's entire message - and any pasted document text - into `logs/bot.log`.
+    """
+    user = getattr(update, "effective_user", None)
+    chat = getattr(update, "effective_chat", None)
+    parts = []
+    if user is not None:
+        parts.append(f"user={getattr(user, 'id', '?')}")
+        if getattr(user, "username", None):
+            parts.append(f"@user={user.username}")
+    if chat is not None:
+        parts.append(f"chat={getattr(chat, 'id', '?')}")
+    for attribute in ("message", "callback_query", "inline_query", "chosen_inline_result"):
+        if getattr(update, attribute, None) is not None:
+            parts.append(f"via={attribute}")
+            break
+    return " ".join(parts) if parts else "<unknown update>"
+
+
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle errors - map domain errors to safe user messages."""
-    logger.error(f"Update {update} caused error: {context.error}", exc_info=context.error)
+    logger.error(
+        f"Update [{_update_label(update)}] caused error: {context.error}",
+        exc_info=context.error,
+    )
 
     message = public_message(context.error)
 

@@ -40,6 +40,24 @@ class _BaseRepository:
     def _connection(self) -> sqlite3.Connection:
         return self._manager._get_connection()
 
+    def _rollback(self) -> None:
+        """Discard an uncommitted transaction left by a failed statement.
+
+        Every repository method catches ``DB_ERROR`` to degrade gracefully.
+        Without an explicit rollback that leaves two problems: on SQLite the
+        implicit transaction stays open so a partially-applied write is
+        committed later by an unrelated ``commit()``; on PostgreSQL a single
+        failed statement poisons the session (``25P02``) and every subsequent
+        command fails until a ROLLBACK is issued.
+
+        Must be called while holding ``self._manager._lock`` (every call site is
+        inside the same ``with`` block as the statement that failed).
+        """
+        try:
+            self._manager._get_connection().rollback()
+        except Exception:  # noqa: BLE001 - rollback must never mask the original error
+            pass
+
     @staticmethod
     def _serialise(value: Any) -> Any:
         if isinstance(value, (list, dict)):
@@ -63,15 +81,30 @@ class UserRepository(_BaseRepository):
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                # `INSERT OR REPLACE` on SQLite is DELETE-then-INSERT. Because
+                # `users` is the parent of eleven ON DELETE CASCADE foreign keys,
+                # re-registering a user wiped every goal, habit, plan, progress
+                # row, review, session, reminder and coach log, and reset all
+                # profile columns not listed here (including `age`, so the wipe
+                # was self-perpetuating on the next /start).
+                #
+                # `ON CONFLICT ... DO UPDATE` is a true upsert: it updates only
+                # the named columns, on both SQLite (>= 3.24) and PostgreSQL.
                 cursor.execute(
-                    "INSERT OR REPLACE INTO users "
+                    "INSERT INTO users "
                     "(user_id, username, first_name, last_name, last_active) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT (user_id) DO UPDATE SET "
+                    "username = excluded.username, "
+                    "first_name = excluded.first_name, "
+                    "last_name = excluded.last_name, "
+                    "last_active = excluded.last_active",
                     (user_id, username, first_name, last_name, datetime.now().isoformat()),
                 )
                 self._connection().commit()
                 return True
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in create user: {e}")
             return False
 
@@ -92,6 +125,7 @@ class UserRepository(_BaseRepository):
                 self._connection().commit()
                 return True
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in update_profile: {e}")
             return False
 
@@ -106,6 +140,7 @@ class UserRepository(_BaseRepository):
                     return self._deserialise(dict(row), _JSON_FIELDS["users"])
                 return None
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in get_user: {e}")
             return None
 
@@ -117,6 +152,7 @@ class UserRepository(_BaseRepository):
                 cursor.execute("SELECT user_id FROM users")
                 return [row["user_id"] for row in cursor.fetchall()]
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in get_all_user_ids: {e}")
             return []
 
@@ -137,6 +173,7 @@ class GoalRepository(_BaseRepository):
                 self._connection().commit()
                 return cursor.lastrowid
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in create_goal: {e}")
             return None
 
@@ -164,6 +201,7 @@ class GoalRepository(_BaseRepository):
                     goals.append(goal)
                 return goals
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in get_goals: {e}")
             return []
 
@@ -180,6 +218,7 @@ class GoalRepository(_BaseRepository):
                 self._connection().commit()
                 return True
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in update_goal_progress: {e}")
             return False
 
@@ -202,6 +241,7 @@ class PlanRepository(_BaseRepository):
                 self._connection().commit()
                 return True
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in create_daily_plan: {e}")
             return False
 
@@ -229,6 +269,7 @@ class PlanRepository(_BaseRepository):
                     return plan
                 return None
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in get_daily_plan: {e}")
             return None
 
@@ -248,6 +289,7 @@ class HabitRepository(_BaseRepository):
                 self._connection().commit()
                 return cursor.lastrowid
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in create_habit: {e}")
             return None
 
@@ -262,6 +304,7 @@ class HabitRepository(_BaseRepository):
                 )
                 return [dict(row) for row in cursor.fetchall()]
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in get_habits: {e}")
             return []
 
@@ -290,6 +333,7 @@ class HabitRepository(_BaseRepository):
                 self._connection().commit()
                 return True
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in log_habit: {e}")
             return False
 
@@ -299,31 +343,28 @@ class ProgressRepository(_BaseRepository):
         """Log daily progress (upsert by user + date)."""
         try:
             with self._manager._lock:
+                if not kwargs:
+                    return True
                 cursor = self._connection().cursor()
+                # A single ON CONFLICT upsert instead of SELECT-then-INSERT.
+                # The read-modify-write below was only serialised within this
+                # process by `_lock`; a second process (or another thread that
+                # bypassed the lock) could interleave between the SELECT and
+                # the INSERT. With `uq_progress_user_date` (CORE_V1) that race
+                # no longer silently duplicates or drops the day's row.
+                columns = ", ".join(kwargs.keys())
+                placeholders = ", ".join(["?"] * len(kwargs))
+                assignments = ", ".join([f"{k} = excluded.{k}" for k in kwargs.keys()])
                 cursor.execute(
-                    "SELECT progress_id FROM progress WHERE user_id = ? AND date = ?",
-                    (user_id, date),
+                    f"INSERT INTO progress (user_id, date, {columns}) "
+                    f"VALUES (?, ?, {placeholders}) "
+                    f"ON CONFLICT (user_id, date) DO UPDATE SET {assignments}",
+                    [user_id, date] + list(kwargs.values()),
                 )
-                existing = cursor.fetchone()
-                if existing:
-                    fields = ", ".join([f"{k} = ?" for k in kwargs.keys()])
-                    values = list(kwargs.values()) + [user_id, date]
-                    cursor.execute(
-                        f"UPDATE progress SET {fields} WHERE user_id = ? AND date = ?",
-                        values,
-                    )
-                else:
-                    fields = ", ".join(kwargs.keys())
-                    placeholders = ", ".join(["?"] * len(kwargs))
-                    values = [user_id, date] + list(kwargs.values())
-                    cursor.execute(
-                        f"INSERT INTO progress (user_id, date, {fields}) "
-                        f"VALUES (?, ?, {placeholders})",
-                        values,
-                    )
                 self._connection().commit()
                 return True
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in log_progress: {e}")
             return False
 
@@ -340,6 +381,7 @@ class ProgressRepository(_BaseRepository):
                 )
                 return [dict(row) for row in cursor.fetchall()]
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in get_progress: {e}")
             return []
 
@@ -351,15 +393,27 @@ class ReviewRepository(_BaseRepository):
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                # A daily review is one row per (user_id, date). The table had
+                # no unique constraint, so `INSERT OR REPLACE` could never
+                # conflict and every save appended another row, which made
+                # `get_daily_reviews` and the streak/stat queries wrong.
+                # CORE_V1 adds the unique index this upsert depends on.
                 cursor.execute(
-                    "INSERT OR REPLACE INTO daily_reviews "
+                    "INSERT INTO daily_reviews "
                     "(user_id, date, accomplished, learned, obstacles, tomorrow_plan, mood) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT (user_id, date) DO UPDATE SET "
+                    "accomplished = excluded.accomplished, "
+                    "learned = excluded.learned, "
+                    "obstacles = excluded.obstacles, "
+                    "tomorrow_plan = excluded.tomorrow_plan, "
+                    "mood = excluded.mood",
                     (user_id, date, accomplished, learned, obstacles, tomorrow_plan, mood),
                 )
                 self._connection().commit()
                 return True
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in save_daily_review: {e}")
             return False
 
@@ -374,6 +428,7 @@ class ReviewRepository(_BaseRepository):
                 )
                 return [dict(row) for row in cursor.fetchall()]
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in get_daily_reviews: {e}")
             return []
 
@@ -395,6 +450,7 @@ class ReminderRepository(_BaseRepository):
                 self._connection().commit()
                 return cursor.lastrowid
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in create_reminder: {e}")
             return None
 
@@ -410,6 +466,7 @@ class ReminderRepository(_BaseRepository):
                 )
                 return [dict(row) for row in cursor.fetchall()]
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in get_active_reminders: {e}")
             return []
 
@@ -421,6 +478,7 @@ class ReminderRepository(_BaseRepository):
                 cursor.execute("SELECT * FROM reminders WHERE is_active = TRUE ORDER BY scheduled_time")
                 return [dict(row) for row in cursor.fetchall()]
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in get_all_active_reminders: {e}")
             return []
 
@@ -438,6 +496,7 @@ class ActivityRepository(_BaseRepository):
                 self._connection().commit()
                 return True
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in log_activity: {e}")
             return False
 
@@ -502,6 +561,7 @@ class StatsRepository(_BaseRepository):
                     "total_reviews": reviews_count or 0,
                 }
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in get_dashboard_stats: {e}")
             return dict(self._DEFAULTS)
 

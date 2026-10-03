@@ -94,15 +94,40 @@ The memory write gate rejects or parks sensitive topics until explicit user cons
 - **Sensitive Topic Regex:** Passwords, banking/cards, health/drugs, IDs/passports detected via Arabic/English regex.
 - **Consent Flow:** Parked as `consent_state=pending` row, surfaced in "pending" menu for accept/reject.
 - **Automatic Rejection:** Topics like passwords are rejected by default unless user explicitly grants consent.
+- **Retrieval consent gate:** only `automatic` and `explicit` memories reach an AI
+  prompt (`CONSENT_ALLOWED_FOR_CONTEXT` in `app/memory/retrieval.py`). `pending`
+  (awaiting the user's decision) and `denied` (refused) rows are dropped before
+  ranking, and an unrecognised consent value fails closed. The allow-list is
+  asserted to be a subset of the declared `CONSENT_STATES`, so a new state cannot
+  silently become retrievable.
 
 ### 4.2 Redaction in Logging
 All logging goes through `RedactingFormatter` to scrub tokens and API keys.
 
+**Coverage:** Telegram tokens (literal and URL form), bare and URL-embedded Google
+(Gemini), OpenAI and Anthropic keys, AWS access key IDs, JWTs, `Authorization`
+header values, credentials inside PostgreSQL/MySQL/Mongo DSNs, labelled
+`key=value`/`key: value` secrets, PEM private key blocks, card-like digit runs,
+and long opaque Telegram `file_id` values (which grant file access).
+
+**Fails closed.** The formatter copies the record, renders it, then redacts the
+*fully rendered text* — so tracebacks (never part of `record.msg`) are covered
+too. Any internal error emits `[REDACTION FAILED] record from <logger> suppressed`
+rather than the raw record. It never mutates the `LogRecord`, so additional
+handlers still see the original.
+
+**Log injection is defused.** CR/LF are escaped to literal `\n`/`\r`, remaining
+C0/C1 control bytes to `\xNN`, and text is NFKC-normalised, so attacker-supplied
+content cannot forge an extra log line or a fake level prefix.
+
 **Mitigations:**
 - No secrets in telemetry
 - No `print` of credentials
-- `.env` never committed
+- `.env` never committed, and excluded from the Docker build context (`.dockerignore`)
 - Real bot token rotated via BotFather if leaked
+- `AUSTRO_LOG_LEVEL` is applied to the root logger (previously loaded and ignored)
+- The Telegram error handler logs an identifier only (`user`/`chat`/update type),
+  never the message text the user sent
 
 ## 5. Secret Leakage
 

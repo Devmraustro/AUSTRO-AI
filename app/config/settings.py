@@ -97,6 +97,15 @@ class Settings:
     db_max_overflow: int = 10
     db_pool_timeout: int = 30
     db_pool_recycle: int = 1800
+    # PostgreSQL transport security. libpq defaults sslmode to "prefer", which
+    # silently falls back to plaintext when the server does not offer TLS, so
+    # DB_PASSWORD and every memory/knowledge row would cross the network in the
+    # clear. "require" is the floor for any non-loopback deployment;
+    # "verify-full" also validates the server certificate.
+    db_sslmode: str = "prefer"
+    db_sslrootcert: str = ""
+    db_sslcert: str = ""
+    db_sslkey: str = ""
 
     # Application-level rate limits (per-user, deterministic; see rate_limiter)
     rate_limit_command_max: int = 30
@@ -121,6 +130,12 @@ class Settings:
     knowledge_max_file_size_mb: int = 50
     knowledge_max_pages: int = 1000
     knowledge_max_chars: int = 2000000
+    # ZIP-based formats (docx/epub) are checked against these limits *before*
+    # decompression, because `knowledge_max_file_size_mb` only bounds the
+    # compressed upload. Without them a 200 KB upload can inflate to GBs.
+    knowledge_max_uncompressed_mb: int = 200
+    knowledge_max_zip_members: int = 2000
+    knowledge_max_zip_ratio: int = 200
     knowledge_max_chunks: int = 20000
     knowledge_chunk_size: int = 900
     knowledge_chunk_overlap: int = 100
@@ -171,6 +186,10 @@ class Settings:
     db_max_overflow: int = 10
     db_pool_timeout: int = 30
     db_pool_recycle: int = 1800
+    db_sslmode: str = "prefer"
+    db_sslrootcert: str = ""
+    db_sslcert: str = ""
+    db_sslkey: str = ""
 
     @property
     def has_gemini_key(self) -> bool:
@@ -233,6 +252,11 @@ def load_settings() -> Settings:
         knowledge_max_file_size_mb=int(os.getenv("KNOWLEDGE_MAX_FILE_SIZE_MB", "50")),
         knowledge_max_pages=int(os.getenv("KNOWLEDGE_MAX_PAGES", "1000")),
         knowledge_max_chars=int(os.getenv("KNOWLEDGE_MAX_CHARS", "2000000")),
+        knowledge_max_uncompressed_mb=int(
+            os.getenv("KNOWLEDGE_MAX_UNCOMPRESSED_MB", "200")
+        ),
+        knowledge_max_zip_members=int(os.getenv("KNOWLEDGE_MAX_ZIP_MEMBERS", "2000")),
+        knowledge_max_zip_ratio=int(os.getenv("KNOWLEDGE_MAX_ZIP_RATIO", "200")),
         knowledge_max_chunks=int(os.getenv("KNOWLEDGE_MAX_CHUNKS", "20000")),
         knowledge_chunk_size=int(os.getenv("KNOWLEDGE_CHUNK_SIZE", "900")),
         knowledge_chunk_overlap=int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "100")),
@@ -284,6 +308,10 @@ def load_settings() -> Settings:
         db_max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "10")),
         db_pool_timeout=int(os.getenv("DB_POOL_TIMEOUT", "30")),
         db_pool_recycle=int(os.getenv("DB_POOL_RECYCLE", "1800")),
+        db_sslmode=os.getenv("DB_SSLMODE", "prefer"),
+        db_sslrootcert=os.getenv("DB_SSL_ROOT_CERT", ""),
+        db_sslcert=os.getenv("DB_SSL_CERT", ""),
+        db_sslkey=os.getenv("DB_SSL_KEY", ""),
         rate_limit_command_max=int(os.getenv("RATE_LIMIT_COMMAND_MAX", "30")),
         rate_limit_command_window=float(os.getenv("RATE_LIMIT_COMMAND_WINDOW", "60")),
         rate_limit_ai_max=int(os.getenv("RATE_LIMIT_AI_MAX", "20")),

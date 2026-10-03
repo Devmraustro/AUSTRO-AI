@@ -31,11 +31,24 @@ WEBHOOK_SECRET=           # strong random secret
 USE_LOCAL_FALLBACK=0      # REQUIRED: prod validator rejects local fallback
 DB_ENGINE=postgresql
 DB_HOST=, DB_PORT=5432, DB_NAME=austro_ai, DB_USER=, DB_PASSWORD=
+DB_SSLMODE=verify-full     # REQUIRED for a non-loopback host
+DB_SSL_ROOT_CERT=/etc/ssl/certs/postgres-ca.crt
 ```
 
 Failure to set `USE_LOCAL_FALLBACK=0` (its default is true) will make the app
 REFUSE to start in production. See `.env.example` for the full variable list,
 including the `RATE_LIMIT_*` and `KNOWLEDGE_*` tunables.
+
+### PostgreSQL transport encryption
+
+`DB_SSLMODE` must be `require` or `verify-full` for any host that is not
+loopback or the compose service name `db`. The application **refuses to
+connect** otherwise: libpq's own default is `prefer`, which attempts TLS and
+then silently falls back to plaintext, sending `DB_PASSWORD` and every memory
+and knowledge row unencrypted with no error and no log line. Prefer
+`verify-full` with `DB_SSL_ROOT_CERT` pointing at your CA bundle. The only
+escape hatch is `DB_ALLOW_INSECURE=1`, which is never a default and must not be
+set in production.
 
 ## 3. Lifecycle
 

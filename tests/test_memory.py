@@ -406,7 +406,8 @@ def test_retrieval_returns_labelled_data_block(memory):
 
 
 def test_retrieval_surfaces_low_confidence_only_on_overlap(memory):
-    # Low-confidence explicit fact (approved but flagged low).
+    # Low-confidence explicit fact: the write gate parks it as
+    # consent_state='pending' for user review (SECURITY_ARCHITECTURE.md 4.1).
     low = MemoryCandidate(
         owner_user_id=1, memory_type="preference",
         subject="دراسة مسائية", claim="يفضل الدراسة مساءً",
@@ -415,6 +416,15 @@ def test_retrieval_surfaces_low_confidence_only_on_overlap(memory):
     result = memory.process_candidates(1, [low])
     assert result["created"] == 1
 
+    # Until the user approves it, a pending memory is not AI context at all.
+    pending = memory.pending(1)
+    assert [p["subject"] for p in pending] == ["دراسة مسائية"]
+    unapproved = memory.relevant_for(1, query="الدراسة مساءً")
+    assert unapproved.memories == [], \
+        "a memory awaiting the user's decision must never reach a prompt"
+
+    # Approving it makes it retrievable, and it still only surfaces on overlap.
+    assert memory.confirm(1, pending[0]["memory_id"], accept=True, actor=1)
     unrelated = memory.relevant_for(1, query="القهوة")
     assert all(m.subject != "دراسة مسائية" for m in unrelated.memories), \
         "low-confidence memory must never surface as a fact off-topic"

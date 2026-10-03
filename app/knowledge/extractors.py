@@ -10,6 +10,7 @@ Supported: pdf, txt, md, docx, epub.
 
 from __future__ import annotations
 
+import io
 import logging
 import zipfile
 import xml.etree.ElementTree as ET
@@ -41,6 +42,123 @@ EXTENSION_ALIASES = {
 }
 
 _W: str = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+# --- ZIP bomb / decompression-bomb guards ---------------------------------
+#
+# `knowledge_max_file_size_mb` bounds the *compressed upload*, so it does not
+# bound what DOCX/EPUB extraction inflates. deflate can compress a run of
+# identical bytes ~1000:1, so the audit reproduced a 0.195 MiB upload that
+# expanded `word/document.xml` to 200 MiB and cost 656 MiB of peak heap before
+# `ingestion.py` finally compared the resulting text against
+# `knowledge_max_chars` and rejected it.
+#
+# These guards read only the ZIP central directory (no member is decompressed)
+# so they are cheap, and they reject the upload rather than paying for it.
+_MAX_UNCOMPRESSED_BYTES: int = 200 * 1024 * 1024
+_MAX_ZIP_MEMBERS: int = 2000
+_MAX_ZIP_RATIO: int = 200
+
+
+def _check_archive_bomb(archive: zipfile.ZipFile) -> None:
+    """Reject a ZIP that decompresses to an unreasonable size.
+
+    Raises ``ValidationError`` based on the central directory alone, so no
+    member is decompressed before the decision is made.
+    """
+    max_bytes, max_members, max_ratio = _resolve_limits()
+
+    try:
+        infos = archive.infolist()
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise ValidationError("ملف مضغوط تالف") from exc
+
+    if len(infos) > max_members:
+        logger.warning(f"Rejecting archive with {len(infos)} members (max {max_members})")
+        raise ValidationError("الملف يحتوي على عدد عناصر كبير جدًا")
+
+    total_uncompressed = 0
+    for info in infos:
+        total_uncompressed += info.file_size
+        if total_uncompressed > max_bytes:
+            logger.warning(
+                f"Rejecting archive: declared uncompressed size "
+                f"{total_uncompressed / 1024 / 1024:.1f} MiB "
+                f"exceeds {max_bytes / 1024 / 1024:.0f} MiB"
+            )
+            raise ValidationError("الملف كبير جدًا بعد فك الضغط")
+        # A huge compression ratio on a single member is the classic zip-bomb
+        # signature. Guard it too, so a many-member bomb cannot slip past the
+        # aggregate check by spreading bytes across small members.
+        if info.file_size > max_bytes:
+            raise ValidationError("الملف كبير جدًا بعد فك الضغط")
+        if info.compress_size > 0 and info.file_size // info.compress_size > max_ratio:
+            logger.warning(
+                f"Rejecting archive member {info.filename!r}: ratio "
+                f"{info.file_size // info.compress_size} exceeds {max_ratio}"
+            )
+            raise ValidationError("نسبة ضغط الملف غير طبيعية")
+
+
+def _read_zip_member(archive: zipfile.ZipFile, name: str, *, limit: int) -> bytes:
+    """Read one ZIP member, aborting as soon as `limit` bytes are exceeded.
+
+    ``limit`` is enforced *during* decompression, so a member that lies about
+    its central-directory size is still cut off.
+    """
+    chunks: List[bytes] = []
+    total = 0
+    try:
+        with archive.open(name) as handle:
+            while True:
+                chunk = handle.read(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit:
+                    logger.warning(
+                        f"Rejecting ZIP member {name!r}: exceeded {limit} bytes"
+                    )
+                    raise ValidationError("الملف كبير جدًا بعد فك الضغط")
+                chunks.append(chunk)
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise ValidationError("ملف مضغوط تالف") from exc
+    return b"".join(chunks)
+
+
+def _pdf_limits() -> tuple:
+    """Return the configured (max_pages, max_chars) for PDF extraction."""
+    try:
+        from app.config.settings import settings
+        return settings.knowledge_max_pages, settings.knowledge_max_chars
+    except Exception:  # noqa: BLE001 - never fail extraction over config lookup
+        return 1000, 2_000_000
+
+
+def _open_checked_zip(data: bytes) -> zipfile.ZipFile:
+    """Open a ZIP archive after validating it against the bomb limits."""
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(data))
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise ValidationError("ملف مضغوط تالف") from exc
+    _check_archive_bomb(archive)
+    return archive
+
+
+def _resolve_limits() -> tuple:
+    """Read the configurable ZIP-bomb limits, falling back to module defaults."""
+    try:
+        from app.config.settings import settings
+        return (
+            settings.knowledge_max_uncompressed_mb * 1024 * 1024,
+            settings.knowledge_max_zip_members,
+            settings.knowledge_max_zip_ratio,
+        )
+    except Exception:  # noqa: BLE001 - never fail extraction over config lookup
+        return (
+            _MAX_UNCOMPRESSED_BYTES,
+            _MAX_ZIP_MEMBERS,
+            _MAX_ZIP_RATIO,
+        )
 
 
 def detect_format(file_name: Optional[str], mime_type: Optional[str]) -> str:
@@ -78,13 +196,28 @@ class _PdfExtractor:
             raise ValidationError("مستخرج PDF غير متاح") from e
 
         try:
-            reader = pypdf.PdfReader(__import__("io").BytesIO(data))
+            reader = pypdf.PdfReader(io.BytesIO(data))
         except Exception as e:  # noqa: BLE001 - bad PDFs throw arbitrary exceptions
             logger.warning(f"PDF could not be opened: {e}")
             raise ValidationError("ملف PDF تالف أو غير قابل للقراءة") from e
 
+        # `knowledge_max_pages` used to be enforced *after* every page had been
+        # parsed, so a 100k-page PDF paid full extraction cost (and full memory)
+        # before being rejected. Read `len(reader.pages)` from the page tree,
+        # which is already parsed, and stop before extracting anything.
+        max_pages, max_chars = _pdf_limits()
+        declared_pages = len(reader.pages)
+        if declared_pages > max_pages:
+            logger.warning(
+                f"Rejecting PDF with {declared_pages} pages (max {max_pages})"
+            )
+            raise ValidationError("عدد صفحات الملف يتجاوز الحد المسموح")
+        if declared_pages == 0:
+            raise ValidationError("لم نتمكن من استخراج نص من هذا الـ PDF")
+
         pages = []
         offset = 0
+        extracted_chars = 0
         text_parts = []
         for index, page in enumerate(reader.pages, start=1):
             page_text = ""
@@ -94,8 +227,15 @@ class _PdfExtractor:
                 logger.warning(f"PDF page {index} extraction failed: {e}")
             start = offset
             if page_text.strip():
-                text_parts.append(page_text.strip())
-                offset += len(page_text.strip()) + 1
+                stripped = page_text.strip()
+                text_parts.append(stripped)
+                extracted_chars += len(stripped) + 1
+                offset += len(stripped) + 1
+                if extracted_chars > max_chars:
+                    logger.warning(
+                        f"Rejecting PDF: text exceeded {max_chars} chars at page {index}"
+                    )
+                    raise ValidationError("محتوى الملف كبير جدًا")
             pages.append({
                 "number": index,
                 "start": start,
@@ -115,11 +255,14 @@ class _PdfExtractor:
 
 class _DocxExtractor:
     def extract(self, data: bytes) -> ExtractedBook:
-        try:
-            with zipfile.ZipFile(__import__("io").BytesIO(data)) as archive:
-                xml_bytes = archive.read("word/document.xml")
-        except (zipfile.BadZipFile, KeyError) as e:
-            raise ValidationError("ملف DOCX تالف") from e
+        max_bytes, _members, _ratio = _resolve_limits()
+        with _open_checked_zip(data) as archive:
+            try:
+                xml_bytes = _read_zip_member(
+                    archive, "word/document.xml", limit=max_bytes
+                )
+            except KeyError as e:
+                raise ValidationError("ملف DOCX تالف") from e
 
         try:
             root = ET.fromstring(xml_bytes)
@@ -171,14 +314,22 @@ class _TxtExtractor:
 
 class _EpubExtractor:
     def extract(self, data: bytes) -> ExtractedBook:
-        try:
-            archive = zipfile.ZipFile(__import__("io").BytesIO(data))
-        except zipfile.BadZipFile as e:
-            raise ValidationError("ملف EPUB تالف") from e
+        max_bytes, _members, _ratio = _resolve_limits()
+        # `with` so the ZipFile (and its file object) is released on every path,
+        # including the ValidationError rejections below.
+        with _open_checked_zip(data) as archive:
+            return self._extract_from(archive, max_bytes)
 
+    def _extract_from(self, archive: zipfile.ZipFile, max_bytes: int) -> ExtractedBook:
         try:
-            container = ET.fromstring(archive.read("META-INF/container.xml"))
-        except (KeyError, ET.ParseError) as e:
+            try:
+                container_xml = _read_zip_member(
+                    archive, "META-INF/container.xml", limit=max_bytes
+                )
+            except KeyError as e:
+                raise ValidationError("ملف EPUB تالف") from e
+            container = ET.fromstring(container_xml)
+        except ET.ParseError as e:
             raise ValidationError("ملف EPUB تالف") from e
 
         rootfile = None
@@ -190,8 +341,7 @@ class _EpubExtractor:
             raise ValidationError("ملف EPUB تالف (لا يوجد rootfile)")
 
         try:
-            with archive.open(rootfile) as handle:
-                spine_root = ET.fromstring(handle.read())
+            spine_root = ET.fromstring(_read_zip_member(archive, rootfile, limit=max_bytes))
         except (KeyError, ET.ParseError) as e:
             raise ValidationError("ملف EPUB تالف") from e
 
@@ -207,16 +357,33 @@ class _EpubExtractor:
                 if href:
                     spine_refs.append(href)
 
+        # Each chapter may legitimately decompress to a few MB; the aggregate
+        # per-member budget stops a single oversized chapter and the cumulative
+        # total keeps a many-chapter EPUB bounded.
+        per_member_limit = max(1, max_bytes // 8)
+        total_limit = max_bytes
+        spent = 0
+
         parts: List[str] = []
+        names = set(archive.namelist())
         for href in spine_refs:
             href = href.split("#")[0]
-            member = href if href in archive.namelist() else self._resolve(archive, rootfile, href)
-            if member not in archive.namelist():
+            member = href if href in names else self._resolve(archive, rootfile, href)
+            if member not in names:
                 continue
             try:
-                with archive.open(member) as handle:
-                    dom = ET.fromstring(handle.read())
-            except (KeyError, ET.ParseError):
+                raw = _read_zip_member(
+                    archive,
+                    member,
+                    limit=min(per_member_limit, total_limit - spent),
+                )
+            except ValidationError as e:
+                logger.warning(f"EPUB member {member!r} rejected: {e}")
+                break
+            spent += len(raw)
+            try:
+                dom = ET.fromstring(raw)
+            except ET.ParseError:
                 continue
             parts.append(self._render(dom))
 

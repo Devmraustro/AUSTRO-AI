@@ -234,6 +234,57 @@ _CORE_INDEXES_DDL: list = [
 ]
 
 
+def _postgres_ssl_kwargs() -> dict:
+    """Build the psycopg2 TLS arguments from settings.
+
+    The audit found no TLS configuration at all, so libpq applied its own
+    default of ``sslmode=prefer``: TLS was attempted but a silent plaintext
+    fallback was accepted. ``DB_PASSWORD`` plus every memory and knowledge row
+    would then cross the network unencrypted with no error and no log line.
+
+    ``sslmode`` and the certificate paths are now explicit and configurable.
+    ``require`` encrypts without validating the server certificate;
+    ``verify-full`` encrypts *and* validates it, and should be used whenever
+    ``DB_SSL_ROOT_CERT`` points at the trusted CA bundle.
+    """
+    kwargs: dict = {"sslmode": settings.db_sslmode or "prefer"}
+    for attr, key in (
+        ("db_sslrootcert", "sslrootcert"),
+        ("db_sslcert", "sslcert"),
+        ("db_sslkey", "sslkey"),
+    ):
+        value = (getattr(settings, attr, "") or "").strip()
+        if value:
+            kwargs[key] = value
+    return kwargs
+
+
+def _assert_tls_for_remote_host() -> None:
+    """Refuse an unencrypted connection to a non-loopback PostgreSQL host.
+
+    This is a hard failure rather than a warning: silently downgrading to
+    plaintext is exactly the failure the audit found, and it happens with no
+    visible symptom. A local socket (or an explicit opt-out) is still allowed
+    so development and the CI service container keep working.
+    """
+    host = (settings.db_host or "localhost").strip().lower()
+    local = {"localhost", "127.0.0.1", "::1", "postgres", "db"}
+    if host in local:
+        return
+    mode = (settings.db_sslmode or "prefer").strip().lower()
+    if mode in {"disable", "allow", "prefer"} and not _tls_opt_out():
+        raise RuntimeError(
+            f"DB_SSLMODE={mode!r} would allow an unencrypted connection to the "
+            f"remote PostgreSQL host {host!r}. Set DB_SSLMODE=require (or "
+            f"verify-full with DB_SSL_ROOT_CERT) to encrypt the connection."
+        )
+
+
+def _tls_opt_out() -> bool:
+    """Explicit operator override for the TLS assertion (never default)."""
+    return os.getenv("DB_ALLOW_INSECURE", "").strip().lower() in {"1", "true", "yes"}
+
+
 def _postgres_connect(db_path: Optional[str] = None):
     """Create a new psycopg2 connection configured from settings."""
     import psycopg2
@@ -244,6 +295,8 @@ def _postgres_connect(db_path: Optional[str] = None):
 
         cursor_factory = DictCursor
 
+    _assert_tls_for_remote_host()
+
     conn = psycopg2.connect(
         host=settings.db_host or "localhost",
         port=settings.db_port or 5432,
@@ -252,6 +305,7 @@ def _postgres_connect(db_path: Optional[str] = None):
         password=settings.db_password or "",
         connect_timeout=10,
         cursor_factory=cursor_factory,
+        **_postgres_ssl_kwargs(),
     )
     conn.set_client_encoding("UTF8")
     return conn

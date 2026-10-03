@@ -571,7 +571,35 @@ LEARNING_V1 = Migration(
     ],
 )
 
-MIGRATIONS: List[Migration] = [KNOWLEDGE_V1, MEMORY_V1, LEARNING_V1]
+# Core (pre-migration) tables lacked the uniqueness their upsert paths assume.
+#
+# `daily_reviews` and `progress` are logically one row per (user, date). Both
+# `ReviewRepository.save` and `ProgressRepository.log` relied on ON CONFLICT /
+# a SELECT-then-INSERT race, but neither table declared a UNIQUE constraint, so:
+#   - daily_reviews accumulated one row per save (the audit reproduced 3 rows
+#     from 3 saves of the same date), skewing `get_daily_reviews` and the
+#     review-count stats query;
+#   - `progress` could not use a real upsert at all.
+#
+# The DUP_E cleanup statements collapse any pre-existing duplicates, keeping the
+# most recent row per (user_id, date). They are a no-op on a healthy database.
+# Statements are idempotent so this migration is safe to re-run.
+CORE_V1 = Migration(
+    schema_name="core",
+    version=1,
+    statements=[
+        "DELETE FROM daily_reviews WHERE review_id NOT IN ("
+        "SELECT MAX(review_id) FROM daily_reviews GROUP BY user_id, date)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_daily_reviews_user_date "
+        "ON daily_reviews (user_id, date)",
+        "DELETE FROM progress WHERE progress_id NOT IN ("
+        "SELECT MAX(progress_id) FROM progress GROUP BY user_id, date)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_progress_user_date "
+        "ON progress (user_id, date)",
+    ],
+)
+
+MIGRATIONS: List[Migration] = [KNOWLEDGE_V1, MEMORY_V1, LEARNING_V1, CORE_V1]
 
 
 def apply_migrations(conn) -> None:  # sqlite3.Connection or psycopg2 connection

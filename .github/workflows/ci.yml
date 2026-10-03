@@ -5,6 +5,10 @@ on:
     branches: ["**"]
   pull_request:
 
+# Least privilege: no job in this workflow writes to the repository.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -74,11 +78,30 @@ jobs:
           GEMINI_API_KEY: ""
         run: python scripts/verify.py
 
+      # This step previously ran `pytest tests/test_security.py || echo skip`.
+      # tests/test_security.py does not exist in the tree, so the `||` branch
+      # always ran and CI reported success for a suite that never executed.
+      # The security surface is now covered by files that DO exist, and the
+      # step fails loudly if any of them goes missing.
       - name: Security tests
-        run: python -m pytest tests/test_security.py -v || python -c "import sys; print('Security tests not found, skipping'); sys.exit(0)"
+        run: |
+          set -o pipefail
+          files=(
+            tests/test_redaction.py
+            tests/test_docker_context.py
+            tests/test_architecture.py
+            tests/test_production_config.py
+          )
+          for f in "${files[@]}"; do
+            if [ ! -f "$f" ]; then
+              echo "ERROR: expected security test file is missing: $f"
+              exit 1
+            fi
+          done
+          python -m pytest "${files[@]}" -v
 
       - name: Repository secret scan
-        uses: trufflesecurity/trufflehog@main
+        uses: trufflesecurity/trufflehog@3.88.24
         with:
           path: ./
           base: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}

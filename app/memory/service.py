@@ -287,6 +287,9 @@ class MemoryService:
             importance=cand.importance or existing.importance,
             source_note=cand.source_note or existing.source_note,
             consent_state=consent_state,
+            # Keep the row reachable by the review menu; otherwise a `pending`
+            # conflict is excluded from prompts and can never be confirmed.
+            needs_confirmation=consent_state == "pending",
         )
         if updated:
             new_key = build_hash_key(owner_user_id, cand.scope, cand.memory_type,

@@ -34,6 +34,20 @@ class _MemoryBase:
     def _connection(self) -> sqlite3.Connection:
         return self._manager._get_connection()
 
+    def _rollback(self) -> None:
+        """Discard an uncommitted transaction left by a failed statement.
+
+        Methods here catch ``DB_ERROR`` to degrade gracefully, so without an
+        explicit rollback a partial write stays in the implicit transaction on
+        SQLite and is committed later by an unrelated ``commit()``; on
+        PostgreSQL one failed statement poisons the session (``25P02``).
+        Called while ``self._manager._lock`` is held.
+        """
+        try:
+            self._manager._get_connection().rollback()
+        except Exception:  # noqa: BLE001 - never mask the original error
+            pass
+
     @staticmethod
     def _now() -> str:
         return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
@@ -130,6 +144,7 @@ class MemoriesRepository(_MemoryBase):
                 self._connection().commit()
                 return cursor.lastrowid
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in memory create: {e}")
             return None
 
@@ -144,6 +159,7 @@ class MemoriesRepository(_MemoryBase):
                 )
                 return self._memory_row(cursor.fetchone())
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in memory get: {e}")
             return None
 
@@ -161,6 +177,7 @@ class MemoriesRepository(_MemoryBase):
                 )
                 return self._memory_row(cursor.fetchone())
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in memory by_hash: {e}")
             return None
 
@@ -190,6 +207,7 @@ class MemoriesRepository(_MemoryBase):
                         latest = item
                 return latest
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in memory find_slot: {e}")
             return None
 
@@ -220,6 +238,7 @@ class MemoriesRepository(_MemoryBase):
                     if item:
                         rows.append(item)
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in memory list: {e}")
         return rows
 
@@ -252,6 +271,7 @@ class MemoriesRepository(_MemoryBase):
                     if item:
                         rows.append(item)
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in memory search: {e}")
         return rows
 
@@ -277,26 +297,46 @@ class MemoriesRepository(_MemoryBase):
                 counts["total"] = total
                 return counts
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in memory counts: {e}")
             return {"total": 0}
 
     def update(self, owner_user_id: int, memory_id: int, *, claim: str,
                confidence: str, importance: int, source_note: str = "",
-               consent_state: str = "automatic") -> bool:
-        """Overwrite a memory's value (used by conflict resolution / user edit)."""
+               consent_state: str = "automatic",
+               needs_confirmation: Optional[bool] = None) -> bool:
+        """Overwrite a memory's value (used by conflict resolution / user edit).
+
+        ``needs_confirmation`` mirrors the ``MemoryService.pending()`` filter:
+        it must be set whenever a row is moved to ``consent_state='pending'``
+        so the user can still review it. Omitting the argument leaves the
+        stored flag untouched.
+        """
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                params: list = [
+                    claim, confidence, importance, source_note,
+                    consent_state,
+                ]
+                extra_sql = ""
+                if needs_confirmation is not None:
+                    extra_sql = ", metadata_json = ?"
+                    params.append(self._j({
+                        "needs_confirmation": bool(needs_confirmation),
+                    }))
+                params.extend([self._now(), memory_id, owner_user_id])
                 cursor.execute(
-                    "UPDATE memories SET claim = ?, confidence = ?, "
-                    "importance = ?, source_note = ?, consent_state = ?, "
-                    "updated_at = ? WHERE memory_id = ? AND owner_user_id = ?",
-                    (claim, confidence, importance, source_note,
-                     consent_state, self._now(), memory_id, owner_user_id),
+                    f"UPDATE memories SET claim = ?, confidence = ?, "
+                    f"importance = ?, source_note = ?, consent_state = ? "
+                    f"{extra_sql}, updated_at = ? "
+                    f"WHERE memory_id = ? AND owner_user_id = ?",
+                    tuple(params),
                 )
                 self._connection().commit()
                 return cursor.rowcount > 0
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in memory update: {e}")
             return False
 
@@ -314,6 +354,7 @@ class MemoriesRepository(_MemoryBase):
                 self._connection().commit()
                 return cursor.rowcount > 0
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in memory update_hash_key: {e}")
             return False
 
@@ -328,6 +369,7 @@ class MemoriesRepository(_MemoryBase):
                 )
                 self._connection().commit()
         except DB_ERROR as e:  # pragma: no cover - defensive
+            self._rollback()
             logger.error(f"Database error in memory touch: {e}")
 
     def confirm(self, owner_user_id: int, memory_id: int) -> bool:
@@ -344,6 +386,7 @@ class MemoriesRepository(_MemoryBase):
                 self._connection().commit()
                 return cursor.rowcount > 0
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in memory confirm: {e}")
             return False
 
@@ -359,6 +402,7 @@ class MemoriesRepository(_MemoryBase):
                 self._connection().commit()
                 return cursor.rowcount > 0
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in memory set_status: {e}")
             return False
 
@@ -385,6 +429,7 @@ class MemoriesRepository(_MemoryBase):
                 self._connection().commit()
                 return cursor.rowcount > 0
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in memory resurrect: {e}")
             return False
 
@@ -399,6 +444,7 @@ class MemoriesRepository(_MemoryBase):
                 self._connection().commit()
                 return cursor.rowcount > 0
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in memory delete: {e}")
             return False
 
@@ -422,6 +468,7 @@ class MemoriesRepository(_MemoryBase):
                 self._connection().commit()
                 return cursor.rowcount
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in memory clear: {e}")
             return 0
 
@@ -454,6 +501,7 @@ class MemoriesRepository(_MemoryBase):
                     if item:
                         rows.append(item)
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in memory recent_used: {e}")
         return rows
 
@@ -477,6 +525,7 @@ class MemoryVersionsRepository(_MemoryBase):
                 self._connection().commit()
                 return cursor.lastrowid
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in memory version add: {e}")
             return None
 
@@ -493,6 +542,7 @@ class MemoryVersionsRepository(_MemoryBase):
                 for row in cursor.fetchall():
                     rows.append(dict(row))
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in memory versions list: {e}")
         return rows
 
@@ -515,6 +565,7 @@ class MemoryEventsRepository(_MemoryBase):
                 self._connection().commit()
                 return cursor.lastrowid
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in memory event log: {e}")
             return None
 
@@ -548,6 +599,7 @@ class MemoryEventsRepository(_MemoryBase):
                         created_at=row["created_at"],
                     ))
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in memory events list: {e}")
         return rows
 
@@ -567,6 +619,7 @@ class MemoryAccessRepository(_MemoryBase):
                 )
                 self._connection().commit()
         except DB_ERROR as e:  # pragma: no cover - defensive
+            self._rollback()
             logger.error(f"Database error in memory access log: {e}")
 
     def count(self, owner_user_id: int, purpose: Optional[str] = None) -> int:
@@ -587,6 +640,7 @@ class MemoryAccessRepository(_MemoryBase):
                     )
                 return cursor.fetchone()["n"]
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in memory access count: {e}")
             return 0
 
@@ -612,6 +666,7 @@ class MemoryPrefsRepository(_MemoryBase):
                     updated_at=row["updated_at"],
                 )
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in memory prefs get: {e}")
             return None
 
@@ -629,6 +684,7 @@ class MemoryPrefsRepository(_MemoryBase):
                 )
                 self._connection().commit()
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in memory prefs ensure: {e}")
         return MemoryPrefs(owner_user_id=owner_user_id, auto_memory_enabled=True)
 
@@ -647,6 +703,7 @@ class MemoryPrefsRepository(_MemoryBase):
                 self._connection().commit()
                 return True
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in memory prefs set_auto: {e}")
             return False
 
@@ -672,6 +729,7 @@ class MemoryPrefsRepository(_MemoryBase):
                 self._connection().commit()
                 return True
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in memory prefs consent: {e}")
             return False
 

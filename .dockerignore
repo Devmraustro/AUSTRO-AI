@@ -1,0 +1,96 @@
+# AUSTRO AI - Docker build context exclusions.
+#
+# The main image is built from this directory and `Dockerfile` historically
+# used `COPY . .`. Without this file the build context shipped every local
+# secret, database, backup and log to the Docker daemon (and into a layer),
+# even though `.gitignore` excluded them. `.gitignore` does NOT affect the
+# build context, so both are needed.
+#
+# Anything listed here must not be needed to RUN the container. If a build
+# fails because something was excluded, add it back explicitly rather than
+# deleting the rule.
+
+# --- version control ---------------------------------------------------------
+.git
+.gitignore
+.gitattributes
+.github
+
+# --- secrets and local configuration ----------------------------------------
+.env
+.env.*
+!.env.example
+!.env.staging.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.keystore
+secrets/
+certs/
+
+# --- local databases ---------------------------------------------------------
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+data/
+database/
+
+# --- backups (contain full memory + knowledge content) -----------------------
+backups/
+*.sql
+*.sql.gz
+*.dump
+*.tar.gz
+
+# --- runtime state -----------------------------------------------------------
+logs/
+*.log
+knowledge_storage/
+memory_uploads/
+.tmp/
+
+# --- Python build/test artefacts ---------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# --- CI / editor / OS -------------------------------------------------------
+.pytest_tmp/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- docs and audits (not needed at runtime) --------------------------------
+*.md
+!README.md
+docs/
+CODE_AUDIT_REPORT.md
+RELEASE_CHECKLIST.md
+PHASE_G_PRODUCTION_REPORT.md
+audit-report.json
+
+# --- VCS metadata used by compose locally only ------------------------------
+.claude/
+.opencode/

@@ -34,6 +34,20 @@ class _KnowledgeBase:
     def _connection(self) -> sqlite3.Connection:
         return self._manager._get_connection()
 
+    def _rollback(self) -> None:
+        """Discard an uncommitted transaction left by a failed statement.
+
+        Methods here catch ``DB_ERROR`` to degrade gracefully, so without an
+        explicit rollback a partial write stays in the implicit transaction on
+        SQLite and is committed later by an unrelated ``commit()``; on
+        PostgreSQL one failed statement poisons the session (``25P02``).
+        Called while ``self._manager._lock`` is held.
+        """
+        try:
+            self._manager._get_connection().rollback()
+        except Exception:  # noqa: BLE001 - never mask the original error
+            pass
+
     @staticmethod
     def _j(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False) if value else ""
@@ -84,6 +98,7 @@ class KnowledgeSourceRepository(_KnowledgeBase):
                 self._connection().commit()
                 return cursor.lastrowid
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge create source: {e}")
             return None
 
@@ -99,6 +114,7 @@ class KnowledgeSourceRepository(_KnowledgeBase):
                 row = cursor.fetchone()
                 return self._row(row)
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge get source: {e}")
             return None
 
@@ -121,6 +137,7 @@ class KnowledgeSourceRepository(_KnowledgeBase):
                     )
                 return [self._row(row) for row in cursor.fetchall()]
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge list sources: {e}")
             return []
 
@@ -141,6 +158,7 @@ class KnowledgeSourceRepository(_KnowledgeBase):
                 self._connection().commit()
                 return True
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge set_state: {e}")
             return False
 
@@ -166,6 +184,7 @@ class KnowledgeSourceRepository(_KnowledgeBase):
                 self._connection().commit()
                 return True
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge set_title: {e}")
             return False
 
@@ -181,6 +200,7 @@ class KnowledgeSourceRepository(_KnowledgeBase):
                 self._connection().commit()
                 return True
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge delete source: {e}")
             return False
 
@@ -213,6 +233,7 @@ class KnowledgeDocumentRepository(_KnowledgeBase):
                 self._connection().commit()
                 return cursor.lastrowid
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge create document: {e}")
             return None
 
@@ -229,6 +250,7 @@ class KnowledgeDocumentRepository(_KnowledgeBase):
                 self._connection().commit()
                 return True
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge complete document: {e}")
             return False
 
@@ -252,6 +274,7 @@ class KnowledgeDocumentRepository(_KnowledgeBase):
                     rows.append(data)
                 return rows
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge documents list_for_source: {e}")
             return []
 
@@ -274,6 +297,7 @@ class KnowledgeSectionRepository(_KnowledgeBase):
                 self._connection().commit()
                 return cursor.lastrowid
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge create section: {e}")
             return None
 
@@ -302,6 +326,7 @@ class KnowledgeSectionRepository(_KnowledgeBase):
                     ))
                 return rows
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge list sections: {e}")
             return []
 
@@ -329,6 +354,7 @@ class KnowledgeSectionRepository(_KnowledgeBase):
                     parent_section_id=row["parent_section_id"],
                 )
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge get section: {e}")
             return None
 
@@ -365,6 +391,7 @@ class KnowledgeChunkRepository(_KnowledgeBase):
                 self._connection().commit()
                 return cursor.lastrowid
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge create chunk: {e}")
             return None
 
@@ -378,6 +405,7 @@ class KnowledgeChunkRepository(_KnowledgeBase):
                 )
                 return int(cursor.fetchone()[0])
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge count chunks: {e}")
             return 0
 
@@ -411,6 +439,7 @@ class KnowledgeChunkRepository(_KnowledgeBase):
                     rows.append(data)
                 return rows
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge list candidates: {e}")
             return []
 
@@ -434,6 +463,7 @@ class KnowledgeEmbeddingRepository(_KnowledgeBase):
                 self._connection().commit()
                 return saved
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge save embeddings: {e}")
             return saved
 
@@ -448,6 +478,7 @@ class KnowledgeEmbeddingRepository(_KnowledgeBase):
                 )
                 return int(cursor.fetchone()[0])
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge count embeddings: {e}")
             return 0
 
@@ -476,6 +507,7 @@ class KnowledgeEmbeddingRepository(_KnowledgeBase):
                         continue
                 return result
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge vectors_for_owner: {e}")
             return {}
 
@@ -495,6 +527,7 @@ class KnowledgeEventRepository(_KnowledgeBase):
                 self._connection().commit()
                 return cursor.lastrowid
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge log event: {e}")
             return None
 
@@ -514,6 +547,7 @@ class KnowledgeEventRepository(_KnowledgeBase):
                 self._connection().commit()
                 return len(citations)
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge add citations: {e}")
             return 0
 
@@ -531,6 +565,7 @@ class KnowledgeCollectionRepository(_KnowledgeBase):
                 self._connection().commit()
                 return cursor.lastrowid
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge create collection: {e}")
             return None
 
@@ -554,6 +589,7 @@ class KnowledgeCollectionRepository(_KnowledgeBase):
                     for row in cursor.fetchall()
                 ]
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge list collections: {e}")
             return []
 
@@ -575,6 +611,7 @@ class KnowledgeCollectionRepository(_KnowledgeBase):
                 self._connection().commit()
                 return True
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge delete collection: {e}")
             return False
 
@@ -597,6 +634,7 @@ class KnowledgeCollectionRepository(_KnowledgeBase):
                 self._connection().commit()
                 return True
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge add_source: {e}")
             return False
 
@@ -612,6 +650,7 @@ class KnowledgeCollectionRepository(_KnowledgeBase):
                 self._connection().commit()
                 return True
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge remove_source: {e}")
             return False
 
@@ -629,6 +668,7 @@ class KnowledgeCollectionRepository(_KnowledgeBase):
                 )
                 return [row["source_id"] for row in cursor.fetchall()]
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge source_ids_for: {e}")
             return []
 
@@ -644,6 +684,7 @@ class KnowledgeCollectionRepository(_KnowledgeBase):
                 )
                 return [row["name"] for row in cursor.fetchall()]
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge names_for_source: {e}")
             return []
 
@@ -665,6 +706,7 @@ class KnowledgeStorageRepository(_KnowledgeBase):
                 self._connection().commit()
                 return True
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge register file: {e}")
             return False
 
@@ -679,6 +721,7 @@ class KnowledgeStorageRepository(_KnowledgeBase):
                 self._connection().commit()
                 return True
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge mark verified: {e}")
             return False
 
@@ -693,6 +736,7 @@ class KnowledgeStorageRepository(_KnowledgeBase):
                 row = cursor.fetchone()
                 return bool(row and row["verified"])
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in knowledge file verified: {e}")
             return False
 

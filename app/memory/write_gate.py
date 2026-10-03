@@ -279,6 +279,14 @@ class MemoryWriteGate:
             consent_state = "pending"
         else:
             consent_state = "automatic"
+        # `pending` is only meaningful if the user can actually see and decide
+        # on the row: MemoryService.pending() filters on both the consent state
+        # and this flag, and retrieval excludes `pending` from AI context. A
+        # low-confidence memory without it would be invisible everywhere and
+        # could never be confirmed.
+        metadata = {"sensitive": candidate.sensitive}
+        if consent_state == "pending":
+            metadata["needs_confirmation"] = True
         return MemoryItem(
             owner_user_id=candidate.owner_user_id,
             scope=candidate.scope,
@@ -297,7 +305,7 @@ class MemoryWriteGate:
             status="active",
             version=1,
             hash_key="",  # filled by the store on create
-            metadata={"sensitive": candidate.sensitive},
+            metadata=metadata,
         )
 
 

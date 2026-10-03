@@ -150,6 +150,12 @@ with offline `LocalProvider` fallback) → attach citations.
 - **Upload limits** (all configurable): max 50 MB, 1000 PDF pages, 2,000,000
   chars, 20,000 chunks, 900-char chunks, 16-embedding batches, top_k=8,
   min_score=0.20, context budget 6,000 chars.
+- **Decompression limits** (ZIP formats, checked *before* inflation): max 200 MB
+  total uncompressed, 2000 members, 200:1 max compression ratio. `max_file_size_mb`
+  bounds the compressed upload only and does **not** bound decompression; a
+  0.2 MB DOCX can otherwise inflate to hundreds of MB. These three limits close
+  that gap and are enforced against the ZIP central directory, plus during
+  decompression for EPUB chapters (per-chapter and cumulative).
 - **Never fabricated pages** — page attribution only comes from the PDF
   extractor's real char→page map.
 
@@ -159,7 +165,9 @@ All under `knowledge_*` in `app/config/settings.py` (env-overridable):
 `storage_path`, `max_file_size_mb`, `max_pages`, `max_chars`, `max_chunks`,
 `chunk_size`, `chunk_overlap`, `embedding_dimensions`, `embedding_model`,
 `embedding_version`, `retrieval_top_k`, `retrieval_min_score`,
-`context_budget_chars`, `embedding_batch_size`.
+`context_budget_chars`, `embedding_batch_size`, plus the decompression-bomb
+guards `max_uncompressed_mb` (default 200), `max_zip_members` (2000) and
+`max_zip_ratio` (200).
 
 The storage root (`knowledge_storage/` by default) is auto-created.
 

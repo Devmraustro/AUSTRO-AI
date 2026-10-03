@@ -30,6 +30,20 @@ class _LearningBase:
     def _connection(self) -> sqlite3.Connection:
         return self._manager._get_connection()
 
+    def _rollback(self) -> None:
+        """Discard an uncommitted transaction left by a failed statement.
+
+        Methods here catch ``DB_ERROR`` to degrade gracefully, so without an
+        explicit rollback a partial write stays in the implicit transaction on
+        SQLite and is committed later by an unrelated ``commit()``; on
+        PostgreSQL one failed statement poisons the session (``25P02``).
+        Called while ``self._manager._lock`` is held.
+        """
+        try:
+            self._manager._get_connection().rollback()
+        except Exception:  # noqa: BLE001 - never mask the original error
+            pass
+
     def _now(self) -> str:
         return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -64,6 +78,7 @@ class EducationalGoalsRepository(_LearningBase):
                 self._connection().commit()
                 return cursor.lastrowid
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in learning goal create: {e}")
             return None
 
@@ -79,6 +94,7 @@ class EducationalGoalsRepository(_LearningBase):
                 row = cursor.fetchone()
                 return dict(row) if row else None
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in learning goal get: {e}")
             return None
 
@@ -93,6 +109,7 @@ class EducationalGoalsRepository(_LearningBase):
                 )
                 return [dict(r) for r in cursor.fetchall()]
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in learning goal list: {e}")
             return []
 
@@ -107,6 +124,7 @@ class EducationalGoalsRepository(_LearningBase):
                 )
                 return [dict(r) for r in cursor.fetchall()]
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in learning goal children: {e}")
             return []
 
@@ -122,6 +140,7 @@ class EducationalGoalsRepository(_LearningBase):
                 self._connection().commit()
                 return cursor.rowcount > 0
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in learning goal set_status: {e}")
             return False
 
@@ -143,6 +162,7 @@ class LearningObjectivesRepository(_LearningBase):
                 self._connection().commit()
                 return cursor.lastrowid
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in objective create: {e}")
             return None
 
@@ -161,6 +181,7 @@ class LearningObjectivesRepository(_LearningBase):
                 data["prerequisites"] = self._unjson(data.pop("prerequisites_json"))
                 return data
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in objective get: {e}")
             return None
 
@@ -180,6 +201,7 @@ class LearningObjectivesRepository(_LearningBase):
                     rows.append(data)
                 return rows
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in objective list: {e}")
             return []
 
@@ -195,6 +217,7 @@ class LearningObjectivesRepository(_LearningBase):
                 self._connection().commit()
                 return cursor.rowcount > 0
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in objective update_mastery: {e}")
             return False
 
@@ -210,6 +233,7 @@ class LearningObjectivesRepository(_LearningBase):
                 self._connection().commit()
                 return cursor.rowcount > 0
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in objective set_status: {e}")
             return False
 
@@ -226,6 +250,7 @@ class LearningObjectivesRepository(_LearningBase):
                 self._connection().commit()
                 return cursor.rowcount > 0
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in objective set_prerequisites: {e}")
             return False
 
@@ -247,6 +272,7 @@ class CurriculaRepository(_LearningBase):
                 self._connection().commit()
                 return cursor.lastrowid
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in curriculum create: {e}")
             return None
 
@@ -266,6 +292,7 @@ class CurriculaRepository(_LearningBase):
                 data["modules"] = self._unjson(data.pop("modules_json"))
                 return data
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in curriculum get: {e}")
             return None
 
@@ -286,6 +313,7 @@ class CurriculaRepository(_LearningBase):
                     rows.append(data)
                 return rows
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in curriculum list: {e}")
             return []
 
@@ -312,6 +340,7 @@ class CurriculaRepository(_LearningBase):
                 self._connection().commit()
                 return cursor.rowcount > 0
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in curriculum update: {e}")
             return False
 
@@ -334,6 +363,7 @@ class LessonsRepository(_LearningBase):
                 self._connection().commit()
                 return cursor.lastrowid
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in lesson create: {e}")
             return None
 
@@ -355,6 +385,7 @@ class LessonsRepository(_LearningBase):
                 data["sources"] = self._unjson(data.pop("sources_json"))
                 return data
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in lesson get_in_curriculum: {e}")
             return None
 
@@ -375,6 +406,7 @@ class LessonsRepository(_LearningBase):
                 data["sources"] = self._unjson(data.pop("sources_json"))
                 return data
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in lesson get: {e}")
             return None
 
@@ -389,6 +421,7 @@ class LessonsRepository(_LearningBase):
                 )
                 return int(cursor.fetchone()[0])
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in lesson count: {e}")
             return 0
 
@@ -411,6 +444,7 @@ class SessionsRepository(_LearningBase):
                 self._connection().commit()
                 return cursor.lastrowid
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in session create: {e}")
             return None
 
@@ -429,6 +463,7 @@ class SessionsRepository(_LearningBase):
                 data["result"] = self._unjson(data.pop("result_json"), {})
                 return data
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in session get: {e}")
             return None
 
@@ -449,6 +484,7 @@ class SessionsRepository(_LearningBase):
                 data["result"] = self._unjson(data.pop("result_json"), {})
                 return data
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in session resume: {e}")
             return None
 
@@ -472,6 +508,7 @@ class SessionsRepository(_LearningBase):
                 self._connection().commit()
                 return cursor.rowcount > 0
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in session set_step: {e}")
             return False
 
@@ -488,6 +525,7 @@ class SessionsRepository(_LearningBase):
                 self._connection().commit()
                 return cursor.rowcount > 0
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in session complete: {e}")
             return False
 
@@ -511,6 +549,7 @@ class MasteryRepository(_LearningBase):
                 data["kinds"] = self._unjson(data.pop("kinds_json"))
                 return data
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in mastery get: {e}")
             return None
 
@@ -536,6 +575,7 @@ class MasteryRepository(_LearningBase):
                 self._connection().commit()
                 return cursor.rowcount >= 0
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in mastery save: {e}")
             return False
 
@@ -556,6 +596,7 @@ class MasteryRepository(_LearningBase):
                     rows.append(data)
                 return rows
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in mastery list: {e}")
             return []
 
@@ -571,6 +612,7 @@ class MasteryRepository(_LearningBase):
                 self._connection().commit()
                 return cursor.rowcount > 0
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in mastery delete: {e}")
             return False
 
@@ -596,6 +638,7 @@ class ReviewsRepository(_LearningBase):
                 row = cursor.fetchone()
                 return int(row["review_id"]) if row else None
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in review create: {e}")
             return None
 
@@ -612,6 +655,7 @@ class ReviewsRepository(_LearningBase):
                 row = cursor.fetchone()
                 return dict(row) if row else None
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in review get: {e}")
             return None
 
@@ -634,6 +678,7 @@ class ReviewsRepository(_LearningBase):
                 self._connection().commit()
                 return cursor.rowcount >= 0
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in review update: {e}")
             return False
 
@@ -650,6 +695,7 @@ class ReviewsRepository(_LearningBase):
                 )
                 return [dict(r) for r in cursor.fetchall()]
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in review due: {e}")
             return []
 
@@ -665,6 +711,7 @@ class ReviewsRepository(_LearningBase):
                 )
                 return [dict(r) for r in cursor.fetchall()]
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in review list: {e}")
             return []
 
@@ -692,6 +739,7 @@ class AssessmentsRepository(_LearningBase):
                 self._connection().commit()
                 return cursor.lastrowid
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in assessment create: {e}")
             return None
 
@@ -721,6 +769,7 @@ class AssessmentsRepository(_LearningBase):
                     rows.append(data)
                 return rows
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in assessment list: {e}")
             return []
 
@@ -758,6 +807,7 @@ class MisconceptionsRepository(_LearningBase):
                 self._connection().commit()
                 return True
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in misconception record: {e}")
             return False
 
@@ -786,6 +836,7 @@ class MisconceptionsRepository(_LearningBase):
                 data["evidence"] = self._unjson(data.pop("evidence_json"))
                 return data
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in misconception get: {e}")
             return None
 
@@ -807,6 +858,7 @@ class MisconceptionsRepository(_LearningBase):
                     rows.append(data)
                 return rows
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in misconception list: {e}")
             return []
 
@@ -822,6 +874,7 @@ class MisconceptionsRepository(_LearningBase):
                 self._connection().commit()
                 return cursor.rowcount > 0
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in misconception acknowledge: {e}")
             return False
 
@@ -843,6 +896,7 @@ class PlansRepository(_LearningBase):
                 self._connection().commit()
                 return True
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in plan save: {e}")
             return False
 
@@ -862,6 +916,7 @@ class PlansRepository(_LearningBase):
                 data["items"] = self._unjson(data.pop("items_json"))
                 return data
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in plan get: {e}")
             return None
 
@@ -881,6 +936,7 @@ class PlansRepository(_LearningBase):
                     rows.append(data)
                 return rows
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in plan recent: {e}")
             return []
 
@@ -911,6 +967,7 @@ class LearningProgressRepository(_LearningBase):
                 self._connection().commit()
                 return True
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in progress record: {e}")
             return False
 
@@ -926,6 +983,7 @@ class LearningProgressRepository(_LearningBase):
                 row = cursor.fetchone()
                 return dict(row) if row else None
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in progress get: {e}")
             return None
 
@@ -940,6 +998,7 @@ class LearningProgressRepository(_LearningBase):
                 )
                 return [dict(r) for r in cursor.fetchall()]
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in progress range: {e}")
             return []
 
@@ -960,6 +1019,7 @@ class LearningEventsRepository(_LearningBase):
                 self._connection().commit()
                 return True
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in learning event log: {e}")
             return False
 
@@ -974,6 +1034,7 @@ class LearningEventsRepository(_LearningBase):
                 )
                 return [dict(r) for r in cursor.fetchall()]
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in learning event list: {e}")
             return []
 
@@ -1025,6 +1086,7 @@ class LearningStore:
                 connection.commit()
                 return True
         except DB_ERROR as e:
+            self._rollback()
             logger.error(f"Database error in learning clear_owner: {e}")
             return False
 
