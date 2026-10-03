@@ -28,7 +28,7 @@ counted as fixed.
 | Dependency vulnerabilities | `python -m pip_audit -r requirements.txt -r requirements-dev.txt` | `No known vulnerabilities found.`, exit 0 |
 | Evaluation harness | `python scripts/verify.py` | `OVERALL: PASS (100.0% / 100% threshold)`, exit 0 |
 | Offline smoke | `python smoke_test.py` | `SMOKE TEST PASSED`, exit 0 |
-| Unit + integration tests | see §2 | 445 passed, 19 skipped, 0 failed |
+| Unit + integration tests | see §2 | 446 passed, 19 skipped, 0 failed |
 
 Local interpreter: CPython 3.14.7 on Windows. CI runs CPython 3.12 on
 `ubuntu-latest`, which is the authoritative Python version for this project; the
@@ -50,7 +50,7 @@ product defects.
 
 | Batch | Result |
 |---|---|
-| `tests/test_audit_regressions.py` | 62 passed (new) |
+| `tests/test_audit_regressions.py` | 63 passed (new) |
 | `tests/test_docker_context.py` | 8 passed, 1 skipped (Docker absent) (new) |
 | `tests/test_redaction.py` | 6 passed |
 | `tests/test_rag.py` | 7 passed |
@@ -59,7 +59,7 @@ product defects.
 | `tests/test_architecture.py`, `test_learning.py`, `test_scheduler.py`, `test_flashcards.py`, `test_backup.py`, `test_smoke.py`, `test_staging.py` | 166 passed |
 | `tests/test_rate_limiter.py`, `test_rate_limit_guards.py`, `test_rate_limit_commands.py`, `test_rate_limit_integration.py` | 111 passed |
 | `tests/test_performance.py`, `test_repositories_pg.py` | 18 skipped (no local PostgreSQL) |
-| **Total** | **445 passed, 19 skipped, 0 failed** |
+| **Total** | **446 passed, 19 skipped, 0 failed** |
 
 ---
 
@@ -349,8 +349,11 @@ action was also pinned to the moving ref `trufflesecurity/trufflehog@main`.
 
 **Fix:** the step now lists the security test files that **do** exist, fails
 loudly if any is missing, and runs pytest over them. TruffleHog is pinned to
-`3.88.24`. A top-level `permissions: contents: read` was added; no job in the
-workflow needs write access.
+`v3.97.9` (the published tags carry a leading `v`; an earlier `3.88.24` had no
+such ref and failed the job at "Set up job" before any code ran — run #19).
+A top-level `permissions: contents: read` was added; no job in the workflow
+needs write access. `test_third_party_actions_are_pinned_to_a_release` now
+enforces both rules.
 
 ### F-17 · High · Low-confidence memories were unreachable and permanently dead
 

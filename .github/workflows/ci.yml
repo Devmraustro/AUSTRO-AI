@@ -101,7 +101,7 @@ jobs:
           python -m pytest "${files[@]}" -v
 
       - name: Repository secret scan
-        uses: trufflesecurity/trufflehog@3.88.24
+        uses: trufflesecurity/trufflehog@v3.97.9
         with:
           path: ./
           base: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}

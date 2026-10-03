@@ -16,6 +16,7 @@ Covers, one test per confirmed defect:
 import io
 import logging
 import os
+import re
 import sqlite3
 import sys
 import zipfile
@@ -897,3 +898,27 @@ def test_security_ci_step_does_not_swallow_failures():
     assert "trufflesecurity/trufflehog@main" not in workflow, (
         "the secret scan action is still pinned to a moving ref"
     )
+
+
+def test_third_party_actions_are_pinned_to_a_release():
+    """A wrong ref fails the whole job at 'Set up job', before any code runs.
+
+    `trufflehog@3.88.24` was committed with no `v` prefix; the published tags
+    are `vX.Y.Z`, so run #19 died with "Unable to resolve action
+    `trufflesecurity/trufflehog@3.88.24`, unable to find version". Keep the pin
+    explicit and in the published tag format.
+    """
+    workflow = (Path(__file__).resolve().parent.parent
+                / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    refs = re.findall(r"uses:\s*([^\s@]+)@([^\s#]+)", workflow)
+    assert refs, "no third-party actions found in the workflow"
+
+    for action, ref in refs:
+        assert ref not in {"main", "master"}, (
+            f"{action} is still pinned to a moving ref"
+        )
+        if action.startswith("trufflesecurity/trufflehog"):
+            assert re.fullmatch(r"v\d+\.\d+\.\d+", ref), (
+                f"{action} must be pinned to a published vX.Y.Z tag, "
+                f"got {ref!r} (trufflehog tags carry a leading 'v')"
+            )
