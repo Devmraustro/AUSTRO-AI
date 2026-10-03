@@ -2,6 +2,8 @@
 
 - **Branch:** `main`
 - **Baseline commit:** `aad4a1ad35430efa66970d492e1e46007d46e759`
+- **Audit commits:** `1f3ec07` (the fixes), `75b8ebf` (TruffleHog pin fix)
+- **CI:** run #20 — <https://github.com/Devmraustro/AUSTRO-AI/actions/runs/37139343688> — all four jobs green.
 - **Scope:** full local security / correctness / runtime-readiness review of the
   repository at the baseline commit. No hosting, deployment, provisioning, or
   live-service access was performed or attempted.
@@ -34,10 +36,9 @@ Local interpreter: CPython 3.14.7 on Windows. CI runs CPython 3.12 on
 `ubuntu-latest`, which is the authoritative Python version for this project; the
 local 3.14 run is a compatibility superset check, not a replacement.
 
-**Not available locally:** Docker/Compose (so no image build, no `pg_dump`
-version assertion, no container start), a PostgreSQL server, Bandit, and any
-real Gemini credential or Telegram bot. Those checks are reported as blocked
-rather than passed.
+**Not available locally:** Docker/Compose, a PostgreSQL server, and Bandit; also
+no real Gemini credential or Telegram bot. Docker and PostgreSQL were exercised
+in GitHub Actions run #20 instead (see §4).
 
 ---
 
@@ -51,14 +52,14 @@ product defects.
 | Batch | Result |
 |---|---|
 | `tests/test_audit_regressions.py` | 63 passed (new) |
-| `tests/test_docker_context.py` | 8 passed, 1 skipped (Docker absent) (new) |
+| `tests/test_docker_context.py` | 8 passed, 1 skipped (Docker absent) (new); **image build verified in CI run #20** |
 | `tests/test_redaction.py` | 6 passed |
 | `tests/test_rag.py` | 7 passed |
 | `tests/test_handlers.py` | 4 passed |
 | `tests/test_memory.py`, `test_database.py`, `test_knowledge.py` | 81 passed |
 | `tests/test_architecture.py`, `test_learning.py`, `test_scheduler.py`, `test_flashcards.py`, `test_backup.py`, `test_smoke.py`, `test_staging.py` | 166 passed |
 | `tests/test_rate_limiter.py`, `test_rate_limit_guards.py`, `test_rate_limit_commands.py`, `test_rate_limit_integration.py` | 111 passed |
-| `tests/test_performance.py`, `test_repositories_pg.py` | 18 skipped (no local PostgreSQL) |
+| `tests/test_performance.py`, `test_repositories_pg.py` | 18 skipped (no local PostgreSQL; **passed in CI run #20** against `postgres:16`) |
 | **Total** | **446 passed, 19 skipped, 0 failed** |
 
 ---
@@ -398,20 +399,30 @@ now also asserts that it is invisible before approval and retrievable after.
 | R-4 | Medium | Ingestion failure state machine can wedge a source | Open — some parse/IO failure paths do not transition the source out of its in-progress state, so a retry may not be scheduled. |
 | R-5 | Low | Owner filters are inconsistent across repositories | Open — several `list`/`get` methods in the learning layer do not take an `owner_user_id`, so they cannot enforce ownership at the repository boundary. Currently safe only because the service layer filters first. |
 
-### Verification blocked by the environment
+### Verification completed in CI (run #20, commit `75b8ebf`)
 
-These were **not** verified locally and are not claimed as passing:
+These were not verifiable on the Windows workstation and are covered by
+GitHub Actions instead. All four jobs passed:
 
-- **Docker image build, `pg_dump` major-version assertion, container start**
-  (requires Docker; unavailable). CI covers these on the `Staging stack` job.
-- **PostgreSQL integration tests** (`tests/test_repositories_pg.py`, 18 tests,
-  skipped locally) — requires a PostgreSQL server. CI runs them against
-  `postgres:16`.
-- **Bandit static analysis** — not installed locally.
-- **TruffleHog secret scan** — requires network/CI; the local `pip-audit` run
-  covered dependency CVEs only, not repository secrets.
+| Job | What it proves |
+|---|---|
+| `test (3.12)` | Byte-compile, pyflakes, full pytest, offline smoke, **PostgreSQL 16 integration tests** (so `CORE_V1`, the upserts and the TLS assertions are validated on real PostgreSQL), the evaluation harness, the security suite, and the TruffleHog secret scan actually executing. |
+| `Staging stack (compose + images)` | The new allow-list `Dockerfile` builds, `Dockerfile.backup` builds, `pg_dump` major version matches, staging isolation preflight, rollback refused outside staging. |
+| `dependency-audit` | `pip-audit` over `requirements.txt` + `requirements-dev.txt`, clean. |
+| `performance-tests` | Performance suite on 3.12. |
+
+So the local gaps below are closed for CI but were never reproducible locally:
+Docker and PostgreSQL were unavailable on this machine.
+
+### Still not verified anywhere
+
+- **Bandit static analysis** — not installed locally and not in CI. If it is
+  wanted, it must be added to `requirements-dev.txt` and a workflow step.
 - **Live Gemini / Telegram behaviour** — no real credentials were used or
-  requested.
+  requested, by design.
+- **Python 3.10/3.11/3.13+** — `pyproject.toml` declares `>=3.10`; CI exercises
+  3.12 only, so the rest of the declared range is untested.
+- **Production/staging runtime** — no deployment was attempted.
 
 ---
 
@@ -435,6 +446,3 @@ Still outstanding (not changed here, listed so it is not lost):
   exercises only 3.12. The 3.10/3.11/3.13+ range is therefore **unverified**.
   Either widen the CI matrix or narrow `requires-python`; this is a release
   decision, not an audit fix.
-- The PostgreSQL-deduplication and unique-index migration (`CORE_V1`) is
-  validated on SQLite only. `tests/test_repositories_pg.py` covers PostgreSQL
-  but is skipped locally.
