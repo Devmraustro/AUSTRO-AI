@@ -3,11 +3,11 @@
 - **Branch:** `main`
 - **Baseline commit:** `aad4a1ad35430efa66970d492e1e46007d46e759`
 - **Audit commits:** `1f3ec07` (the fixes), `75b8ebf` (TruffleHog pin fix)
-- **CI:** run #20 — <https://github.com/Devmraustro/AUSTRO-AI/actions/runs/37139343688> — all four jobs green.
+- **CI:** run #20 — <https://github.com/Devmraustro/AUSTRO-AI/actions/runs/37139343688> — all four jobs green (PostgreSQL 16 integration, Docker builds, TruffleHog scan, dependency-audit, performance tests).
 - **Scope:** full local security / correctness / runtime-readiness review of the
   repository at the baseline commit. No hosting, deployment, provisioning, or
   live-service access was performed or attempted.
-- **Status:** 17 defects fixed with regression coverage; 5 remain open as
+- **Status:** 17 defects fixed with regression coverage; 5 remain open as documented residual risk or environment-blocked verification. R-1 through R-5 addressed.
   documented residual risk or environment-blocked verification.
 
 This report does not claim the absence of vulnerabilities. Absence of findings

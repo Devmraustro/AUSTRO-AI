@@ -205,14 +205,14 @@ class LearningObjectivesRepository(_LearningBase):
             logger.error(f"Database error in objective list: {e}")
             return []
 
-    def update_mastery(self, objective_id: int, state: str, score: float) -> bool:
+    def update_mastery(self, owner_user_id: int, objective_id: int, state: str, score: float) -> bool:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
                 cursor.execute(
                     "UPDATE learning_objectives SET mastery_state = ?, "
-                    "mastery_score = ?, updated_at = ? WHERE objective_id = ?",
-                    (state, round(score, 1), self._now(), objective_id),
+                    "mastery_score = ?, updated_at = ? WHERE objective_id = ? AND owner_user_id = ?",
+                    (state, round(score, 1), self._now(), objective_id, owner_user_id),
                 )
                 self._connection().commit()
                 return cursor.rowcount > 0
@@ -237,15 +237,15 @@ class LearningObjectivesRepository(_LearningBase):
             logger.error(f"Database error in objective set_status: {e}")
             return False
 
-    def set_prerequisites(self, objective_id: int,
+    def set_prerequisites(self, owner_user_id: int, objective_id: int,
                           prerequisites: List[int]) -> bool:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
                 cursor.execute(
                     "UPDATE learning_objectives SET prerequisites_json = ?, "
-                    "updated_at = ? WHERE objective_id = ?",
-                    (self._j(prerequisites), self._now(), objective_id),
+                    "updated_at = ? WHERE objective_id = ? AND owner_user_id = ?",
+                    (self._j(prerequisites), self._now(), objective_id, owner_user_id),
                 )
                 self._connection().commit()
                 return cursor.rowcount > 0
@@ -488,7 +488,7 @@ class SessionsRepository(_LearningBase):
             logger.error(f"Database error in session resume: {e}")
             return None
 
-    def set_step(self, session_id: int, state: str, step: str,
+    def set_step(self, owner_user_id: int, session_id: int, state: str, step: str,
                  lesson_id: Optional[int] = None) -> bool:
         try:
             with self._manager._lock:
@@ -496,14 +496,14 @@ class SessionsRepository(_LearningBase):
                 if lesson_id is not None:
                     cursor.execute(
                         "UPDATE learning_sessions SET state = ?, step = ?, "
-                        "lesson_id = ?, last_activity_at = ? WHERE session_id = ?",
-                        (state, step, lesson_id, self._now(), session_id),
+                        "lesson_id = ?, last_activity_at = ? WHERE session_id = ? AND owner_user_id = ?",
+                        (state, step, lesson_id, self._now(), session_id, owner_user_id),
                     )
                 else:
                     cursor.execute(
                         "UPDATE learning_sessions SET state = ?, step = ?, "
-                        "last_activity_at = ? WHERE session_id = ?",
-                        (state, step, self._now(), session_id),
+                        "last_activity_at = ? WHERE session_id = ? AND owner_user_id = ?",
+                        (state, step, self._now(), session_id, owner_user_id),
                     )
                 self._connection().commit()
                 return cursor.rowcount > 0
@@ -512,15 +512,15 @@ class SessionsRepository(_LearningBase):
             logger.error(f"Database error in session set_step: {e}")
             return False
 
-    def complete(self, session_id: int, result: Dict[str, Any]) -> bool:
+    def complete(self, owner_user_id: int, session_id: int, result: Dict[str, Any]) -> bool:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
                 cursor.execute(
                     "UPDATE learning_sessions SET state = 'COMPLETED', "
                     "step = 'COMPLETED', ended_at = ?, result_json = ?, "
-                    "last_activity_at = ? WHERE session_id = ?",
-                    (self._now(), self._j(result), self._now(), session_id),
+                    "last_activity_at = ? WHERE session_id = ? AND owner_user_id = ?",
+                    (self._now(), self._j(result), self._now(), session_id, owner_user_id),
                 )
                 self._connection().commit()
                 return cursor.rowcount > 0

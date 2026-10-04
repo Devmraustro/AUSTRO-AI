@@ -73,7 +73,7 @@ def knowledge(fresh_db):
 
 
 async def _ingest(knowledge, owner, file_name, text, mime_type=None):
-    upload = knowledge.register_upload(
+    upload = await knowledge.register_upload(
         owner_user_id=owner,
         file_name=file_name,
         data=text.encode("utf-8"),
@@ -162,27 +162,27 @@ def test_structure_and_semantic_chunker_produce_attributed_chunks():
 # ============================ UPLOAD VALIDATION ============================
 
 
-def test_register_upload_rejects_empty_file(knowledge):
+async def test_register_upload_rejects_empty_file(knowledge):
     with pytest.raises(ValidationError):
-        knowledge.register_upload(owner_user_id=1, file_name="e.txt", data=b"")
+        await knowledge.register_upload(owner_user_id=1, file_name="e.txt", data=b"")
 
 
-def test_register_upload_rejects_unsupported_format(knowledge):
+async def test_register_upload_rejects_unsupported_format(knowledge):
     with pytest.raises(ValidationError):
-        knowledge.register_upload(owner_user_id=1, file_name="e.zip", data=b"x")
+        await knowledge.register_upload(owner_user_id=1, file_name="e.zip", data=b"x")
 
 
-def test_register_upload_rejects_oversize(knowledge, monkeypatch):
+async def test_register_upload_rejects_oversize(knowledge, monkeypatch):
     overrides = dataclasses.replace(knowledge._settings, knowledge_max_file_size_mb=1)
     monkeypatch.setattr(knowledge, "_settings", overrides)
     with pytest.raises(ValidationError):
-        knowledge.register_upload(
+        await knowledge.register_upload(
             owner_user_id=1, file_name="big.txt", data=b"x" * (2 * 1024 * 1024)
         )
 
 
-def test_register_upload_creates_pending_source(knowledge):
-    upload = knowledge.register_upload(
+async def test_register_upload_creates_pending_source(knowledge):
+    upload = await knowledge.register_upload(
         owner_user_id=5, file_name="book.txt", data=b"hello world"
     )
     assert upload["duplicate"] is False
@@ -219,7 +219,7 @@ async def test_ingest_txt_reaches_ready_with_consistent_embeddings(knowledge):
 
 async def test_ingest_pdf_reaches_ready_with_page_numbers(knowledge):
     pdf = _minimal_pdf("Routine: waking early each day improves focus sharply.")
-    upload = knowledge.register_upload(
+    upload = await knowledge.register_upload(
         owner_user_id=8,
         file_name="routine.pdf",
         data=pdf,
@@ -235,7 +235,7 @@ async def test_ingest_pdf_reaches_ready_with_page_numbers(knowledge):
 
 async def test_ingest_is_idempotent_by_checksum(knowledge):
     upload1, _ = await _ingest(knowledge, 9, "a.txt", ARABIC_BOOK)
-    upload2 = knowledge.register_upload(
+    upload2 = await knowledge.register_upload(
         owner_user_id=9, file_name="renamed.txt", data=ARABIC_BOOK.encode()
     )
     assert upload2["duplicate"] is True
@@ -244,7 +244,7 @@ async def test_ingest_is_idempotent_by_checksum(knowledge):
 
 
 async def test_pipeline_failure_is_recorded_and_recovers(knowledge):
-    upload = knowledge.register_upload(
+    upload = await knowledge.register_upload(
         owner_user_id=10, file_name="bad.epub", data=b"not a zip"
     )
     result = await knowledge.process_source(10, upload["source_id"])
@@ -311,3 +311,6 @@ def test_settings_info_exposes_engine_limits(knowledge):
     assert info["embedding_version"] == "1"
     assert info["dimensions"] == 128
     assert info["top_k"] > 0
+
+
+

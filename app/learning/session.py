@@ -48,7 +48,7 @@ class SessionManager:
 
     def attach_lesson(self, session: LearningSession, lesson_id: int) -> bool:
         return self._store.sessions.set_step(
-            session.session_id, "LESSON", "LESSON", lesson_id=lesson_id,
+            session.owner_user_id, session.session_id, "LESSON", "LESSON", lesson_id=lesson_id,
         )
 
     def advance(self, session: LearningSession, to_step: str,
@@ -56,7 +56,7 @@ class SessionManager:
         if to_step not in _SESSION_FLOW:
             to_step = _SESSION_FLOW[0]
         self._store.sessions.set_step(
-            session.session_id, state or to_step, to_step,
+            session.owner_user_id, session.session_id, state or to_step, to_step,
         )
         return self.resume(session.owner_user_id) or session
 

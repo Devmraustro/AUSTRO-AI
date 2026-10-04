@@ -8,6 +8,7 @@ before anything touches disk or the database.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from typing import Any, Dict, List, Optional
@@ -49,13 +50,16 @@ class KnowledgeService:
     # ------------------------------------------------------------------
     # Upload
     # ------------------------------------------------------------------
-    def register_upload(self, *, owner_user_id: int, file_name: str, data: bytes,
-                        mime_type: Optional[str] = None, source_type: str = "book",
-                        original_ref: Optional[str] = None) -> Dict[str, Any]:
+    async def register_upload(self, *, owner_user_id: int, file_name: str, data: bytes,
+                              mime_type: Optional[str] = None, source_type: str = "book",
+                              original_ref: Optional[str] = None) -> Dict[str, Any]:
         """Validate, store and register a raw file as a knowledge source.
 
         Returns {"source_id", "duplicate"} where duplicate=True means a file
         with the same checksum already exists for this owner (idempotent).
+
+        Runs blocking I/O (checksum, disk write) in a thread pool so the
+        event loop is not blocked.
         """
         file_name = (file_name or "document").strip()
         fmt = detect_format(file_name, mime_type)
@@ -69,8 +73,9 @@ class KnowledgeService:
                 f"({self._settings.knowledge_max_file_size_mb}MB)"
             )
 
-        checksum = hashlib.sha256(data).hexdigest()
-        storage_key, checksum = self._storage.save(
+        checksum = (await asyncio.to_thread(hashlib.sha256, data)).hexdigest()
+        storage_key, checksum = await asyncio.to_thread(
+            self._storage.save,
             owner_user_id=owner_user_id,
             file_name=file_name,
             data=data,
@@ -78,7 +83,8 @@ class KnowledgeService:
             checksum=checksum,
         )
         title = file_name.rsplit(".", 1)[0] if "." in file_name else file_name
-        source_id = self._store.sources.create(
+        source_id = await asyncio.to_thread(
+            self._store.sources.create,
             owner_user_id=owner_user_id,
             source_type=source_type,
             title=title[:120],
@@ -93,12 +99,13 @@ class KnowledgeService:
         )
         if source_id is None:
             # Duplicate file for this owner: remove the copy just written.
-            self._storage.delete(storage_key)
-            existing = self._source_by_checksum(owner_user_id, checksum)
+            await asyncio.to_thread(self._storage.delete, storage_key)
+            existing = await asyncio.to_thread(self._source_by_checksum, owner_user_id, checksum)
             return {"source_id": existing["source_id"] if existing else None,
                     "duplicate": True}
 
-        self._storage.register_file(
+        await asyncio.to_thread(
+            self._storage.register_file,
             owner_user_id=owner_user_id,
             source_id=source_id,
             storage_key=storage_key,

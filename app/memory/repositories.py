@@ -546,6 +546,39 @@ class MemoryVersionsRepository(_MemoryBase):
             logger.error(f"Database error in memory versions list: {e}")
         return rows
 
+    def redact(self, owner_user_id: int, memory_id: Optional[int] = None) -> int:
+        """Redact claim content in memory_versions when a memory is forgotten/deleted.
+
+        If memory_id is provided, only that memory's versions are redacted.
+        If memory_id is None, all memory versions for the given owner_user_id are redacted.
+        Returns the number of rows redacted.
+        """
+        try:
+            with self._manager._lock:
+                cursor = self._connection().cursor()
+                if memory_id is not None:
+                    cursor.execute(
+                        "UPDATE memory_versions SET claim = ? "
+                        "WHERE memory_id = ? AND owner_user_id = ? AND claim != ?",
+                        ("(forgotten - content redacted)", memory_id, owner_user_id,
+                         "(forgotten - content redacted)"),
+                    )
+                    self._connection().commit()
+                    return cursor.rowcount
+                else:
+                    cursor.execute(
+                        "UPDATE memory_versions SET claim = ? "
+                        "WHERE owner_user_id = ? AND claim != ?",
+                        ("(forgotten - content redacted)", owner_user_id,
+                         "(forgotten - content redacted)"),
+                    )
+                    self._connection().commit()
+                    return cursor.rowcount
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in memory versions redact: {e}")
+            return 0
+
 
 class MemoryEventsRepository(_MemoryBase):
     """Audit trail of every memory lifecycle action."""

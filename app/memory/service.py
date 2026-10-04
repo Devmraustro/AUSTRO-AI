@@ -423,6 +423,7 @@ class MemoryService:
                actor: Optional[int] = None) -> bool:
         ok = self.store.memories.forget(owner_user_id, memory_id)
         if ok:
+            self.store.versions.redact(owner_user_id, memory_id)
             self.store.events.log(
                 owner_user_id=owner_user_id, memory_id=memory_id,
                 action="forgotten", source="user", actor=actor,
@@ -433,6 +434,7 @@ class MemoryService:
               actor: Optional[int] = None) -> int:
         count = self.store.memories.clear(owner_user_id, memory_type=memory_type)
         if count:
+            self.store.versions.redact(owner_user_id)
             self.store.events.log(
                 owner_user_id=owner_user_id, memory_id=None,
                 action="cleared", source="user", actor=actor,
@@ -443,6 +445,7 @@ class MemoryService:
                actor: Optional[int] = None) -> bool:
         ok = self.store.memories.delete(owner_user_id, memory_id)
         if ok:
+            self.store.versions.redact(owner_user_id, memory_id)
             self.store.events.log(
                 owner_user_id=owner_user_id, memory_id=memory_id,
                 action="deleted", source="user", actor=actor,

@@ -68,7 +68,7 @@ def services(fresh_db):
 
 async def _ingest(services, owner, file_name, text):
     knowledge = services.knowledge
-    upload = knowledge.register_upload(
+    upload = await knowledge.register_upload(
         owner_user_id=owner, file_name=file_name, data=text.encode("utf-8")
     )
     await knowledge.process_source(owner, upload["source_id"])

@@ -250,7 +250,7 @@ class AssessmentEngine:
             recent=series["recent"], kinds=series["kinds"],
         )
         self._store.objectives.update_mastery(
-            objective_id, series["state"], series["score"],
+            owner_user_id, objective_id, series["state"], series["score"],
         )
 
 

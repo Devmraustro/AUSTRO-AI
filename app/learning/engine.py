@@ -475,8 +475,9 @@ class AdaptiveLearningEngine:
             score=skill.score, evidence_count=skill.evidence_count,
             recent=skill.recent, kinds=skill.kinds,
         )
-        self._store.objectives.update_mastery(objective_id, skill.state,
-                                              skill.score)
+        self._store.objectives.update_mastery(
+            owner_user_id, objective_id, skill.state, skill.score,
+        )
 
     # ------------------------------------------------------------------
     # Progress & weekly review

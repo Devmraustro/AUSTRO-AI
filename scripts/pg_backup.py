@@ -34,7 +34,8 @@ Usage:
     python scripts/pg_backup.py --outdir /var/backups/austro --engine postgresql
 
 env: DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD, PG_BIN (optional),
-     BACKUP_OUTDIR, BACKUP_DAILY_KEEP, BACKUP_MONTHLY_KEEP
+     BACKUP_OUTDIR, BACKUP_DAILY_KEEP, BACKUP_MONTHLY_KEEP,
+     BACKUP_ENCRYPTION_KEY_FILE, BACKUP_ENCRYPTION_ENABLED
 
 Exit code 0 on success, non-zero on failure.
 """
@@ -45,6 +46,7 @@ import argparse
 import datetime as dt
 import gzip
 import hashlib
+import base64
 import json
 import os
 import subprocess
@@ -63,6 +65,12 @@ LOCK_NAME = ".backup.lock"
 STALE_LOCK_SECONDS = 3600
 PGDUMP_TIMEOUT = 1800
 CHUNK = 1024 * 1024
+
+# Encryption configuration
+BACKUP_ENCRYPTION_KEY_FILE = "BACKUP_ENCRYPTION_KEY_FILE"
+BACKUP_ENCRYPTION_ENABLED = "BACKUP_ENCRYPTION_ENABLED"
+BACKUP_ENCRYPTION_ALGO = "aes-256-gcm"
+BACKUP_ENCRYPTION_DEFAULT_KEY = b"\x00" * 32  # never used; key must come from file
 
 
 # --------------------------------------------------------------------------- #
@@ -303,12 +311,174 @@ def file_sha256(path: Path) -> str:
             digest.update(chunk)
     return digest.hexdigest()
 
+# --------------------------------------------------------------------------- #
+# Encryption / decryption (AES-256-GCM, key from secret file)
+# --------------------------------------------------------------------------- #
+def _load_encryption_key() -> Optional[bytes]:
+    """Load the encryption key from BACKUP_ENCRYPTION_KEY_FILE.
+
+    Returns None if the key file is not configured or not found.
+    The key must be 32 bytes (256 bits) for AES-256-GCM.
+    """
+    key_file = os.environ.get(BACKUP_ENCRYPTION_KEY_FILE)
+    if not key_file:
+        return None
+    key_path = Path(key_file)
+    if not key_path.is_file():
+        return None
+    try:
+        key = key_path.read_bytes()
+        if len(key) != 32:
+            log("warn", f"encryption key file {key_file} must be 32 bytes; using None")
+            return None
+        return key
+    except OSError as exc:
+        log("warn", f"could not read encryption key file {key_file}: {exc}")
+        return None
+
+
+def encrypt_data(plaintext: bytes, key: bytes) -> Dict[str, str]:
+    """Encrypt plaintext using AES-256-GCM.
+
+    Returns a dict with 'nonce', 'ciphertext', 'tag' (all base64-encoded).
+    """
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    nonce = os.urandom(12)
+    cipher = Cipher(algorithms.AES(key), modes.GCM(nonce))
+    encryptor = cipher.encryptor()
+    ciphertext = encryptor.update(plaintext) + encryptor.finalize()
+    return {
+        "nonce": base64.b64encode(nonce).decode(),
+        "ciphertext": base64.b64encode(ciphertext).decode(),
+        "tag": base64.b64encode(encryptor.tag).decode(),
+    }
+
+
+def decrypt_data(encrypted: Dict[str, str], key: bytes) -> bytes:
+    """Decrypt data encrypted with encrypt_data().
+
+    Returns the plaintext bytes.
+    Raises ValueError if the key is wrong or the data is tampered.
+    """
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    nonce = base64.b64decode(encrypted["nonce"])
+    ciphertext = base64.b64decode(encrypted["ciphertext"])
+    tag = base64.b64decode(encrypted["tag"])
+
+    cipher = Cipher(algorithms.AES(key), modes.GCM(nonce, tag))
+    decryptor = cipher.decryptor()
+    try:
+        plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+    except Exception as exc:  # noqa: BLE001 - wrong key or tampered data
+        raise ValueError(f"decryption failed: {exc}") from exc
+    return plaintext
+
+
+def _compress_archive_plain(raw: Path, archive: Path) -> Tuple[str, str, int, int]:
+    """Stream-gzip the dump (unencrypted version)."""
+    content = hashlib.sha256()
+    content_bytes = 0
+    with open(raw, "rb") as src, gzip.open(archive, "wb", compresslevel=6) as dst:
+        while True:
+            chunk = src.read(CHUNK)
+            if not chunk:
+                break
+            content.update(chunk)
+            content_bytes += len(chunk)
+            dst.write(chunk)
+    return content.hexdigest(), file_sha256(archive), archive.stat().st_size, content_bytes
+
+
+def compress_archive(raw: Path, archive: Path,
+                     key: Optional[bytes] = None) -> Tuple[str, str, int, int]:
+    """Stream-gzip the dump, optionally encrypting the content.
+
+    Returns (content_sha256, archive_sha256, archive_bytes, content_bytes).
+    If key is provided, the gzip-compressed data is encrypted with AES-256-GCM
+    before writing to the archive file. The manifest records the encryption
+    metadata so the restore drill can decrypt.
+    """
+    content = hashlib.sha256()
+    content_bytes = 0
+
+    # Load key if not provided
+    if key is None:
+        key = _load_encryption_key()
+
+    if key is None:
+        # No encryption configured - use plain gzip
+        return _compress_archive_plain(raw, archive)
+
+    # Encryption mode: encrypt the entire gzip-compressed dump
+    with open(raw, "rb") as src:
+        gzip_data = gzip.compress(src.read(), compresslevel=6)
+
+    content.update(gzip_data)
+    content_bytes = len(gzip_data)
+
+    # Encrypt the gzip data
+    enc = encrypt_data(gzip_data, key=key)
+
+    # Write the encrypted data to the archive file
+    # Format: nonce (12 bytes) + ciphertext + tag (16 bytes)
+    # The nonce is prepended and is available for decryption
+    with open(archive, "wb") as dst:
+        # Write nonce first (12 bytes for GCM)
+        dst.write(base64.b64decode(enc["nonce"]))
+        # Write ciphertext
+        dst.write(base64.b64decode(enc["ciphertext"]))
+        # Write tag last (16 bytes, embedded in GCM)
+        dst.write(base64.b64decode(enc["tag"]))
+
+    # Compute archive sha256 on the encrypted file
+    archive_sha = file_sha256(archive)
+
+    return content.hexdigest(), archive_sha, 0, content_bytes
+
 
 def build_manifest(*, stamp: str, moment: dt.datetime, archive_name: str,
                    content_sha256: str, archive_sha256: str, archive_bytes: int,
                    content_bytes: int, tables: List[str], counts: Dict[str, int],
-                   dump_version: str, daily_keep: int, monthly_keep: int) -> Dict:
-    return {
+                   dump_version: str, daily_keep: int, monthly_keep: int,
+                   encryption_key_version: str = "v1",
+                   encryption_enabled: bool = False) -> Dict:
+    manifest = {
+        # checksum_sha256 is the SHA-256 of the DECOMPRESSED SQL:
+        # contract consumed by scripts/pg_restore_drill.py and must not change.
+        "backup": archive_name,
+        "checksum_sha256": content_sha256,
+        "archive_sha256": archive_sha256,
+        "archive_bytes": archive_bytes,
+        "content_bytes": content_bytes,
+        "created_utc": stamp,
+        "created_utc_iso": moment.astimezone(dt.timezone.utc).isoformat(),
+        "engine": "postgresql",
+        "pg_dump_version": dump_version,
+        "tables": len(tables),
+        "row_counts": counts,
+        "retention": {"daily_keep": daily_keep, "monthly_keep": monthly_keep},
+        "total_rows": sum(v for v in counts.values() if v > 0),
+    }
+
+    if encryption_enabled:
+        manifest["encryption"] = {
+            "enabled": True,
+            "algo": "aes-256-gcm",
+            "key_version": encryption_key_version,
+        }
+
+    return manifest
+
+
+def build_manifest(*, stamp: str, moment: dt.datetime, archive_name: str,
+                   content_sha256: str, archive_sha256: str, archive_bytes: int,
+                   content_bytes: int, tables: List[str], counts: Dict[str, int],
+                   dump_version: str, daily_keep: int, monthly_keep: int,
+                   encryption_key_version: str = "v1",
+                   encryption_enabled: bool = False) -> Dict:
+    manifest = {
         # `checksum_sha256` is the SHA-256 of the DECOMPRESSED SQL: it is the
         # contract consumed by scripts/pg_restore_drill.py and must not change.
         "backup": archive_name,
@@ -325,6 +495,15 @@ def build_manifest(*, stamp: str, moment: dt.datetime, archive_name: str,
         "retention": {"daily_keep": daily_keep, "monthly_keep": monthly_keep},
         "total_rows": sum(v for v in counts.values() if v > 0),
     }
+
+    if encryption_enabled:
+        manifest["encryption"] = {
+            "enabled": True,
+            "algo": "aes-256-gcm",
+            "key_version": encryption_key_version,
+        }
+
+    return manifest
 
 
 # --------------------------------------------------------------------------- #
@@ -520,8 +699,10 @@ def run_backup(
                     f"{' (' + dump_version + ')' if dump_version else ''}")
 
         log("3/6", "gzip + manifest")
+        # Load encryption key (from secret file; never logged or in env directly)
+        enc_key = _load_encryption_key()
         content_sha, archive_sha, archive_bytes, content_bytes = compress_archive(
-            raw, archive_part
+            raw, archive_part, key=enc_key
         )
         verify_archive(archive_part, content_sha, archive_sha)
         manifest = build_manifest(
@@ -530,6 +711,8 @@ def run_backup(
             archive_bytes=archive_bytes, content_bytes=content_bytes,
             tables=tables, counts=counts, dump_version=dump_version,
             daily_keep=daily_keep, monthly_keep=monthly_keep,
+            encryption_key_version="v1",
+            encryption_enabled=enc_key is not None,
         )
         manifest_part.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         os.replace(archive_part, archive)

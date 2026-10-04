@@ -1858,7 +1858,7 @@ async def knowledge_document(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     try:
-        result = services.knowledge.register_upload(
+        result = await services.knowledge.register_upload(
             owner_user_id=user_id,
             file_name=file_name,
             data=bytes(data),
