@@ -147,11 +147,20 @@ class KnowledgeSourceRepository(_KnowledgeBase):
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
-                retry_sql = ", retry_count = retry_count + 1" if increment_retry else ""
+                if increment_retry:
+                    sql = (
+                        "UPDATE knowledge_sources SET status = ?, ingestion_state = ?, "
+                        "error_message = ?, updated_at = ?, retry_count = retry_count + 1 "
+                        "WHERE source_id = ? AND owner_user_id = ?"
+                    )
+                else:
+                    sql = (
+                        "UPDATE knowledge_sources SET status = ?, ingestion_state = ?, "
+                        "error_message = ?, updated_at = ? "
+                        "WHERE source_id = ? AND owner_user_id = ?"
+                    )
                 cursor.execute(
-                    f"UPDATE knowledge_sources SET status = ?, ingestion_state = ?, "
-                    f"error_message = ?, updated_at = ?{retry_sql} "
-                    f"WHERE source_id = ? AND owner_user_id = ?",
+                    sql,
                     (status, state, error, datetime.now().isoformat(),
                      source_id, owner_user_id),
                 )
@@ -663,7 +672,7 @@ class KnowledgeCollectionRepository(_KnowledgeBase):
                 placeholders = ", ".join(["?"] * len(collection_ids))
                 cursor.execute(
                     "SELECT DISTINCT source_id FROM knowledge_collection_sources "
-                    f"WHERE owner_user_id = ? AND collection_id IN ({placeholders})",
+                    f"WHERE owner_user_id = ? AND collection_id IN ({placeholders})",  # nosec B608
                     [owner_user_id] + list(collection_ids),
                 )
                 return [row["source_id"] for row in cursor.fetchall()]

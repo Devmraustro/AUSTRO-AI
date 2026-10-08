@@ -38,7 +38,7 @@ class SessionManager:
         )
         if session_id is None:
             return None
-        row = self._store.sessions.get(session_id)
+        row = self._store.sessions.get(owner_user_id, session_id)
         session = _adorn(row)
         self._store.events.log(
             owner_user_id, "session_started", objective_id, session_id,
@@ -66,14 +66,18 @@ class SessionManager:
             return None
         return _adorn(row)
 
-    def get(self, session_id: int) -> Optional[LearningSession]:
-        row = self._store.sessions.get(session_id)
+    def get(self, owner_user_id: int, session_id: int) -> Optional[LearningSession]:
+        row = self._store.sessions.get(owner_user_id, session_id)
         return _adorn(row) if row else None
 
     def complete(self, session: LearningSession, *,
                  minutes: int = 0) -> LearningSession:
         result = {"study_minutes": minutes}
-        self._store.sessions.complete(session.session_id, result)
+        self._store.sessions.complete(
+            session.owner_user_id,
+            session.session_id,
+            result,
+        )
         if session.owner_user_id and minutes:
             from datetime import datetime
             day = datetime.utcnow().strftime("%Y-%m-%d")

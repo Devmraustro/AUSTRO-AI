@@ -46,12 +46,13 @@ import argparse
 import datetime as dt
 import gzip
 import hashlib
-import base64
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -69,8 +70,11 @@ CHUNK = 1024 * 1024
 # Encryption configuration
 BACKUP_ENCRYPTION_KEY_FILE = "BACKUP_ENCRYPTION_KEY_FILE"
 BACKUP_ENCRYPTION_ENABLED = "BACKUP_ENCRYPTION_ENABLED"
-BACKUP_ENCRYPTION_ALGO = "aes-256-gcm"
-BACKUP_ENCRYPTION_DEFAULT_KEY = b"\x00" * 32  # never used; key must come from file
+_AES_KEY_BYTES = 32
+_GCM_NONCE_BYTES = 12
+_GCM_TAG_BYTES = 16
+_GZIP_WBITS = 16 + zlib.MAX_WBITS
+_ARCHIVE_FORMAT_VERSION = 1
 
 
 # --------------------------------------------------------------------------- #
@@ -285,25 +289,6 @@ def pg_dump_version(tool: Optional[Path] = None,
 # --------------------------------------------------------------------------- #
 # stage 4 - compression + manifest
 # --------------------------------------------------------------------------- #
-def compress_archive(raw: Path, archive: Path) -> Tuple[str, str, int, int]:
-    """Stream-gzip the dump.
-
-    Returns (content_sha256, archive_sha256, archive_bytes, content_bytes).
-    Streaming keeps memory flat for large production dumps.
-    """
-    content = hashlib.sha256()
-    content_bytes = 0
-    with open(raw, "rb") as src, gzip.open(archive, "wb", compresslevel=6) as dst:
-        while True:
-            chunk = src.read(CHUNK)
-            if not chunk:
-                break
-            content.update(chunk)
-            content_bytes += len(chunk)
-            dst.write(chunk)
-    return content.hexdigest(), file_sha256(archive), archive.stat().st_size, content_bytes
-
-
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -311,165 +296,281 @@ def file_sha256(path: Path) -> str:
             digest.update(chunk)
     return digest.hexdigest()
 
+
 # --------------------------------------------------------------------------- #
 # Encryption / decryption (AES-256-GCM, key from secret file)
 # --------------------------------------------------------------------------- #
-def _load_encryption_key() -> Optional[bytes]:
-    """Load the encryption key from BACKUP_ENCRYPTION_KEY_FILE.
+_TRUTHY = {"1", "true", "yes", "on"}
 
-    Returns None if the key file is not configured or not found.
-    The key must be 32 bytes (256 bits) for AES-256-GCM.
+
+def encryption_required() -> bool:
+    """True when BACKUP_ENCRYPTION_ENABLED demands encryption (fail closed)."""
+    return str(os.environ.get(BACKUP_ENCRYPTION_ENABLED) or "").strip().lower() in _TRUTHY
+
+
+def _load_encryption_key(required: bool = False) -> Optional[bytes]:
+    """Load the AES-256 key from BACKUP_ENCRYPTION_KEY_FILE.
+
+    The key is only ever read from that file: never from the environment, never
+    from argv, and it is never logged or persisted anywhere. Returns None when
+    no key is configured and encryption is not required. When `required` is set
+    a missing/unreadable/wrong-sized key raises instead of silently degrading
+    to an unencrypted backup.
     """
     key_file = os.environ.get(BACKUP_ENCRYPTION_KEY_FILE)
     if not key_file:
+        if required:
+            raise RuntimeError(
+                f"{BACKUP_ENCRYPTION_ENABLED} is set but "
+                f"{BACKUP_ENCRYPTION_KEY_FILE} is not configured"
+            )
         return None
     key_path = Path(key_file)
     if not key_path.is_file():
+        if required:
+            raise RuntimeError(f"encryption key file not found: {key_file}")
+        log("warn", f"encryption key file not found: {key_file}")
         return None
     try:
-        key = key_path.read_bytes()
-        if len(key) != 32:
-            log("warn", f"encryption key file {key_file} must be 32 bytes; using None")
-            return None
-        return key
+        raw = key_path.read_bytes()
     except OSError as exc:
+        if required:
+            raise RuntimeError(f"could not read encryption key file: {exc}") from exc
         log("warn", f"could not read encryption key file {key_file}: {exc}")
         return None
+    # Accept a raw 32-byte key, or a text file whose only extra byte is a
+    # trailing newline from a secret store / `echo` invocation.
+    for candidate in (raw, raw.strip()):
+        if len(candidate) == _AES_KEY_BYTES:
+            return candidate
+    message = (
+        f"encryption key file {key_file} must contain exactly "
+        f"{_AES_KEY_BYTES} bytes (got {len(raw)})"
+    )
+    if required:
+        raise RuntimeError(message)
+    log("warn", message)
+    return None
 
 
-def encrypt_data(plaintext: bytes, key: bytes) -> Dict[str, str]:
-    """Encrypt plaintext using AES-256-GCM.
-
-    Returns a dict with 'nonce', 'ciphertext', 'tag' (all base64-encoded).
-    """
+def _gcm(key: bytes, nonce: bytes, tag: Optional[bytes] = None):
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-    nonce = os.urandom(12)
-    cipher = Cipher(algorithms.AES(key), modes.GCM(nonce))
-    encryptor = cipher.encryptor()
-    ciphertext = encryptor.update(plaintext) + encryptor.finalize()
-    return {
-        "nonce": base64.b64encode(nonce).decode(),
-        "ciphertext": base64.b64encode(ciphertext).decode(),
-        "tag": base64.b64encode(encryptor.tag).decode(),
-    }
+    if len(key) != _AES_KEY_BYTES:
+        raise ValueError(f"AES-256-GCM requires a {_AES_KEY_BYTES}-byte key")
+    if len(nonce) != _GCM_NONCE_BYTES:
+        raise ValueError(f"AES-GCM nonce must be {_GCM_NONCE_BYTES} bytes")
+    mode = modes.GCM(nonce) if tag is None else modes.GCM(nonce, tag)
+    return Cipher(algorithms.AES(key), mode)
 
 
-def decrypt_data(encrypted: Dict[str, str], key: bytes) -> bytes:
-    """Decrypt data encrypted with encrypt_data().
+class _EncryptingWriter:
+    """File-like sink that pipes writes into a GCM encryptor."""
 
-    Returns the plaintext bytes.
-    Raises ValueError if the key is wrong or the data is tampered.
-    """
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    def __init__(self, handle, encryptor) -> None:
+        self._handle = handle
+        self._encryptor = encryptor
 
-    nonce = base64.b64decode(encrypted["nonce"])
-    ciphertext = base64.b64decode(encrypted["ciphertext"])
-    tag = base64.b64decode(encrypted["tag"])
+    def write(self, data) -> int:
+        if not data:
+            return 0
+        self._handle.write(self._encryptor.update(data))
+        return len(data)
 
-    cipher = Cipher(algorithms.AES(key), modes.GCM(nonce, tag))
-    decryptor = cipher.decryptor()
-    try:
-        plaintext = decryptor.update(ciphertext) + decryptor.finalize()
-    except Exception as exc:  # noqa: BLE001 - wrong key or tampered data
-        raise ValueError(f"decryption failed: {exc}") from exc
-    return plaintext
+    def flush(self) -> None:
+        self._handle.flush()
 
 
-def _compress_archive_plain(raw: Path, archive: Path) -> Tuple[str, str, int, int]:
-    """Stream-gzip the dump (unencrypted version)."""
-    content = hashlib.sha256()
-    content_bytes = 0
+def _gzip_stream(raw: Path, archive: Path) -> None:
+    """Stream-gzip the dump with flat memory usage."""
     with open(raw, "rb") as src, gzip.open(archive, "wb", compresslevel=6) as dst:
-        while True:
-            chunk = src.read(CHUNK)
-            if not chunk:
-                break
-            content.update(chunk)
-            content_bytes += len(chunk)
+        for chunk in iter(lambda: src.read(CHUNK), b""):
             dst.write(chunk)
-    return content.hexdigest(), file_sha256(archive), archive.stat().st_size, content_bytes
+
+
+def _gzip_encrypt_stream(raw: Path, archive: Path, key: bytes) -> None:
+    """gzip then AES-256-GCM encrypt in bounded memory.
+
+    Container layout (stable, versioned):
+        b"\\x01" || nonce(12) || ciphertext || tag(16)
+    The version byte distinguishes an encrypted container from a plain gzip
+    member, which lets the restore path auto-detect either form.
+    """
+    nonce = os.urandom(_GCM_NONCE_BYTES)
+    encryptor = _gcm(key, nonce).encryptor()
+    with open(raw, "rb") as src, open(archive, "wb") as dst:
+        dst.write(bytes([_ARCHIVE_FORMAT_VERSION]))
+        dst.write(nonce)
+        with gzip.GzipFile(fileobj=_EncryptingWriter(dst, encryptor),
+                           mode="wb", compresslevel=6) as gz:
+            for chunk in iter(lambda: src.read(CHUNK), b""):
+                gz.write(chunk)
+        tail = encryptor.finalize()
+        if tail:
+            dst.write(tail)
+        dst.write(encryptor.tag)
 
 
 def compress_archive(raw: Path, archive: Path,
                      key: Optional[bytes] = None) -> Tuple[str, str, int, int]:
-    """Stream-gzip the dump, optionally encrypting the content.
+    """Stream the dump into an archive, optionally AES-256-GCM encrypting it.
 
     Returns (content_sha256, archive_sha256, archive_bytes, content_bytes).
-    If key is provided, the gzip-compressed data is encrypted with AES-256-GCM
-    before writing to the archive file. The manifest records the encryption
-    metadata so the restore drill can decrypt.
+    `content_sha256` is always the SHA-256 of the original uncompressed SQL -
+    that is the contract consumed by scripts/pg_restore_drill.py and by the
+    manifest's `checksum_sha256`. Memory stays bounded: the dump is never
+    materialised in full, so production-sized dumps are safe.
     """
+    if key is None:
+        key = _load_encryption_key(required=encryption_required())
+
     content = hashlib.sha256()
     content_bytes = 0
-
-    # Load key if not provided
-    if key is None:
-        key = _load_encryption_key()
-
-    if key is None:
-        # No encryption configured - use plain gzip
-        return _compress_archive_plain(raw, archive)
-
-    # Encryption mode: encrypt the entire gzip-compressed dump
     with open(raw, "rb") as src:
-        gzip_data = gzip.compress(src.read(), compresslevel=6)
+        for chunk in iter(lambda: src.read(CHUNK), b""):
+            content.update(chunk)
+            content_bytes += len(chunk)
 
-    content.update(gzip_data)
-    content_bytes = len(gzip_data)
+    if key is None:
+        _gzip_stream(raw, archive)
+    else:
+        _gzip_encrypt_stream(raw, archive, key)
 
-    # Encrypt the gzip data
-    enc = encrypt_data(gzip_data, key=key)
-
-    # Write the encrypted data to the archive file
-    # Format: nonce (12 bytes) + ciphertext + tag (16 bytes)
-    # The nonce is prepended and is available for decryption
-    with open(archive, "wb") as dst:
-        # Write nonce first (12 bytes for GCM)
-        dst.write(base64.b64decode(enc["nonce"]))
-        # Write ciphertext
-        dst.write(base64.b64decode(enc["ciphertext"]))
-        # Write tag last (16 bytes, embedded in GCM)
-        dst.write(base64.b64decode(enc["tag"]))
-
-    # Compute archive sha256 on the encrypted file
-    archive_sha = file_sha256(archive)
-
-    return content.hexdigest(), archive_sha, 0, content_bytes
+    return (content.hexdigest(), file_sha256(archive),
+            archive.stat().st_size, content_bytes)
 
 
-def build_manifest(*, stamp: str, moment: dt.datetime, archive_name: str,
-                   content_sha256: str, archive_sha256: str, archive_bytes: int,
-                   content_bytes: int, tables: List[str], counts: Dict[str, int],
-                   dump_version: str, daily_keep: int, monthly_keep: int,
-                   encryption_key_version: str = "v1",
-                   encryption_enabled: bool = False) -> Dict:
-    manifest = {
-        # checksum_sha256 is the SHA-256 of the DECOMPRESSED SQL:
-        # contract consumed by scripts/pg_restore_drill.py and must not change.
-        "backup": archive_name,
-        "checksum_sha256": content_sha256,
-        "archive_sha256": archive_sha256,
-        "archive_bytes": archive_bytes,
-        "content_bytes": content_bytes,
-        "created_utc": stamp,
-        "created_utc_iso": moment.astimezone(dt.timezone.utc).isoformat(),
-        "engine": "postgresql",
-        "pg_dump_version": dump_version,
-        "tables": len(tables),
-        "row_counts": counts,
-        "retention": {"daily_keep": daily_keep, "monthly_keep": monthly_keep},
-        "total_rows": sum(v for v in counts.values() if v > 0),
-    }
+def archive_is_encrypted(archive: Path) -> bool:
+    """True when the archive uses the encrypted container format."""
+    try:
+        with open(archive, "rb") as handle:
+            return handle.read(1) == bytes([_ARCHIVE_FORMAT_VERSION])
+    except OSError:
+        return False
 
-    if encryption_enabled:
-        manifest["encryption"] = {
-            "enabled": True,
-            "algo": "aes-256-gcm",
-            "key_version": encryption_key_version,
-        }
 
-    return manifest
+def _iter_encrypted_sql(archive: Path, key: bytes):
+    """Yield the original SQL from an encrypted archive, bounded memory.
+
+    The GCM tag is read from the tail of the file so the ciphertext body can be
+    streamed and decrypted incrementally. A wrong key or any modification makes
+    `finalize()` raise InvalidTag, so tampering cannot pass unnoticed.
+    """
+    size = archive.stat().st_size
+    header = 1 + _GCM_NONCE_BYTES
+    if size < header + _GCM_TAG_BYTES:
+        raise ValueError("encrypted archive is truncated")
+    with open(archive, "rb") as handle:
+        if handle.read(1) != bytes([_ARCHIVE_FORMAT_VERSION]):
+            raise ValueError("unsupported encrypted archive format version")
+        nonce = handle.read(_GCM_NONCE_BYTES)
+        handle.seek(size - _GCM_TAG_BYTES)
+        tag = handle.read(_GCM_TAG_BYTES)
+        handle.seek(header)
+        try:
+            decryptor = _gcm(key, nonce, tag).decryptor()
+        except ValueError as exc:
+            raise ValueError(f"invalid encryption key: {exc}") from exc
+        inflater = zlib.decompressobj(_GZIP_WBITS)
+        inflate_error: Optional[zlib.error] = None
+        remaining = size - _GCM_TAG_BYTES - header
+        while remaining > 0:
+            block = handle.read(min(CHUNK, remaining))
+            if not block:
+                break
+            remaining -= len(block)
+            plain = decryptor.update(block)
+            if plain:
+                try:
+                    out = inflater.decompress(plain)
+                except zlib.error as exc:
+                    # Wrong key or tampered ciphertext. Keep going so the GCM
+                    # tag below still produces the authoritative verdict.
+                    inflate_error = exc
+                    break
+                if out:
+                    yield out
+        try:
+            plain = decryptor.finalize()
+        except Exception as exc:  # noqa: BLE001 - InvalidTag: wrong key or tampered
+            raise ValueError(
+                f"archive decryption failed (wrong key or tampered archive): {exc}"
+            ) from exc
+        if inflate_error is not None:
+            raise ValueError(
+                "archive decryption failed (wrong key or tampered archive): "
+                f"{inflate_error}"
+            )
+        if plain:
+            try:
+                out = inflater.decompress(plain)
+            except zlib.error as exc:
+                raise ValueError(
+                    f"archive decompression failed (wrong key or tampered archive): {exc}"
+                ) from exc
+            if out:
+                yield out
+        try:
+            out = inflater.flush()
+        except zlib.error as exc:
+            raise ValueError(
+                f"archive decompression failed (wrong key or tampered archive): {exc}"
+            ) from exc
+        if out:
+            yield out
+
+
+def _iter_archive_sql(archive: Path, key: Optional[bytes] = None):
+    """Yield the original SQL bytes from a plain or encrypted archive."""
+    if archive_is_encrypted(archive):
+        if key is None:
+            key = _load_encryption_key(required=True)
+        yield from _iter_encrypted_sql(archive, key)
+        return
+    with open(archive, "rb") as probe:
+        magic = probe.read(2)
+    if magic != b"\x1f\x8b":
+        raise ValueError(
+            f"unrecognised archive format (magic={magic!r}); expected gzip or "
+            f"encrypted container version {_ARCHIVE_FORMAT_VERSION}"
+        )
+    with gzip.open(archive, "rb") as handle:
+        for chunk in iter(lambda: handle.read(CHUNK), b""):
+            yield chunk
+
+
+class _DecryptingStream(io.RawIOBase):
+    """Read-only file-like view over an iterator of plaintext SQL chunks."""
+
+    def __init__(self, chunks) -> None:
+        self._chunks = chunks
+        self._buf = b""
+        self._done = False
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, target) -> int:  # type: ignore[override]
+        while not self._buf and not self._done:
+            try:
+                self._buf = next(self._chunks)
+            except StopIteration:
+                self._done = True
+        if not self._buf:
+            return 0
+        size = min(len(target), len(self._buf))
+        target[:size] = self._buf[:size]
+        self._buf = self._buf[size:]
+        return size
+
+
+def open_archive_sql(archive: Path, key: Optional[bytes] = None):
+    """Return a binary file object over the original SQL inside the archive.
+
+    Handles both the plain gzip and the encrypted container, so the restore
+    drill works without knowing in advance which form it received.
+    """
+    return io.BufferedReader(_DecryptingStream(_iter_archive_sql(archive, key)))
 
 
 def build_manifest(*, stamp: str, moment: dt.datetime, archive_name: str,
@@ -497,6 +598,8 @@ def build_manifest(*, stamp: str, moment: dt.datetime, archive_name: str,
     }
 
     if encryption_enabled:
+        # Metadata only. The key, the nonce and the tag all stay out of the
+        # manifest: the nonce/tag live in the container header/tail.
         manifest["encryption"] = {
             "enabled": True,
             "algo": "aes-256-gcm",
@@ -509,14 +612,28 @@ def build_manifest(*, stamp: str, moment: dt.datetime, archive_name: str,
 # --------------------------------------------------------------------------- #
 # stage 5 - integrity
 # --------------------------------------------------------------------------- #
-def verify_archive(archive: Path, content_sha256: str, archive_sha256: str) -> None:
-    """Raise AssertionError unless the archive is intact and byte-faithful."""
+def verify_archive(archive: Path, content_sha256: str, archive_sha256: str,
+                   key: Optional[bytes] = None,
+                   expect_encrypted: Optional[bool] = None) -> None:
+    """Raise AssertionError unless the archive is intact and byte-faithful.
+
+    Works for both plain gzip and encrypted archives; for an encrypted archive
+    the key must be available or loadable, otherwise this fails closed.
+    """
     if file_sha256(archive) != archive_sha256:
         raise AssertionError("archive sha256 mismatch after publish")
+
+    encrypted = archive_is_encrypted(archive)
+    if expect_encrypted is not None and encrypted != expect_encrypted:
+        raise AssertionError(
+            f"archive encryption mismatch: expected {expect_encrypted}, got {encrypted}"
+        )
+    if encrypted and key is None:
+        key = _load_encryption_key(required=True)
+
     content = hashlib.sha256()
-    with gzip.open(archive, "rb") as handle:
-        for chunk in iter(lambda: handle.read(CHUNK), b""):
-            content.update(chunk)
+    for chunk in _iter_archive_sql(archive, key):
+        content.update(chunk)
     if content.hexdigest() != content_sha256:
         raise AssertionError("gzip round-trip sha256 mismatch")
 
@@ -699,12 +816,13 @@ def run_backup(
                     f"{' (' + dump_version + ')' if dump_version else ''}")
 
         log("3/6", "gzip + manifest")
-        # Load encryption key (from secret file; never logged or in env directly)
-        enc_key = _load_encryption_key()
+        # Fail closed: when BACKUP_ENCRYPTION_ENABLED is set, a missing or
+        # invalid key aborts the backup instead of silently writing plaintext.
+        enc_key = _load_encryption_key(required=encryption_required())
         content_sha, archive_sha, archive_bytes, content_bytes = compress_archive(
             raw, archive_part, key=enc_key
         )
-        verify_archive(archive_part, content_sha, archive_sha)
+        verify_archive(archive_part, content_sha, archive_sha, key=enc_key)
         manifest = build_manifest(
             stamp=stamp, moment=moment, archive_name=archive.name,
             content_sha256=content_sha, archive_sha256=archive_sha,
@@ -723,7 +841,7 @@ def run_backup(
                    f"+ {manifest_path.name}")
 
         log("4/6", "integrity verification")
-        verify_archive(archive, content_sha, archive_sha)
+        verify_archive(archive, content_sha, archive_sha, key=enc_key)
         log("4/6", "gzip round-trip + sha256 OK")
         verified = True
 

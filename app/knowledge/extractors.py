@@ -16,6 +16,11 @@ import zipfile
 import xml.etree.ElementTree as ET
 from typing import Dict, List, Optional, Set
 
+# Untrusted EPUB container XML and book content are parsed with defusedxml so
+# entity-expansion / external-reference attacks cannot read files or exhaust
+# memory. Manual element construction (jar_path, _render) stays on stdlib.
+from defusedxml import ElementTree as _SafeElementTree
+
 from app.core.errors import ValidationError
 from app.knowledge.models import ExtractedBook
 
@@ -265,7 +270,7 @@ class _DocxExtractor:
                 raise ValidationError("ملف DOCX تالف") from e
 
         try:
-            root = ET.fromstring(xml_bytes)
+            root = _SafeElementTree.fromstring(xml_bytes)
         except ET.ParseError as e:
             raise ValidationError("ملف DOCX تالف") from e
 
@@ -328,7 +333,7 @@ class _EpubExtractor:
                 )
             except KeyError as e:
                 raise ValidationError("ملف EPUB تالف") from e
-            container = ET.fromstring(container_xml)
+            container = _SafeElementTree.fromstring(container_xml)
         except ET.ParseError as e:
             raise ValidationError("ملف EPUB تالف") from e
 
@@ -341,7 +346,7 @@ class _EpubExtractor:
             raise ValidationError("ملف EPUB تالف (لا يوجد rootfile)")
 
         try:
-            spine_root = ET.fromstring(_read_zip_member(archive, rootfile, limit=max_bytes))
+            spine_root = _SafeElementTree.fromstring(_read_zip_member(archive, rootfile, limit=max_bytes))
         except (KeyError, ET.ParseError) as e:
             raise ValidationError("ملف EPUB تالف") from e
 
@@ -382,7 +387,7 @@ class _EpubExtractor:
                 break
             spent += len(raw)
             try:
-                dom = ET.fromstring(raw)
+                dom = _SafeElementTree.fromstring(raw)
             except ET.ParseError:
                 continue
             parts.append(self._render(dom))

@@ -210,7 +210,8 @@ class SemanticChunker:
             chunks.append({
                 "content": content,
                 "chunk_key": hashlib.sha1(
-                    self.cleaner.transform(content).encode("utf-8")
+                    self.cleaner.transform(content).encode("utf-8"),
+                    usedforsecurity=False,
                 ).hexdigest(),
                 "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
                 "char_count": len(content),

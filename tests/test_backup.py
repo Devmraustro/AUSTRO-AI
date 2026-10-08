@@ -8,6 +8,8 @@ against an explicitly disposable database (see DISASTER_RECOVERY.md).
 
 from __future__ import annotations
 
+import ast
+import base64
 import datetime as dt
 import gzip
 import hashlib
@@ -485,3 +487,226 @@ def test_scheduler_never_schedules_restore_drills():
     source = Path(backup_scheduler.__file__).read_text(encoding="utf-8")
     assert "pg_restore_drill" not in source
     assert "DROP DATABASE" not in source
+
+# ==================== encrypted backup archive ==================== #
+_ENCRYPTED_SQL = "".join(
+    f"-- AUSTRO dump\nINSERT INTO t VALUES ({i});\n" for i in range(500)
+)
+
+
+def _write_raw(tmp_path: Path, body: bytes = None) -> Path:
+    raw = tmp_path / "dump.sql.part"
+    raw.write_bytes(body if body is not None else _ENCRYPTED_SQL.encode("utf-8"))
+    return raw
+
+
+def _key_file(tmp_path: Path, key: bytes) -> Path:
+    path = tmp_path / "backup.key"
+    path.write_bytes(key)
+    return path
+
+
+def test_encrypted_archive_is_not_plaintext_and_round_trips(tmp_path, monkeypatch):
+    """A keyed backup is a real ciphertext container that decrypts back."""
+    monkeypatch.delenv("BACKUP_ENCRYPTION_ENABLED", raising=False)
+    monkeypatch.delenv("BACKUP_ENCRYPTION_KEY_FILE", raising=False)
+    key = os.urandom(32)
+    raw = _write_raw(tmp_path)
+    archive = tmp_path / f"enc{ARCHIVE_SUFFIX}"
+
+    content_sha, archive_sha, archive_bytes, content_bytes = compress_archive(
+        raw, archive, key=key
+    )
+
+    assert pg_backup.archive_is_encrypted(archive) is True
+    # The SQL must not be readable in the archive at all.
+    assert b"INSERT INTO t VALUES" not in archive.read_bytes()
+    assert key not in archive.read_bytes()
+    # archive_bytes is the real file size and content_bytes the raw SQL size.
+    assert archive_bytes == archive.stat().st_size
+    assert content_bytes == len(_ENCRYPTED_SQL.encode("utf-8"))
+    # checksums describe the original SQL, matching the plaintext contract.
+    assert content_sha == hashlib.sha256(_ENCRYPTED_SQL.encode("utf-8")).hexdigest()
+
+    verify_archive(archive, content_sha, archive_sha, key=key)
+    with pg_backup.open_archive_sql(archive, key=key) as handle:
+        assert handle.read() == _ENCRYPTED_SQL.encode("utf-8")
+
+
+def test_plain_archive_still_round_trips_when_no_key_configured(tmp_path, monkeypatch):
+    monkeypatch.delenv("BACKUP_ENCRYPTION_ENABLED", raising=False)
+    monkeypatch.delenv("BACKUP_ENCRYPTION_KEY_FILE", raising=False)
+    raw = _write_raw(tmp_path)
+    archive = tmp_path / f"plain{ARCHIVE_SUFFIX}"
+
+    content_sha, archive_sha, _, _ = compress_archive(raw, archive)
+
+    assert pg_backup.archive_is_encrypted(archive) is False
+    verify_archive(archive, content_sha, archive_sha)
+    with gzip.open(archive, "rb") as handle:
+        assert handle.read() == _ENCRYPTED_SQL.encode("utf-8")
+
+
+def test_encrypted_archive_rejects_wrong_key(tmp_path, monkeypatch):
+    monkeypatch.delenv("BACKUP_ENCRYPTION_ENABLED", raising=False)
+    monkeypatch.delenv("BACKUP_ENCRYPTION_KEY_FILE", raising=False)
+    raw = _write_raw(tmp_path)
+    archive = tmp_path / f"enc{ARCHIVE_SUFFIX}"
+    compress_archive(raw, archive, key=os.urandom(32))
+
+    with pytest.raises(ValueError):
+        with pg_backup.open_archive_sql(archive, key=os.urandom(32)) as handle:
+            handle.read()
+
+
+@pytest.mark.parametrize("offset_from_end", [1, -1], ids=["last_byte", "one_before_end"])
+def test_encrypted_archive_rejects_tampering(tmp_path, monkeypatch, offset_from_end):
+    """Flipping any byte of the ciphertext or tag must fail authentication."""
+    monkeypatch.delenv("BACKUP_ENCRYPTION_ENABLED", raising=False)
+    monkeypatch.delenv("BACKUP_ENCRYPTION_KEY_FILE", raising=False)
+    key = os.urandom(32)
+    raw = _write_raw(tmp_path)
+    archive = tmp_path / f"enc{ARCHIVE_SUFFIX}"
+    compress_archive(raw, archive, key=key)
+
+    blob = bytearray(archive.read_bytes())
+    index = len(blob) + offset_from_end if offset_from_end < 0 else len(blob) - 1
+    blob[index] ^= 0xFF
+    archive.write_bytes(bytes(blob))
+
+    with pytest.raises(ValueError):
+        with pg_backup.open_archive_sql(archive, key=key) as handle:
+            handle.read()
+
+
+def test_encryption_required_without_key_fails_closed(tmp_path, monkeypatch):
+    """BACKUP_ENCRYPTION_ENABLED must never silently produce a plaintext dump."""
+    monkeypatch.setenv("BACKUP_ENCRYPTION_ENABLED", "true")
+    monkeypatch.delenv("BACKUP_ENCRYPTION_KEY_FILE", raising=False)
+    raw = _write_raw(tmp_path)
+
+    with pytest.raises(RuntimeError):
+        compress_archive(raw, tmp_path / f"enc{ARCHIVE_SUFFIX}")
+
+
+def test_encryption_required_with_wrong_size_key_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("BACKUP_ENCRYPTION_ENABLED", "true")
+    monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", str(_key_file(tmp_path, b"too-short")))
+    raw = _write_raw(tmp_path)
+
+    with pytest.raises(RuntimeError):
+        compress_archive(raw, tmp_path / f"enc{ARCHIVE_SUFFIX}")
+
+
+def test_encryption_required_with_missing_key_file_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("BACKUP_ENCRYPTION_ENABLED", "true")
+    monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", str(tmp_path / "absent.key"))
+    raw = _write_raw(tmp_path)
+
+    with pytest.raises(RuntimeError):
+        compress_archive(raw, tmp_path / f"enc{ARCHIVE_SUFFIX}")
+
+
+def test_manifest_never_leaks_key_or_ciphertext_material(tmp_path, monkeypatch):
+    monkeypatch.delenv("BACKUP_ENCRYPTION_ENABLED", raising=False)
+    monkeypatch.delenv("BACKUP_ENCRYPTION_KEY_FILE", raising=False)
+    key = os.urandom(32)
+    raw = _write_raw(tmp_path)
+    archive = tmp_path / f"enc{ARCHIVE_SUFFIX}"
+    content_sha, archive_sha, archive_bytes, content_bytes = compress_archive(
+        raw, archive, key=key
+    )
+
+    manifest = build_manifest(
+        stamp="20260101_020000", moment=_moment(1),
+        archive_name=archive.name, content_sha256=content_sha,
+        archive_sha256=archive_sha, archive_bytes=archive_bytes,
+        content_bytes=content_bytes, tables=list(TABLES), counts=dict(COUNTS),
+        dump_version="pg_dump 16.6", daily_keep=7, monthly_keep=30,
+        encryption_enabled=True,
+    )
+    blob = json.dumps(manifest)
+
+    assert manifest["encryption"] == {
+        "enabled": True, "algo": "aes-256-gcm", "key_version": "v1",
+    }
+    assert base64.b64encode(key).decode() not in blob
+    assert key.hex() not in blob
+    for forbidden in ("nonce", "tag", "ciphertext", "key_material"):
+        assert forbidden not in manifest["encryption"]
+
+
+def test_key_is_loaded_only_from_the_configured_file(tmp_path, monkeypatch):
+    monkeypatch.delenv("BACKUP_ENCRYPTION_ENABLED", raising=False)
+    key = os.urandom(32)
+    monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", str(_key_file(tmp_path, key)))
+
+    assert pg_backup._load_encryption_key() == key
+
+
+def test_key_file_tolerates_single_trailing_newline(tmp_path, monkeypatch):
+    """Secret stores often append a newline; a 32-byte key must still load."""
+    monkeypatch.delenv("BACKUP_ENCRYPTION_ENABLED", raising=False)
+    key = os.urandom(32)
+    path = _key_file(tmp_path, key + b"\n")
+    monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", str(path))
+
+    assert pg_backup._load_encryption_key() == key
+
+
+def test_verify_archive_rejects_encrypted_archive_without_key(tmp_path, monkeypatch):
+    """Verification must fail closed rather than skip an encrypted archive."""
+    monkeypatch.setenv("BACKUP_ENCRYPTION_ENABLED", "true")
+    monkeypatch.delenv("BACKUP_ENCRYPTION_KEY_FILE", raising=False)
+    raw = _write_raw(tmp_path)
+    archive = tmp_path / f"enc{ARCHIVE_SUFFIX}"
+    content_sha, archive_sha, _, _ = compress_archive(raw, archive, key=os.urandom(32))
+
+    with pytest.raises(RuntimeError):
+        verify_archive(archive, content_sha, archive_sha)
+
+
+def test_encrypted_archive_uses_a_versioned_container_format(tmp_path, monkeypatch):
+    """The container is 0x01 || nonce(12) || ciphertext || tag(16)."""
+    monkeypatch.delenv("BACKUP_ENCRYPTION_ENABLED", raising=False)
+    monkeypatch.delenv("BACKUP_ENCRYPTION_KEY_FILE", raising=False)
+    raw = _write_raw(tmp_path)
+    archive = tmp_path / f"enc{ARCHIVE_SUFFIX}"
+    compress_archive(raw, archive, key=os.urandom(32))
+
+    blob = archive.read_bytes()
+    assert blob[0] == 0x01
+    assert len(blob) > 1 + 12 + 16
+
+
+def test_dead_encryption_constants_are_removed():
+    """No default key material or unused algo constant may linger."""
+    assert not hasattr(pg_backup, "BACKUP_ENCRYPTION_DEFAULT_KEY")
+    assert not hasattr(pg_backup, "BACKUP_ENCRYPTION_ALGO")
+
+
+def test_backup_script_defines_each_helper_once():
+    """Duplicate definitions silently shadow each other; guard against them."""
+    tree = ast.parse(Path(pg_backup.__file__).read_text(encoding="utf-8"))
+    names = [
+        node.name for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef))
+    ]
+    duplicates = {n for n in names if names.count(n) > 1}
+    assert not duplicates, f"duplicate definitions in pg_backup.py: {duplicates}"
+    # The two helpers the audit called out must exist exactly once each.
+    assert names.count("compress_archive") == 1
+    assert names.count("build_manifest") == 1
+
+
+def test_restore_drill_supports_encrypted_archives():
+    """The drill must decrypt rather than assume a plain gzip member.
+
+    Read as source: importing the module would open a database connection at
+    import time, which this offline suite must never do.
+    """
+    source = (Path(pg_backup.__file__).parent / "pg_restore_drill.py").read_text(
+        encoding="utf-8"
+    )
+    assert "open_archive_sql" in source
+    assert "gzip.open(str(backup)" not in source

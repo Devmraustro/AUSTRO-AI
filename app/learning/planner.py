@@ -100,11 +100,11 @@ class AdaptivePlanner:
             goal = next((g for g in goals if g.get("kind") == "long_term"), None)
             if goal is None:
                 return None
-            objectives = self._store.objectives.list_for_goal(goal["goal_id"])
+            objectives = self._store.objectives.list_for_goal(owner_user_id, goal["goal_id"])
             if not objectives:
                 return None
             objective_id = objectives[0]["objective_id"]
-        return self._store.objectives.get(objective_id)
+        return self._store.objectives.get(owner_user_id, objective_id)
 
     def _habit_items(self, owner_user_id: int, day: str) -> List[PlanItem]:
         if self._habits_provider is None:

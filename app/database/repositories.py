@@ -30,6 +30,20 @@ _JSON_FIELDS = {
     "daily_plans": ["tasks", "priorities", "completed_tasks"],
 }
 
+# Identifiers that callers may supply as **kwargs keys. Interpolated into SQL
+# only after allowlist validation, so the f-strings below accept schema
+# columns and nothing else (prevents SQL injection via key names).
+_PROFILE_FIELDS = frozenset({
+    "username", "first_name", "last_name", "age", "education_level",
+    "goals", "current_skills", "daily_available_time",
+    "strengths", "weaknesses", "current_mode",
+})
+
+_PROGRESS_FIELDS = frozenset({
+    "study_hours", "tasks_completed", "goals_advanced",
+    "habits_maintained", "discipline_score", "notes",
+})
+
 
 class _BaseRepository:
     """Shared helpers: locked access to the thread-local connection."""
@@ -110,12 +124,18 @@ class UserRepository(_BaseRepository):
 
     def update_profile(self, user_id: int, **kwargs: Any) -> bool:
         """Update user profile fields (JSON-encoding list/dict values)."""
+        unknown = set(kwargs) - _PROFILE_FIELDS
+        if unknown:
+            raise ValueError(
+                f"update_profile does not allow these columns: {sorted(unknown)}"
+            )
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
                 for key, value in kwargs.items():
+                    # key was allowlist-validated against _PROFILE_FIELDS above.
                     cursor.execute(
-                        f"UPDATE users SET {key} = ? WHERE user_id = ?",
+                        f"UPDATE users SET {key} = ? WHERE user_id = ?",  # nosec B608
                         (self._serialise(value), user_id),
                     )
                 cursor.execute(
@@ -341,6 +361,11 @@ class HabitRepository(_BaseRepository):
 class ProgressRepository(_BaseRepository):
     def log(self, user_id: int, date: str, **kwargs: Any) -> bool:
         """Log daily progress (upsert by user + date)."""
+        unknown = set(kwargs) - _PROGRESS_FIELDS
+        if unknown:
+            raise ValueError(
+                f"log_progress does not allow these columns: {sorted(unknown)}"
+            )
         try:
             with self._manager._lock:
                 if not kwargs:
@@ -352,11 +377,12 @@ class ProgressRepository(_BaseRepository):
                 # bypassed the lock) could interleave between the SELECT and
                 # the INSERT. With `uq_progress_user_date` (CORE_V1) that race
                 # no longer silently duplicates or drops the day's row.
+                # keys were allowlist-validated against _PROGRESS_FIELDS above.
                 columns = ", ".join(kwargs.keys())
                 placeholders = ", ".join(["?"] * len(kwargs))
                 assignments = ", ".join([f"{k} = excluded.{k}" for k in kwargs.keys()])
                 cursor.execute(
-                    f"INSERT INTO progress (user_id, date, {columns}) "
+                    f"INSERT INTO progress (user_id, date, {columns}) "  # nosec B608
                     f"VALUES (?, ?, {placeholders}) "
                     f"ON CONFLICT (user_id, date) DO UPDATE SET {assignments}",
                     [user_id, date] + list(kwargs.values()),

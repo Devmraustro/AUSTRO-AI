@@ -50,7 +50,7 @@ class AssessmentEngine:
                            count: int = 3, kinds: Optional[List[str]] = None,
                            lesson: Optional[Dict[str, Any]] = None,
                            use_llm: bool = False) -> List[AssessmentQuestion]:
-        objective = self._store.objectives.get(objective_id)
+        objective = self._store.objectives.get(owner_user_id, objective_id)
         if objective is None:
             return []
         requested = kinds or ["short_answer", "multiple_choice", "true_false"]

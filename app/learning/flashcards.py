@@ -94,7 +94,7 @@ class FlashcardEngine:
 
     def from_objective(self, owner_user_id: int, objective_id: int) -> List[Flashcard]:
         """Generate flashcards from an objective's concept."""
-        objective = self._store.objectives.get(objective_id)
+        objective = self._store.objectives.get(owner_user_id, objective_id)
         if objective is None:
             return []
 

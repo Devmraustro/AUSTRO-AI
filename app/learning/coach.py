@@ -74,7 +74,7 @@ class CoachEngine:
         if active:
             weakest = sorted(active, key=lambda m: (m.get("score", 0.0),
                                                     m.get("updated_at", "")))[0]
-            title = self._objective_title(weakest["objective_id"])
+            title = self._objective_title(owner_user_id, weakest["objective_id"])
             return f"الاستمرار على هدف «{title}»"
         goals = self._store.goals.list(owner_user_id)
         goal = next((g for g in goals if g.get("kind") == "long_term"), None)
@@ -91,7 +91,7 @@ class CoachEngine:
         regressed = [m for m in self._store.mastery.list_for_owner(owner_user_id)
                      if m.get("state") == "REGRESSED"]
         if regressed:
-            return f"تراجع في «{self._objective_title(regressed[0]['objective_id'])}»"
+            return f"تراجع في «{self._objective_title(owner_user_id, regressed[0]['objective_id'])}»"
         return ""
 
     def _smallest_action(self, focus: str) -> str:
@@ -104,8 +104,8 @@ class CoachEngine:
             return f"أولوية اليوم: {focus}، والعوائق المعروفة: {blocker}."
         return f"الأفضل اليوم: {focus}."
 
-    def _objective_title(self, objective_id: int) -> str:
-        objective = self._store.objectives.get(objective_id)
+    def _objective_title(self, owner_user_id: int, objective_id: int) -> str:
+        objective = self._store.objectives.get(owner_user_id, objective_id)
         return (objective or {}).get("title") or "هدف"
 
     def _llm_focus(self, owner_user_id: int, result: CoachFocus) -> Optional[Dict[str, Any]]:

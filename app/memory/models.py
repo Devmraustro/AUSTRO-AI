@@ -305,7 +305,7 @@ def build_hash_key(owner_user_id: int, scope: str, memory_type: str,
         normalize_text(subject),
         normalize_text(claim),
     ])
-    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+    return hashlib.sha1(payload.encode("utf-8"), usedforsecurity=False).hexdigest()
 
 
 def subject_key(scope: str, memory_type: str, subject: str) -> str:

@@ -117,7 +117,9 @@ class MemoriesRepository(_MemoryBase):
                 cursor = self._connection().cursor()
                 now = self._now()
                 cursor.execute(
-                    f"INSERT INTO memories ({self._INSERT_COLUMNS}) "
+                    # _INSERT_COLUMNS is a class-level constant of literal
+                    # column names; the ? count matches it 1:1.
+                    f"INSERT INTO memories ({self._INSERT_COLUMNS}) "  # nosec B608
                     f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         item.owner_user_id,
@@ -319,18 +321,28 @@ class MemoriesRepository(_MemoryBase):
                     claim, confidence, importance, source_note,
                     consent_state,
                 ]
-                extra_sql = ""
-                if needs_confirmation is not None:
-                    extra_sql = ", metadata_json = ?"
+                needs_metadata = needs_confirmation is not None
+                if needs_metadata:
                     params.append(self._j({
                         "needs_confirmation": bool(needs_confirmation),
                     }))
                 params.extend([self._now(), memory_id, owner_user_id])
+                if needs_metadata:
+                    sql = (
+                        "UPDATE memories SET claim = ?, confidence = ?, "
+                        "importance = ?, source_note = ?, consent_state = ?, "
+                        "metadata_json = ?, updated_at = ? "
+                        "WHERE memory_id = ? AND owner_user_id = ?"
+                    )
+                else:
+                    sql = (
+                        "UPDATE memories SET claim = ?, confidence = ?, "
+                        "importance = ?, source_note = ?, consent_state = ?, "
+                        "updated_at = ? "
+                        "WHERE memory_id = ? AND owner_user_id = ?"
+                    )
                 cursor.execute(
-                    f"UPDATE memories SET claim = ?, confidence = ?, "
-                    f"importance = ?, source_note = ?, consent_state = ? "
-                    f"{extra_sql}, updated_at = ? "
-                    f"WHERE memory_id = ? AND owner_user_id = ?",
+                    sql,
                     tuple(params),
                 )
                 self._connection().commit()

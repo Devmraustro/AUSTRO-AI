@@ -52,7 +52,7 @@ class LessonGenerator:
         if cached is not None and not force:
             return _as_lesson(cached)
 
-        objective = self._store.objectives.get(objective_id)
+        objective = self._store.objectives.get(owner_user_id, objective_id)
         if objective is None:
             return None
         content = self._template(objective, mode, evidence or [])

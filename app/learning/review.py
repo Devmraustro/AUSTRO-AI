@@ -66,7 +66,7 @@ class WeeklyReviewEngine:
         masteries = self._store.mastery.list_for_owner(owner_user_id)
         for m in masteries:
             if m.get("state") in ("MASTERED", "NEAR_MASTERY", "REGRESSED"):
-                title = self._objective_title(m["objective_id"])
+                title = self._objective_title(owner_user_id, m["objective_id"])
                 mastery_deltas[title] = m.get("state", "")
 
         weak = self._weak_areas(owner_user_id)
@@ -105,8 +105,8 @@ class WeeklyReviewEngine:
         except Exception:
             return False
 
-    def _objective_title(self, objective_id: int) -> str:
-        objective = self._store.objectives.get(objective_id)
+    def _objective_title(self, owner_user_id: int, objective_id: int) -> str:
+        objective = self._store.objectives.get(owner_user_id, objective_id)
         return (objective or {}).get("title") or "هدف"
 
     def _weak_areas(self, owner_user_id: int) -> List[str]:
@@ -152,7 +152,7 @@ class WeeklyReviewEngine:
                            key=lambda m: m.get("score", 0.0))
         active = [m for m in masteries if m.get("state") not in ("MASTERED",)]
         if active:
-            priorities.append(f"واصل: {self._objective_title(active[0]['objective_id'])}.")
+            priorities.append(f"واصل: {self._objective_title(owner_user_id, active[0]['objective_id'])}.")
         if not priorities:
             priorities.append("حدد هدفًا جديدًا أو راجع أهدافك القديمة.")
         return priorities

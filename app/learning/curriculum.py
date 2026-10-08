@@ -78,7 +78,7 @@ class CurriculumEngine:
     def build(self, *, owner_user_id: int, goal_id: int, title: str,
               mode: str = "READ",
               objective_ids: Optional[List[int]] = None) -> Optional[Dict[str, Any]]:
-        objectives = self._store.objectives.list_for_goal(goal_id)
+        objectives = self._store.objectives.list_for_goal(owner_user_id, goal_id)
         if objective_ids is not None:
             allowed = set(objective_ids)
             objectives = [o for o in objectives if o["objective_id"] in allowed]
@@ -117,7 +117,7 @@ class CurriculumEngine:
         if curriculum is None:
             return False
         goal_id = curriculum["goal_id"]
-        objectives = self._store.objectives.list_for_goal(goal_id)
+        objectives = self._store.objectives.list_for_goal(owner_user_id, goal_id)
         index = {int(o["objective_id"]): o for o in objectives}
         ordered = [oid for oid in objective_ids if oid in index] + \
             [oid for oid in topological_order(objectives) if oid not in set(objective_ids)]

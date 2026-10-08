@@ -68,7 +68,7 @@ class MultiSourceLearning:
         source_ids: set = set()
         for module in curriculum.get("modules", []):
             for obj_id in module.get("objective_ids", []):
-                objective = self._learn.objectives.get(obj_id)
+                objective = self._learn.objectives.get(owner_user_id, obj_id)
                 if objective and objective.get("source_id"):
                     source_ids.add(objective["source_id"])
 

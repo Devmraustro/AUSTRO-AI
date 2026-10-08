@@ -53,7 +53,7 @@ class DiagnosticEngine:
 
     def diagnose(self, owner_user_id: int, goal_id: int,
                  self_ratings: Optional[Dict[int, float]] = None) -> DiagnosticResult:
-        objectives = self._store.objectives.list_for_goal(goal_id)
+        objectives = self._store.objectives.list_for_goal(owner_user_id, goal_id)
         statuses: List[str] = []
         entries: List[DiagnosticEntry] = []
         mastery_records = {

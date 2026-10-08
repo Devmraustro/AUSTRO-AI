@@ -166,13 +166,13 @@ class LearningObjectivesRepository(_LearningBase):
             logger.error(f"Database error in objective create: {e}")
             return None
 
-    def get(self, objective_id: int) -> Optional[Dict[str, Any]]:
+    def get(self, owner_user_id: int, objective_id: int) -> Optional[Dict[str, Any]]:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
                 cursor.execute(
-                    "SELECT * FROM learning_objectives WHERE objective_id = ?",
-                    (objective_id,),
+                    "SELECT * FROM learning_objectives WHERE objective_id = ? AND owner_user_id = ?",
+                    (objective_id, owner_user_id),
                 )
                 row = cursor.fetchone()
                 if row is None:
@@ -185,14 +185,14 @@ class LearningObjectivesRepository(_LearningBase):
             logger.error(f"Database error in objective get: {e}")
             return None
 
-    def list_for_goal(self, goal_id: int) -> List[Dict[str, Any]]:
+    def list_for_goal(self, owner_user_id: int, goal_id: int) -> List[Dict[str, Any]]:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
                 cursor.execute(
-                    "SELECT * FROM learning_objectives WHERE goal_id = ? "
+                    "SELECT * FROM learning_objectives WHERE goal_id = ? AND owner_user_id = ? "
                     "ORDER BY objective_id",
-                    (goal_id,),
+                    (goal_id, owner_user_id),
                 )
                 rows = []
                 for row in cursor.fetchall():
@@ -221,14 +221,14 @@ class LearningObjectivesRepository(_LearningBase):
             logger.error(f"Database error in objective update_mastery: {e}")
             return False
 
-    def set_status(self, objective_id: int, status: str) -> bool:
+    def set_status(self, owner_user_id: int, objective_id: int, status: str) -> bool:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
                 cursor.execute(
                     "UPDATE learning_objectives SET status = ?, updated_at = ? "
-                    "WHERE objective_id = ?",
-                    (status, self._now(), objective_id),
+                    "WHERE objective_id = ? AND owner_user_id = ?",
+                    (status, self._now(), objective_id, owner_user_id),
                 )
                 self._connection().commit()
                 return cursor.rowcount > 0
@@ -332,8 +332,10 @@ class CurriculaRepository(_LearningBase):
                     sets.append("mode = ?")
                     params.append(mode)
                 params += [curriculum_id, owner_user_id]
+                # `sets` is assembled only from string literals above, never
+                # from caller input, so the joined fragment is safe.
                 cursor.execute(
-                    f"UPDATE learning_curricula SET {', '.join(sets)} "
+                    f"UPDATE learning_curricula SET {', '.join(sets)} "  # nosec B608
                     "WHERE curriculum_id = ? AND owner_user_id = ?",
                     params,
                 )
@@ -448,13 +450,13 @@ class SessionsRepository(_LearningBase):
             logger.error(f"Database error in session create: {e}")
             return None
 
-    def get(self, session_id: int) -> Optional[Dict[str, Any]]:
+    def get(self, owner_user_id: int, session_id: int) -> Optional[Dict[str, Any]]:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
                 cursor.execute(
-                    "SELECT * FROM learning_sessions WHERE session_id = ?",
-                    (session_id,),
+                    "SELECT * FROM learning_sessions WHERE session_id = ? AND owner_user_id = ?",
+                    (session_id, owner_user_id),
                 )
                 row = cursor.fetchone()
                 if row is None:
@@ -1079,8 +1081,10 @@ class LearningStore:
                 connection = self._manager._get_connection()
                 cursor = connection.cursor()
                 for table in self._OWNER_TABLES:
-                    cursor.execute(
-                        f"DELETE FROM {table} WHERE owner_user_id = ?",
+                    # _OWNER_TABLES is a module-level tuple of literal table
+                    # names, never caller-controlled.
+                    cursor.execute(  # nosec B608
+                        f"DELETE FROM {table} WHERE owner_user_id = ?",  # nosec B608
                         (owner_user_id,),
                     )
                 connection.commit()

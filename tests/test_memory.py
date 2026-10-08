@@ -10,6 +10,8 @@ budget cap, usage feedback) and the memory-aware ChatService. Everything is
 deterministic - no network, no real AI keys required.
 """
 
+import json
+
 import pytest
 
 from app.application.chat import ChatService
@@ -525,193 +527,25 @@ def test_gate_types_are_a_known_closed_set(memory):
 
 def test_forget_redacts_versions_direct(memory):
     """Privacy-safe forget: claim content must be redacted from memory_versions."""
-    # Directly create a memory with a claim
-    from app.memory.service import MemoryService
-    from app.memory.repositories import MemoryItem
-    
-    # Create a memory item directly
-    item = MemoryItem(
-        memory_id=0,
-        owner_user_id=1,
-        version=1,
-        claim="Secret plan to climb Mount Everest on 2025-01-01",
-        confidence="high",
-        importance=5,
-        reason="user_statement",
-        actor=1,
-    )
-    memory.store.memories.create(item)
-    memory.store.events.log(
-        owner_user_id=1, memory_id=item.memory_id,
-        action="created", source="test", actor=1,
-    )
-    
-    # List memories
-    items = memory.list(1)
-    first_id = items[0]["memory_id"]
-    
-    # Forget the memory
-    result = memory.forget(1, first_id)
-    assert result is True
-    
-    # The memory list should not include the forgotten item
-    remaining = memory.list(1)
-    assert len(remaining) == len(items) - 1
-    assert all(item["memory_id"] != first_id for item in remaining)
-    
-    # Verify memory_versions claim is redacted
-    versions = memory.store.versions.list(1, first_id)
-    assert len(versions) > 0
-    for v in versions:
-        claim = v.get("claim", "")
-        # Claim should be redacted, not the original sensitive content
-        assert "(forgotten" in claim or "forgotten" in claim.lower()
-    
-    # Verify export does not include forgotten claims
-    payload = memory.export(1)
-    assert payload is not None
-    # Export only contains active memories, so forgotten one should be absent
-    mem_ids = [m.get("memory_id") for m in payload.get("memories", [])]
-    assert first_id not in mem_ids
-
-
-
-def test_forget_redacts_versions_direct(memory):
-    """Privacy-safe forget: claim content must be redacted from memory_versions."""
     # Directly create a memory with a claim using MemoryItem dataclass
     from app.memory.models import MemoryItem
-    
-    # Create a memory item directly with the claim
-    item = MemoryItem(
-        memory_id=1,
-        owner_user_id=1,
-        claim="Secret plan to climb Mount Everest on 2025-01-01",
-        confidence="high",
-        importance=5,
-        provenance="user_statement",
-        status="active",
-    )
-    memory.store.memories.create(item)
-    memory.store.events.log(
-        owner_user_id=1, memory_id=item.memory_id,
-        action="created", source="test", actor=1,
-    )
-    
-    # List memories
-    items = memory.list(1)
-    first_id = items[0]["memory_id"]
-    
-    # Forget the memory
-    result = memory.forget(1, first_id)
-    assert result is True
-    
-    # The memory list should not include the forgotten item
-    remaining = memory.list(1)
-    assert len(remaining) == len(items) - 1
-    assert all(item["memory_id"] != first_id for item in remaining)
-    
-    # Verify memory_versions claim is redacted
-    versions = memory.store.versions.list(1, first_id)
-    assert len(versions) > 0
-    for v in versions:
-        claim = v.get("claim", "")
-        # Claim should be redacted, not the original sensitive content
-        assert "(forgotten" in claim or "forgotten" in claim.lower()
-    
-    # Verify export does not include forgotten claims
-    payload = memory.export(1)
-    assert payload is not None
-    # Export only contains active memories, so forgotten one should be absent
-    mem_ids = [m.get("memory_id") for m in payload.get("memories", [])]
-    assert first_id not in mem_ids
 
+    SECRET = "Secret plan to climb Mount Everest on 2025-01-01"
 
-
-def test_forget_redacts_versions_direct(memory):
-    """Privacy-safe forget: claim content must be redacted from memory_versions."""
-    # Directly create a memory with a claim using MemoryItem dataclass
-    from app.memory.models import MemoryItem
-    from app.memory.repositories import MemoryVersionsRepository
-    
-    # Create a memory item directly with the claim
-    item = MemoryItem(
-        memory_id=1,
-        owner_user_id=1,
-        claim="Secret plan to climb Mount Everest on 2025-01-01",
-        confidence="high",
-        importance=5,
-        provenance="user_statement",
-        status="active",
-    )
-    memory.store.memories.create(item)
-    
-    # Add a version to memory_versions so we can test redaction
-    versions_repo = memory.store.versions
-    versions_repo.add(
-        memory_id=item.memory_id,
-        owner_user_id=1,
-        version=1,
-        claim=item.claim,
-        confidence=item.confidence,
-        importance=item.importance,
-        reason=item.provenance,
-        actor=1,
-    )
-    
-    # Log the event
-    memory.store.events.log(
-        owner_user_id=1, memory_id=item.memory_id,
-        action="created", source="test", actor=1,
-    )
-    
-    # List memories
-    items = memory.list(1)
-    first_id = items[0]["memory_id"]
-    
-    # Forget the memory
-    result = memory.forget(1, first_id)
-    assert result is True
-    
-    # The memory list should not include the forgotten item
-    remaining = memory.list(1)
-    assert len(remaining) == len(items) - 1
-    assert all(item["memory_id"] != first_id for item in remaining)
-    
-    # Verify memory_versions claim is redacted
-    versions = memory.store.versions.list(1, first_id)
-    assert len(versions) > 0
-    for v in versions:
-        claim = v.get("claim", "")
-        # Claim should be redacted, not the original sensitive content
-        assert "(forgotten" in claim or "forgotten" in claim.lower()
-    
-    # Verify export does not include forgotten claims
-    payload = memory.export(1)
-    assert payload is not None
-    # Export only contains active memories, so forgotten one should be absent
-    mem_ids = [m.get("memory_id") for m in payload.get("memories", [])]
-    assert first_id not in mem_ids
-
-
-
-def test_forget_redacts_versions_direct(memory):
-    """Privacy-safe forget: claim content must be redacted from memory_versions."""
-    # Directly create a memory with a claim using MemoryItem dataclass
-    from app.memory.models import MemoryItem
-    from app.memory.repositories import MemoryVersionsRepository
-    
-    # Create two memory items - one to keep, one to forget
+    # Create two memory items - one to forget, one to keep. hash_key must be
+    # distinct per row: memories has a UNIQUE (owner_user_id, hash_key).
     item1 = MemoryItem(
         memory_id=1,
         owner_user_id=1,
-        claim="Secret plan to climb Mount Everest on 2025-01-01",
+        claim=SECRET,
         confidence="high",
         importance=5,
         provenance="user_statement",
         status="active",
+        hash_key="forgettest-secret-1",
     )
     memory.store.memories.create(item1)
-    
+
     item2 = MemoryItem(
         memory_id=2,
         owner_user_id=1,
@@ -720,9 +554,10 @@ def test_forget_redacts_versions_direct(memory):
         importance=3,
         provenance="user_statement",
         status="active",
+        hash_key="forgettest-keep-2",
     )
     memory.store.memories.create(item2)
-    
+
     # Add versions to memory_versions for both memories
     versions_repo = memory.store.versions
     versions_repo.add(
@@ -745,7 +580,7 @@ def test_forget_redacts_versions_direct(memory):
         reason=item2.provenance,
         actor=1,
     )
-    
+
     # Log the events
     memory.store.events.log(
         owner_user_id=1, memory_id=item1.memory_id,
@@ -755,22 +590,25 @@ def test_forget_redacts_versions_direct(memory):
         owner_user_id=1, memory_id=item2.memory_id,
         action="created", source="test", actor=1,
     )
-    
-    # List memories
-    items = memory.list(1)
-    first_id = items[0]["memory_id"]
-    second_id = items[1]["memory_id"]
-    
-    # Forget only the first memory
+
+    # Pick the rows explicitly: memory.list() returns newest-first, so index
+    # order must never decide which row is the secret to forget.
+    first_id = item1.memory_id   # SECRET - gets forgotten
+    second_id = item2.memory_id  # kept
+
+    assert first_id in [i["memory_id"] for i in memory.list(1)]
+    assert second_id in [i["memory_id"] for i in memory.list(1)]
+
+    # Forget only the secret memory
     result = memory.forget(1, first_id)
     assert result is True
-    
+
     # The memory list should include only the kept item
     remaining = memory.list(1)
     assert len(remaining) == 1
     assert remaining[0]["memory_id"] == second_id
     assert remaining[0]["memory_id"] != first_id
-    
+
     # Verify memory_versions claim is redacted for the forgotten memory
     versions = memory.store.versions.list(1, first_id)
     assert len(versions) > 0
@@ -778,7 +616,14 @@ def test_forget_redacts_versions_direct(memory):
         claim = v.get("claim", "")
         # Claim should be redacted, not the original sensitive content
         assert "(forgotten" in claim or "forgotten" in claim.lower()
-    
+        # The original secret text must be gone from every stored version.
+        assert SECRET not in claim
+        assert "Mount Everest" not in claim
+
+    # The secret must not be reachable by retrieval either.
+    for hit in memory.search(1, "Mount Everest"):
+        assert SECRET not in str(hit)
+
     # Verify the kept memory's versions are NOT redacted
     kept_versions = memory.store.versions.list(1, second_id)
     assert len(kept_versions) > 0
@@ -786,7 +631,7 @@ def test_forget_redacts_versions_direct(memory):
         claim = v.get("claim", "")
         # Kept memory's claim should NOT contain the redact marker
         assert "(forgotten" not in claim and "forgotten" not in claim.lower()
-    
+
     # Verify export includes the kept memory but not the forgotten one
     payload = memory.export(1)
     assert payload is not None
@@ -794,112 +639,44 @@ def test_forget_redacts_versions_direct(memory):
     mem_ids = [m.get("memory_id") for m in payload.get("memories", [])]
     assert first_id not in mem_ids  # forgotten memory should not be in export
     assert second_id in mem_ids  # kept memory should be in export
+    # And the secret must not appear anywhere in the exported snapshot.
+    assert SECRET not in json.dumps(payload, ensure_ascii=False)
 
 
-
-def test_forget_redacts_versions_direct(memory):
-    """Privacy-safe forget: claim content must be redacted from memory_versions."""
-    # Directly create a memory with a claim using MemoryItem dataclass
+def test_clear(memory):
+    """clear() must remove every active memory for the owner."""
     from app.memory.models import MemoryItem
-    from app.memory.repositories import MemoryVersionsRepository
-    
-    # Create two memory items - one to keep, one to forget
-    import uuid
-    hash_key_1 = str(uuid.uuid4())[:8]
-    hash_key_2 = str(uuid.uuid4())[:8]
-    
-    item1 = MemoryItem(
-        memory_id=1,
-        owner_user_id=1,
-        claim="Secret plan to climb Mount Everest on 2025-01-01",
-        confidence="high",
-        importance=5,
-        provenance="user_statement",
-        status="active",
-        hash_key=hash_key_1,
-    )
-    memory.store.memories.create(item1)
-    
-    item2 = MemoryItem(
-        memory_id=2,
-        owner_user_id=1,
-        claim="Another memory to keep",
-        confidence="medium",
-        importance=3,
-        provenance="user_statement",
-        status="active",
-        hash_key=hash_key_2,
-    )
-    memory.store.memories.create(item2)
-    
-    # Add versions to memory_versions for both memories
-    versions_repo = memory.store.versions
-    versions_repo.add(
-        memory_id=item1.memory_id,
-        owner_user_id=1,
-        version=1,
-        claim=item1.claim,
-        confidence=item1.confidence,
-        importance=item1.importance,
-        reason=item1.provenance,
-        actor=1,
-    )
-    versions_repo.add(
-        memory_id=item2.memory_id,
-        owner_user_id=1,
-        version=1,
-        claim=item2.claim,
-        confidence=item2.confidence,
-        importance=item2.importance,
-        reason=item2.provenance,
-        actor=1,
-    )
-    
-    # Log the events
-    memory.store.events.log(
-        owner_user_id=1, memory_id=item1.memory_id,
-        action="created", source="test", actor=1,
-    )
-    memory.store.events.log(
-        owner_user_id=1, memory_id=item2.memory_id,
-        action="created", source="test", actor=1,
-    )
-    
-    # List memories
+
+    for index, claim in enumerate(("first seeded claim", "second seeded claim"), start=1):
+        memory.store.memories.create(MemoryItem(
+            memory_id=index, owner_user_id=1, claim=claim,
+            confidence="high", importance=3, provenance="user_statement",
+            status="active", hash_key=f"clearseed-{index}",
+        ))
+    assert len(memory.list(1)) >= 2
+
+    count = memory.clear(1)
+    assert count >= 2
+    assert memory.list(1) == []
+    payload = memory.export(1) or {}
+    assert payload.get("memories", []) == []
+
+
+def test_hard_delete(memory):
+    """delete() must hard-remove the row, leaving nothing to retrieve."""
+    from app.memory.models import MemoryItem
+
+    memory.store.memories.create(MemoryItem(
+        memory_id=7, owner_user_id=1, claim="hard delete target",
+        confidence="high", importance=3, provenance="user_statement",
+        status="active", hash_key="harddelete-target-7",
+    ))
     items = memory.list(1)
+    assert items
     first_id = items[0]["memory_id"]
-    second_id = items[1]["memory_id"]
-    
-    # Forget only the first memory
-    result = memory.forget(1, first_id)
-    assert result is True
-    
-    # The memory list should include only the kept item
-    remaining = memory.list(1)
-    assert len(remaining) == 1
-    assert remaining[0]["memory_id"] == second_id
-    assert remaining[0]["memory_id"] != first_id
-    
-    # Verify memory_versions claim is redacted for the forgotten memory
-    versions = memory.store.versions.list(1, first_id)
-    assert len(versions) > 0
-    for v in versions:
-        claim = v.get("claim", "")
-        # Claim should be redacted, not the original sensitive content
-        assert "(forgotten" in claim or "forgotten" in claim.lower()
-    
-    # Verify the kept memory's versions are NOT redacted
-    kept_versions = memory.store.versions.list(1, second_id)
-    assert len(kept_versions) > 0
-    for v in kept_versions:
-        claim = v.get("claim", "")
-        # Kept memory's claim should NOT contain the redact marker
-        assert "(forgotten" not in claim and "forgotten" not in claim.lower()
-    
-    # Verify export includes the kept memory but not the forgotten one
-    payload = memory.export(1)
-    assert payload is not None
-    # Export only contains active memories
-    mem_ids = [m.get("memory_id") for m in payload.get("memories", [])]
-    assert first_id not in mem_ids  # forgotten memory should not be in export
-    assert second_id in mem_ids  # kept memory should be in export
+
+    assert memory.delete(1, first_id) is True
+    assert memory.get(1, first_id) is None
+    assert all(i["memory_id"] != first_id for i in memory.list(1))
+    # No redaction marker is left behind: the row is gone entirely.
+    assert memory.store.versions.list(1, first_id) == []

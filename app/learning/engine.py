@@ -180,7 +180,7 @@ class AdaptiveLearningEngine:
 
     def objectives(self, owner_user_id: int,
                    goal_id: int) -> List[Dict[str, Any]]:
-        return self._store.objectives.list_for_goal(goal_id)
+        return self._store.objectives.list_for_goal(owner_user_id, goal_id)
 
     # ------------------------------------------------------------------
     # Curriculum
@@ -229,7 +229,7 @@ class AdaptiveLearningEngine:
             )
         if chosen_id is None:
             return None
-        objective = self._store.objectives.get(chosen_id)
+        objective = self._store.objectives.get(owner_user_id, chosen_id)
         if objective is None:
             return None
 
@@ -278,7 +278,7 @@ class AdaptiveLearningEngine:
             lesson = self.lessons.get(owner_user_id, session.lesson_id)
             result["lesson"] = _lesson_dict(lesson) if lesson else None
         if session.objective_id:
-            result["objective"] = self._store.objectives.get(session.objective_id)
+            result["objective"] = self._store.objectives.get(owner_user_id, session.objective_id)
         return result
 
     def _grounded_evidence(self, owner_user_id: int,
@@ -350,7 +350,7 @@ class AdaptiveLearningEngine:
     def assessment(self, owner_user_id: int, objective_id: int, *,
                    count: int = 3,
                    kinds: Optional[List[str]] = None) -> List[Dict[str, Any]]:
-        objective = self._store.objectives.get(objective_id)
+        objective = self._store.objectives.get(owner_user_id, objective_id)
         lesson = None
         if objective is not None:
             goal_id = objective.get("goal_id")
@@ -394,7 +394,7 @@ class AdaptiveLearningEngine:
         record = self._store.mastery.get(owner_user_id, objective_id)
         if record is None:
             return
-        objective = self._store.objectives.get(objective_id)
+        objective = self._store.objectives.get(owner_user_id, objective_id)
         if objective:
             self._remember_state(owner_user_id, objective,
                                  record.get("state", ""))
@@ -485,7 +485,7 @@ class AdaptiveLearningEngine:
     def progress_overview(self, owner_user_id: int) -> ProgressOverview:
         masteries = self._store.mastery.list_for_owner(owner_user_id)
         objectives = sum(1 for g in self._store.goals.list(owner_user_id)
-                         for _ in self._store.objectives.list_for_goal(g["goal_id"]))
+                          for _ in self._store.objectives.list_for_goal(owner_user_id, g["goal_id"]))
         overview = ProgressOverview(
             objectives_total=objectives,
             objectives_engaged=len(masteries),
@@ -548,7 +548,7 @@ class AdaptiveLearningEngine:
             "goals": self._store.goals.list(owner_user_id),
             "objectives": [
                 dict(o) for g in self._store.goals.list(owner_user_id)
-                for o in self._store.objectives.list_for_goal(g["goal_id"])
+                for o in self._store.objectives.list_for_goal(owner_user_id, g["goal_id"])
             ],
             "curricula": [
                 dict(c) for g in self._store.goals.list(owner_user_id)

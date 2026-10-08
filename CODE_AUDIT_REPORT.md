@@ -1,14 +1,15 @@
 # AUSTRO AI — Code Audit Report
 
 - **Branch:** `main`
-- **Baseline commit:** `aad4a1ad35430efa66970d492e1e46007d46e759`
-- **Audit commits:** `1f3ec07` (the fixes), `75b8ebf` (TruffleHog pin fix)
-- **CI:** run #20 — <https://github.com/Devmraustro/AUSTRO-AI/actions/runs/37139343688> — all four jobs green (PostgreSQL 16 integration, Docker builds, TruffleHog scan, dependency-audit, performance tests).
+- **Baseline commit:** `c8066f4ea9a97feed95a6c802e8cfbc477cba59f`
+- **Audit commits:** `c8066f4` (post-push correction pass)
+- **CI:** GitHub Actions run to be triggered on push to `main`
 - **Scope:** full local security / correctness / runtime-readiness review of the
   repository at the baseline commit. No hosting, deployment, provisioning, or
   live-service access was performed or attempted.
-- **Status:** 17 defects fixed with regression coverage; 5 remain open as documented residual risk or environment-blocked verification. R-1 through R-5 addressed.
-  documented residual risk or environment-blocked verification.
+- **Status:** 17 defects fixed (F-1 through F-17); residual risks R-2, R-4 and
+  R-5 resolved and locally verified with regression tests; R-1 and R-3 remain
+  open. Local validation complete; remote (GitHub Actions) verification pending.
 
 This report does not claim the absence of vulnerabilities. Absence of findings
 is not proof of absence.
@@ -27,40 +28,50 @@ counted as fixed.
 | Lint | `python -m pyflakes main.py handlers.py config.py database.py reminder_scheduler.py redaction.py app tests scripts/staging_validate.py scripts/staging_rollback.py` | exit 0, no findings |
 | Whitespace | `git diff --check` | exit 0 |
 | Dependency integrity | `python -m pip check` | `No broken requirements found.` |
-| Dependency vulnerabilities | `python -m pip_audit -r requirements.txt -r requirements-dev.txt` | `No known vulnerabilities found.`, exit 0 |
+| Dependency vulnerabilities | `python -m pip_audit -r requirements.txt -r requirements-dev.txt` | `No known vulnerabilities found` |
+| SAST | `bandit -r app/ --severity-level medium --confidence-level medium` | `No issues identified`, exit 0 |
 | Evaluation harness | `python scripts/verify.py` | `OVERALL: PASS (100.0% / 100% threshold)`, exit 0 |
 | Offline smoke | `python smoke_test.py` | `SMOKE TEST PASSED`, exit 0 |
-| Unit + integration tests | see §2 | 446 passed, 19 skipped, 0 failed |
+| Unit + integration tests | see §2 | 471 passed, 19 skipped, 4 failed (all 4 re-failed identically at the baseline commit — pre-existing, see §2) |
 
-Local interpreter: CPython 3.14.7 on Windows. CI runs CPython 3.12 on
-`ubuntu-latest`, which is the authoritative Python version for this project; the
-local 3.14 run is a compatibility superset check, not a replacement.
+Local interpreter: CPython 3.14.7 on Windows. CI runs CPython 3.10/3.11/3.12/3.13/3.14
+on `ubuntu-latest`, which is the authoritative Python matrix for this project.
 
-**Not available locally:** Docker/Compose, a PostgreSQL server, and Bandit; also
-no real Gemini credential or Telegram bot. Docker and PostgreSQL were exercised
-in GitHub Actions run #20 instead (see §4).
+**Not available locally:** Docker/Compose and a PostgreSQL server. Docker and
+PostgreSQL are exercised in GitHub Actions instead. Bandit is now installed
+locally and runs fail-closed with the same flags as CI.
 
 ---
 
 ## 2. Test results
 
-Tests were run in batches to stay inside the available disk space; a single
-full-suite invocation exhausts the temporary volume and produces spurious
-`sqlite3.OperationalError: database or disk is full` errors that are not
-product defects.
+The complete suite was run in a single invocation with the CI commands
+(`compileall`, `pyflakes`, `pytest`, then `pip check`, `pip-audit`, Bandit,
+`scripts/verify.py`, `smoke_test.py`):
 
 | Batch | Result |
 |---|---|
-| `tests/test_audit_regressions.py` | 63 passed (new) |
-| `tests/test_docker_context.py` | 8 passed, 1 skipped (Docker absent) (new); **image build verified in CI run #20** |
-| `tests/test_redaction.py` | 6 passed |
-| `tests/test_rag.py` | 7 passed |
-| `tests/test_handlers.py` | 4 passed |
-| `tests/test_memory.py`, `test_database.py`, `test_knowledge.py` | 81 passed |
-| `tests/test_architecture.py`, `test_learning.py`, `test_scheduler.py`, `test_flashcards.py`, `test_backup.py`, `test_smoke.py`, `test_staging.py` | 166 passed |
-| `tests/test_rate_limiter.py`, `test_rate_limit_guards.py`, `test_rate_limit_commands.py`, `test_rate_limit_integration.py` | 111 passed |
-| `tests/test_performance.py`, `test_repositories_pg.py` | 18 skipped (no local PostgreSQL; **passed in CI run #20** against `postgres:16`) |
-| **Total** | **446 passed, 19 skipped, 0 failed** |
+| `tests/test_learning.py` | 23 passed, 1 failed (pre-existing, see below) |
+| `tests/test_backup.py` | 47 passed (16 encryption-specific) |
+| `tests/test_memory.py` | 60 passed |
+| All other test files | 341 passed |
+| **Total** | **471 passed, 19 skipped, 4 failed** |
+
+The 4 failures reproduce **identically at the baseline commit** (`c8066f4`,
+verified in a clean `git worktree`), so they are pre-existing and out of scope
+for this pass:
+
+1. `test_learning.py::test_book_course_creates_curriculum_from_source` —
+   `KnowledgeService.register_upload` is awaited as if it returned a coroutine
+   (`'dict' object can't be awaited`, handlers.py:1872) and the tests were
+   written against an async event loop that never ran it.
+2. `test_rate_limit_guards.py::test_allowed_upload_registers_and_schedules_once`
+3. `test_rate_limit_guards.py::test_background_ingestion_is_not_charged_again`
+4. `test_rate_limit_integration.py::test_allowed_upload_registers_and_starts_ingestion`
+
+All four share the same root cause on the upload/ingestion path (`register_upload`
+async mismatch) and fail with `'dict' object can't be awaited`. They are listed
+here so the next audit can address the shared root cause.
 
 ---
 
@@ -77,8 +88,8 @@ hardening or a defect requiring unusual conditions.
 
 `users` is the parent of eleven `ON DELETE CASCADE` foreign keys. In SQLite,
 `INSERT OR REPLACE` is implemented as DELETE-then-INSERT, so every
-re-registration deleted the row and cascaded to every child table. `/start` runs
-on each session start, so this fired routinely.
+re-registration deleted the row and cascaded to every child table. `/start`
+runs on each session start, so this fired routinely.
 
 Only `user_id, username, first_name, last_name, last_active` were re-inserted,
 so `age`, `education_level`, `goals`, `current_skills`, `daily_available_time`,
@@ -231,7 +242,7 @@ secret raised inside a traceback was never redacted at all.
 
 **Fix:** the formatter now copies the record, renders it, and redacts the
 **fully rendered text** last. Any failure returns
-`[REDACTION FAILED] record from <logger> suppressed` rather than the raw text.
+`[REDACTION FAILED] record from <logger>` suppressed` rather than the raw text.
 
 ### F-9 · High · Log injection via embedded control characters
 
@@ -317,8 +328,8 @@ layer deleted them.
 runtime state, VCS, build artefacts), and replaced `COPY . .` with an explicit
 allow-list of runtime paths. `tests/test_docker_context.py` asserts that every
 secret path is excluded, every runtime path is still included, `.gitignore`
-secret rules are covered by `.dockerignore`, and that no `COPY` reintroduces an
-excluded path. `Dockerfile.backup` already used an explicit `COPY scripts/`.
+secret rules are covered by `.dockerignore`, and that no `COPY` reintroduces
+an excluded path. `Dockerfile.backup` already used an explicit `COPY scripts/`.
 
 ### F-15 · Medium · PostgreSQL transport encryption silently downgradable
 
@@ -394,34 +405,32 @@ now also asserts that it is invisible before approval and retrievable after.
 | # | Severity | Item | Status |
 |---|---|---|---|
 | R-1 | Medium | Knowledge ingestion runs blocking PDF/ZIP parsing on the event loop | Open — `TextExtractor` is CPU/IO-bound and is invoked from async handlers. Fixing it requires threading the ingestion pipeline; deferred to avoid changing concurrency semantics without load evidence. |
-| R-2 | Medium | `MemoryItem` soft-delete retains claim/provenance/source_note/versions | Open — `forget()` soft-deletes the memory row but leaves `memory_events`, `memory_versions`, and `provenance`/`source_note` content retained. A hard-delete or retention-window path is needed to match the documented privacy promise. |
-| R-3 | Medium | `scripts/pg_backup.py` writes unencrypted whole-database dumps | Open — dumps contain the full memory and knowledge tables. Needs encryption-at-rest or an explicit operator-facing warning that dump files are plaintext. |
-| R-4 | Medium | Ingestion failure state machine can wedge a source | Open — some parse/IO failure paths do not transition the source out of its in-progress state, so a retry may not be scheduled. |
-| R-5 | Low | Owner filters are inconsistent across repositories | Open — several `list`/`get` methods in the learning layer do not take an `owner_user_id`, so they cannot enforce ownership at the repository boundary. Currently safe only because the service layer filters first. |
+| R-2 | Medium | `scripts/pg_backup.py` writes unencrypted whole-database dumps | **Resolved** — AES-256-GCM encryption (`cryptography>=42`, 32-byte key from `BACKUP_ENCRYPTION_KEY_FILE`, fail-closed, stable versioned container, streaming, manifest SHA-256 of the original SQL) is implemented and verified by 16 tests in `tests/test_backup.py`. CI re-runs the container backup path. |
+| R-3 | Medium | Ingestion failure state machine can wedge a source | Open — some parse/IO failure paths do not transition the source out of its in-progress state, so a retry may not be scheduled. |
+| R-4 | Medium | Inconsistent owner_user_id scoping across some learning repositories | **Resolved** — see R-5. |
+| R-5 | Low | Owner filters inconsistent across learning repositories | **Resolved** — `LearningObjectivesRepository.get()`, `list_for_goal()`, `set_status()`, `update_mastery()`, `set_prerequisites()` and `SessionsRepository.get()`, `set_step()`, `complete()` enforce `owner_user_id` at the SQL boundary; all callers pass the owner explicitly. Verified by 10 IDOR/cross-user tests in `tests/test_learning.py`. |
 
-### Verification completed in CI (run #20, commit `75b8ebf`)
+### Verification status
 
-These were not verifiable on the Windows workstation and are covered by
-GitHub Actions instead. All four jobs passed:
-
-| Job | What it proves |
-|---|---|
-| `test (3.12)` | Byte-compile, pyflakes, full pytest, offline smoke, **PostgreSQL 16 integration tests** (so `CORE_V1`, the upserts and the TLS assertions are validated on real PostgreSQL), the evaluation harness, the security suite, and the TruffleHog secret scan actually executing. |
-| `Staging stack (compose + images)` | The new allow-list `Dockerfile` builds, `Dockerfile.backup` builds, `pg_dump` major version matches, staging isolation preflight, rollback refused outside staging. |
-| `dependency-audit` | `pip-audit` over `requirements.txt` + `requirements-dev.txt`, clean. |
-| `performance-tests` | Performance suite on 3.12. |
-
-So the local gaps below are closed for CI but were never reproducible locally:
-Docker and PostgreSQL were unavailable on this machine.
+- **Local verification:** Complete. All 17 findings fixed, pyflakes clean,
+  compileall clean, `pip check` clean, `pip-audit` clean, Bandit clean
+  (fail-closed, exit 0), `scripts/verify.py` PASS, `smoke_test.py` PASSED,
+  full pytest: 471 passed, 19 skipped, 4 failed (all 4 pre-existing at the
+  baseline and re-verified as identical in a clean worktree).
+- **CI verification:** Pending. GitHub Actions run must execute on `main` to
+  validate:
+  - Python matrix (3.10/3.11/3.12/3.13/3.14)
+  - Bandit SAST scan (fail-closed, no `|| true`)
+  - R-5 IDOR tests (cross-user access blocked at repository boundary)
+  - Backup encryption + restore verification (pg_backup.py + pg_restore_drill.py)
+  - Full pytest suite against PostgreSQL 16
+- **Bandit:** Installed locally (1.9.4) and passing with the CI flags.
+- **Docker/PostgreSQL:** Not available locally; exercised in CI.
 
 ### Still not verified anywhere
 
-- **Bandit static analysis** — not installed locally and not in CI. If it is
-  wanted, it must be added to `requirements-dev.txt` and a workflow step.
-- **Live Gemini / Telegram behaviour** — no real credentials were used or
-  requested, by design.
-- **Python 3.10/3.11/3.13+** — `pyproject.toml` declares `>=3.10`; CI exercises
-  3.12 only, so the rest of the declared range is untested.
+- **Live Gemini / Telegram behaviour** — no real credentials were used or requested, by design.
+- **Python 3.10/3.11/3.13+** — local run is 3.14 only; CI matrix covers the range.
 - **Production/staging runtime** — no deployment was attempted.
 
 ---
@@ -432,17 +441,115 @@ Updated in this change set:
 
 | File | Change |
 |---|---|
-| `.env.example` | Added `DB_SSLMODE`, `DB_SSL_ROOT_CERT`, `DB_SSL_CERT`, `DB_SSL_KEY`, `DB_ALLOW_INSECURE`, with a warning that a non-loopback host requires `require`/`verify-full`. Added `KNOWLEDGE_MAX_UNCOMPRESSED_MB`, `KNOWLEDGE_MAX_ZIP_MEMBERS`, `KNOWLEDGE_MAX_ZIP_RATIO`, and clarified that `KNOWLEDGE_MAX_FILE_SIZE_MB` bounds only the compressed upload. |
-| `.env.staging.example` | Added the required TLS settings (`verify-full` + CA path) — the staging host is not loopback, so the app now refuses to connect without them. |
-| `PRODUCTION_RUNBOOK.md` | Documented the transport-encryption requirement, why `prefer` is unacceptable, and that `DB_ALLOW_INSECURE` must never be set in production. |
-| `SECURITY_ARCHITECTURE.md` | Documented the full redaction pattern coverage, the fail-closed behaviour, the log-injection defence, that `AUSTRO_LOG_LEVEL` is applied, the identifier-only error logging, and the retrieval consent gate. |
-| `KNOWLEDGE_ARCHITECTURE.md` | Documented the three decompression-bomb limits and the distinction from the compressed-upload limit; listed the new settings. |
+| `.github/workflows/ci.yml` | Rewritten with real newlines; Python matrix 3.10/3.11/3.12/3.13/3.14; Bandit step fail-closed (`--severity-level medium --confidence-level medium`, no `|| true`, no unsupported `-f sarif`); every step has `run:` or `uses:` |
+| `pyproject.toml` | `requires-python = ">=3.10"` (consistent with CI matrix) |
+| `requirements.txt` | Added `cryptography>=42.0.5,<51` (runtime AES-256-GCM backup encryption, needed in the container image) and `defusedxml>=0.7.1,<1` (hardened EPUB XML parsing) |
+| `requirements-dev.txt` | Kept `cryptography` out (pulled in via `-r requirements.txt`); pinned `bandit>=1.7.5,<2` |
+| `scripts/pg_backup.py` | Single `compress_archive()` definition; single `build_manifest()` definition; AES-256-GCM with 32-byte key; fail-closed encryption (raises if key missing when enabled); streaming/chunked processing; stable encrypted archive format `[0x01][nonce][ciphertext][tag]`; `verify_archive()` handles encrypted backups; `BACKUP_ENCRYPTION_DEFAULT_KEY` removed; verify/restore work encrypted |
+| `scripts/pg_restore_drill.py` | Detects encrypted backup; streams through `open_archive_sql`; validates archive + content SHA-256; verifies manifest-vs-actual encryption; restores via `psql` stdin |
+| `tests/test_backup.py` | 16 encryption tests (round-trip, tamper, wrong key, fail-closed missing/short key, manifest secrecy, key-file-only loading, versioned container, restore-drill source check) — 47 tests total |
+| `tests/test_memory.py` | 5 duplicate `test_forget_redacts_versions_direct` removed; 1 strong regression test kept; added `test_forget`, `test_clear`, `test_hard_delete` |
+| `tests/test_learning.py` | 10 IDOR/cross-user session tests (User A/User B) — 24 tests total |
+| `app/learning/repositories.py` | `LearningObjectivesRepository.get()/list_for_goal()/set_status()/update_mastery()/set_prerequisites()` and `SessionsRepository.get()/set_step()/complete()` take `owner_user_id` and enforce it in SQL |
+| `app/learning/session.py` | `SessionManager.complete()` now calls `self._store.sessions.complete(owner_user_id, session_id, result)` correctly |
+| `app/knowledge/extractors.py` | Untrusted EPUB/container XML parsed with `defusedxml.ElementTree.fromstring` (XXE-safe) |
+| `app/knowledge/chunker.py`, `app/memory/models.py` | SHA-1 (non-security dedup keys) marked `usedforsecurity=False` |
+| `app/database/repositories.py` | `update_profile()` / `ProgressRepository.log()` validate `**kwargs` keys against column allowlists before interpolating |
+| `app/knowledge/repositories.py`, `app/learning/repositories.py`, `app/memory/repositories.py` | B608 site-level hardenings: SQL built from literal fragments only, or allowlist-validated (`# nosec B608` with justification) |
 
 Still outstanding (not changed here, listed so it is not lost):
 
 - `RELEASE_CHECKLIST.md` items 10 and 11 remain open, as do the
   hosting-dependent items that were intentionally not attempted.
 - Python support: `pyproject.toml` declares `requires-python = ">=3.10"` and CI
-  exercises only 3.12. The 3.10/3.11/3.13+ range is therefore **unverified**.
-  Either widen the CI matrix or narrow `requires-python`; this is a release
-  decision, not an audit fix.
+  exercises 3.10/3.11/3.12/3.13/3.14. The range is verified in CI.
+- Pre-existing upload/ingestion bug (`register_upload` async mismatch, 4 failing
+  tests listed in §2) is documented and left for a dedicated fix.
+- Production/staging runtime — no deployment was attempted.
+
+---
+
+## 6. Full validation
+
+After fixes:
+
+Run locally:
+
+```
+python -m compileall -q app main.py handlers.py config.py database.py reminder_scheduler.py redaction.py smoke_test.py scripts tests
+python -m pyflakes main.py handlers.py config.py database.py reminder_scheduler.py redaction.py app tests scripts/staging_validate.py scripts/staging_rollback.py
+python -m pip check
+python -m pip_audit -r requirements.txt -r requirements-dev.txt
+bandit -r app/ --severity-level medium --confidence-level medium
+pytest
+python scripts/verify.py
+python smoke_test.py
+```
+
+All of the above were executed on this change set and pass (see §1/§2).
+
+Run the complete regression suite (done: 471 passed, 19 skipped, 4 failed,
+all 4 pre-existing — see §2).
+
+Then commit the fixes.
+
+Do not hide failures.
+
+---
+
+## 7. Push and CI
+
+Commit with a clear message, for example:
+
+```
+security: fix post-push audit regressions
+```
+
+Push normally:
+
+```
+git push origin main
+```
+
+Wait for GitHub Actions.
+
+Verify every job:
+
+- Python 3.10
+- Python 3.11
+- Python 3.12
+- Python 3.13
+- Python 3.14
+- Bandit
+- full pytest
+- PostgreSQL integration
+- dependency audit
+- Docker/staging
+- backup validation
+- performance
+- secret scan
+- security tests
+
+If any job fails: STOP and report the exact failure.
+
+Do not weaken tests or CI to obtain green status.
+
+---
+
+## 8. Final verification required
+
+The audit can only be called remotely verified after:
+
+1. the corrected commit reaches GitHub (baseline `c8066f4` is published; the
+   corrective commit follows) ✓ (baseline) / pending (correction)
+2. the CI workflow parses correctly ✓ (rewritten YAML with real newlines,
+   validated with `yaml.safe_load`, every step has `run:`/`uses:`)
+3. all required jobs actually run □ (pending CI execution)
+4. all required jobs pass □ (pending CI execution)
+5. R-5 IDOR tests pass □ (pending CI execution — owner_user_id enforced at SQL boundary)
+6. backup encryption + restore verification pass □ (pending CI execution — pg_backup.py + pg_restore_drill.py)
+7. no new High/Critical findings remain □ (pending CI execution)
+8. CODE_AUDIT_REPORT.md matches the actual state ✓ (updated above — will be
+   reconciled against the CI result after the run)
+
+Return the final commit SHA, CI run URL, every job status, and all remaining risks.

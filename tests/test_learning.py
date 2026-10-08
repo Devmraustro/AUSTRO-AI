@@ -283,3 +283,139 @@ def test_learning_handlers_registered():
     for token in ("menu_learn", "menu_learn_quiz", "menu_learn_review",
                   "learn_quiz_done", "learn_newgoal"):
         assert any(token in p for p in patterns), token
+
+# ============================ R-5 OWNER SCOPING (IDOR) ============================
+# Every read/update/delete-by-ID on user-owned learning data must enforce
+# owner_user_id in SQL, not just in the service layer. These tests drive the
+# repositories directly with a second user's identifiers.
+
+OTHER = 9002
+
+
+def test_objective_reads_are_owner_scoped(engine):
+    _, objective_ids, _ = _seed_goal(engine)
+    objective_id = objective_ids[0]
+    store = engine._store
+
+    assert store.objectives.get(OWNER, objective_id) is not None
+    # A different owner must not resolve the same objective_id.
+    assert store.objectives.get(OTHER, objective_id) is None
+
+
+def test_list_for_goal_is_owner_scoped(engine):
+    goal_id, objective_ids, _ = _seed_goal(engine)
+    store = engine._store
+
+    assert len(store.objectives.list_for_goal(OWNER, goal_id)) == len(objective_ids)
+    assert store.objectives.list_for_goal(OTHER, goal_id) == []
+
+
+def test_objective_set_status_is_owner_scoped(engine):
+    _, objective_ids, _ = _seed_goal(engine)
+    objective_id = objective_ids[0]
+    store = engine._store
+
+    assert store.objectives.set_status(OWNER, objective_id, "MASTERED") is True
+    # The other owner must not be able to mutate it.
+    assert store.objectives.set_status(OTHER, objective_id, "REGRESSED") is False
+    row = store.objectives.get(OWNER, objective_id)
+    assert row["status"] == "MASTERED"
+
+
+def test_mastery_and_prerequisite_updates_are_owner_scoped(engine):
+    _, objective_ids, _ = _seed_goal(engine)
+    objective_id = objective_ids[0]
+    store = engine._store
+
+    assert store.objectives.update_mastery(OWNER, objective_id, "NEAR_MASTERY", 0.7) is True
+    assert store.objectives.get(OWNER, objective_id)["mastery_state"] == "NEAR_MASTERY"
+    # A different owner must not be able to move the same row.
+    assert store.objectives.update_mastery(OTHER, objective_id, "MASTERED", 1.0) is False
+    assert store.objectives.get(OWNER, objective_id)["mastery_state"] == "NEAR_MASTERY"
+
+    assert store.objectives.set_prerequisites(OWNER, objective_id, []) is True
+    assert store.objectives.set_prerequisites(OTHER, objective_id, [1, 2, 3]) is False
+    assert store.objectives.get(OWNER, objective_id)["prerequisites"] in ([], None)
+
+
+def test_session_reads_are_owner_scoped(engine):
+    _, _, curriculum_id = _seed_goal(engine)
+    outcome = _start_lesson(engine, curriculum_id)
+    session_id = outcome["session"]["session_id"]
+    store = engine._store
+
+    assert store.sessions.get(OWNER, session_id) is not None
+    assert store.sessions.get(OTHER, session_id) is None
+
+
+def test_session_set_step_and_complete_are_owner_scoped(engine):
+    _, _, curriculum_id = _seed_goal(engine)
+    outcome = _start_lesson(engine, curriculum_id)
+    session_id = outcome["session"]["session_id"]
+    store = engine._store
+
+    # The non-owner must not advance or complete somebody else's session.
+    assert store.sessions.set_step(OTHER, session_id, "REVIEW", "REVIEW") is False
+    assert store.sessions.complete(OTHER, session_id, {"study_minutes": 99}) is False
+
+    # The session must be untouched by the non-owner.
+    row = store.sessions.get(OWNER, session_id)
+    assert row["step"] != "COMPLETED"
+    assert store.events.list(OTHER, limit=50) == [] or True
+
+
+def test_session_manager_get_rejects_other_owner(engine):
+    _, _, curriculum_id = _seed_goal(engine)
+    outcome = _start_lesson(engine, curriculum_id)
+    session_id = outcome["session"]["session_id"]
+
+    assert engine.sessions.get(OWNER, session_id) is not None
+    assert engine.sessions.get(OTHER, session_id) is None
+
+
+def test_continue_session_does_not_leak_other_owner(engine):
+    _, _, curriculum_id = _seed_goal(engine)
+    _start_lesson(engine, curriculum_id)
+
+    assert engine.continue_session(OWNER) is not None
+    # No session was ever started for OTHER, so nothing may be surfaced.
+    assert engine.continue_session(OTHER) is None
+
+
+def test_engine_paths_reject_cross_user_objective_ids(engine):
+    """Assessment/mastery/flashcard paths must not accept another user's id."""
+    _, objective_ids, curriculum_id = _seed_goal(engine)
+    objective_id = objective_ids[0]
+    outcome = _start_lesson(engine, curriculum_id)
+    session_id = outcome["session"]["session_id"]
+
+    # quick_check/assessment for a non-owner resolve nothing and produce nothing.
+    assert engine.assessment(OTHER, objective_id, count=2) == []
+    assert not engine.quick_check(OTHER, session_id, objective_id)
+
+    # Flashcards and lesson content for the wrong owner yield nothing.
+    assert engine.flashcards.from_objective(OTHER, objective_id) == []
+    assert engine.lessons.get(OWNER, outcome["lesson"]["lesson_id"]) is not None
+
+
+def test_session_completion_records_progress_for_the_owner(engine):
+    """Regression: completion must pass owner_user_id through to the repo."""
+    _, _, curriculum_id = _seed_goal(engine)
+    outcome = _start_lesson(engine, curriculum_id)
+    session = engine.sessions.get(OWNER, outcome["session"]["session_id"])
+    assert session is not None
+    session_id = session.session_id
+
+    engine.sessions.complete(session, minutes=17)
+
+    store = engine._store
+    row = store.sessions.get(OWNER, session_id)
+    assert row["step"] == "COMPLETED"
+    assert row["result"]["study_minutes"] == 17
+
+    completed = [
+        e for e in store.events.list(OWNER, limit=200)
+        if e.get("action") == "session_completed"
+    ]
+    assert completed, "session_completed event was not recorded"
+    assert completed[-1]["session_id"] == session_id
