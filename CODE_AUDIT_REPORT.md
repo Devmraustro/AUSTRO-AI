@@ -416,16 +416,21 @@ now also asserts that it is invisible before approval and retrievable after.
   compileall clean, `pip check` clean, `pip-audit` clean, Bandit clean
   (fail-closed, exit 0), `scripts/verify.py` PASS, `smoke_test.py` PASSED,
   full pytest: 471 passed, 19 skipped, 4 failed (all 4 pre-existing at the
-  baseline and re-verified as identical in a clean worktree).
-- **CI verification:** Pending. GitHub Actions run must execute on `main` to
-  validate:
-  - Python matrix (3.10/3.11/3.12/3.13/3.14)
-  - Bandit SAST scan (fail-closed, no `|| true`)
-  - R-5 IDOR tests (cross-user access blocked at repository boundary)
-  - Backup encryption + restore verification (pg_backup.py + pg_restore_drill.py)
-  - Full pytest suite against PostgreSQL 16
+  baseline and re-verified as identical in a clean worktree). Also reproduced
+  on Python 3.11 (the CI interpreter): same 4 failures, nothing else.
+- **CI verification:** Run `37773381695` on `f8c29ae` failed, **because of the
+  4 pre-existing tests**, not this change set:
+  - `dependency-audit` job: success
+  - `performance-tests` job: success
+  - `Staging stack (compose + images)` job: success
+  - `test` job (3.11): failure at step "Run tests" (`pytest -v`) — the 4
+    pre-existing failures; downstream steps (Bandit, smoke, PostgreSQL
+    integration, verify, security tests, secret scan) were skipped.
+  - `test` job (3.10/3.12/3.13/3.14): cancelled by the matrix when 3.11 failed.
+  - Remote verification of Bandit/PG-integration/security-scan is therefore
+    still pending until the pre-existing upload bug is fixed.
 - **Bandit:** Installed locally (1.9.4) and passing with the CI flags.
-- **Docker/PostgreSQL:** Not available locally; exercised in CI.
+- **Docker/PostgreSQL:** Not available locally; exercised in CI (staging job passed).
 
 ### Still not verified anywhere
 
@@ -540,16 +545,21 @@ Do not weaken tests or CI to obtain green status.
 
 The audit can only be called remotely verified after:
 
-1. the corrected commit reaches GitHub (baseline `c8066f4` is published; the
-   corrective commit follows) ✓ (baseline) / pending (correction)
+1. the corrected commit reaches GitHub ✓ (baseline `c8066f4` and correction
+   `f8c29ae` are both published)
 2. the CI workflow parses correctly ✓ (rewritten YAML with real newlines,
-   validated with `yaml.safe_load`, every step has `run:`/`uses:`)
-3. all required jobs actually run □ (pending CI execution)
-4. all required jobs pass □ (pending CI execution)
-5. R-5 IDOR tests pass □ (pending CI execution — owner_user_id enforced at SQL boundary)
-6. backup encryption + restore verification pass □ (pending CI execution — pg_backup.py + pg_restore_drill.py)
-7. no new High/Critical findings remain □ (pending CI execution)
-8. CODE_AUDIT_REPORT.md matches the actual state ✓ (updated above — will be
-   reconciled against the CI result after the run)
+   validated with `yaml.safe_load`; every step has `run:`/`uses:`; the run
+   spawned all defined jobs, not zero)
+3. all required jobs actually run ✗ — run `37773381695` started all jobs but
+   the `test` matrix cancelled 4 of 5 when 3.11 failed, and the failing job
+   skipped Bandit/smoke/PG/verify/security-steps
+4. all required jobs pass ✗ — `test (3.11)` failed at `pytest -v` on the 4
+   pre-existing tests (identical on 3.14 and at baseline); the 3 independent
+   jobs pass
+5. R-5 IDOR tests pass □ (pending CI — verified locally; owner_user_id enforced at SQL boundary)
+6. backup encryption + restore verification pass □ (pending CI — verified locally by 47 tests)
+7. no new High/Critical findings remain ✗ — CI run `37773381695` status `failure`
+   (cause: pre-existing tests); no findings were introduced by this pass
+8. CODE_AUDIT_REPORT.md matches the actual state ✓ (updated after the CI run)
 
 Return the final commit SHA, CI run URL, every job status, and all remaining risks.
