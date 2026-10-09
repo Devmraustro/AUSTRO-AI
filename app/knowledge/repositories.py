@@ -191,7 +191,7 @@ class KnowledgeSourceRepository(_KnowledgeBase):
                      source_id, owner_user_id),
                 )
                 self._connection().commit()
-                return True
+                return cursor.rowcount > 0
         except DB_ERROR as e:
             self._rollback()
             logger.error(f"Database error in knowledge set_title: {e}")
@@ -207,7 +207,7 @@ class KnowledgeSourceRepository(_KnowledgeBase):
                     (source_id, owner_user_id),
                 )
                 self._connection().commit()
-                return True
+                return cursor.rowcount > 0
         except DB_ERROR as e:
             self._rollback()
             logger.error(f"Database error in knowledge delete source: {e}")
@@ -263,15 +263,15 @@ class KnowledgeDocumentRepository(_KnowledgeBase):
             logger.error(f"Database error in knowledge complete document: {e}")
             return False
 
-    def list_for_source(self, source_id: int) -> List[Dict[str, Any]]:
-        """Documents referencing a source, newest version first."""
+    def list_for_source(self, owner_user_id: int, source_id: int) -> List[Dict[str, Any]]:
+        """Documents of one owner's source, newest version first. Owner-bound in SQL."""
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
                 cursor.execute(
-                    "SELECT * FROM knowledge_documents WHERE source_id = ? "
-                    "ORDER BY version DESC",
-                    (source_id,),
+                    "SELECT * FROM knowledge_documents WHERE owner_user_id = ? "
+                    "AND source_id = ? ORDER BY version DESC",
+                    (owner_user_id, source_id),
                 )
                 rows = []
                 for row in cursor.fetchall():
@@ -310,14 +310,15 @@ class KnowledgeSectionRepository(_KnowledgeBase):
             logger.error(f"Database error in knowledge create section: {e}")
             return None
 
-    def list_for_document(self, document_id: int) -> List[KnowledgeSection]:
+    def list_for_document(self, owner_user_id: int, document_id: int) -> List[KnowledgeSection]:
+        """Sections of one owner's document. Owner-bound in SQL."""
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
                 cursor.execute(
-                    "SELECT * FROM knowledge_sections WHERE document_id = ? "
-                    "ORDER BY order_index",
-                    (document_id,),
+                    "SELECT * FROM knowledge_sections WHERE owner_user_id = ? "
+                    "AND document_id = ? ORDER BY order_index",
+                    (owner_user_id, document_id),
                 )
                 rows = []
                 for row in cursor.fetchall():
@@ -339,13 +340,15 @@ class KnowledgeSectionRepository(_KnowledgeBase):
             logger.error(f"Database error in knowledge list sections: {e}")
             return []
 
-    def get(self, section_id: int) -> Optional[KnowledgeSection]:
+    def get(self, owner_user_id: int, section_id: int) -> Optional[KnowledgeSection]:
+        """One section, only if it belongs to the owner."""
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
                 cursor.execute(
-                    "SELECT * FROM knowledge_sections WHERE section_id = ?",
-                    (section_id,),
+                    "SELECT * FROM knowledge_sections WHERE section_id = ? "
+                    "AND owner_user_id = ?",
+                    (section_id, owner_user_id),
                 )
                 row = cursor.fetchone()
                 if row is None:

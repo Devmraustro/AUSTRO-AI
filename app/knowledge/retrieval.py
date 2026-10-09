@@ -116,7 +116,7 @@ class RetrievalService:
             seen[candidate["chunk_key"]] = score
             section = None
             if candidate.get("section_id"):
-                section = self._store.sections.get(candidate["section_id"])
+                section = self._store.sections.get(owner_user_id, candidate["section_id"])
             ranked.append(RetrievedChunk(
                 chunk_row_id=candidate["chunk_id"],
                 source_id=candidate["source_id"],
