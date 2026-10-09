@@ -38,8 +38,6 @@ os.environ.setdefault("GEMINI_API_KEY", "validate-gemini-key-0000000000")
 os.environ.setdefault("BOT_TOKEN", "123456789:VALIDATE-bot-token-abcdefghij")
 
 import datetime  # noqa: E402
-import os
-import sys
 
 REPO_ROOT = os.getcwd()
 sys.path.insert(0, REPO_ROOT)
@@ -194,7 +192,6 @@ def main() -> int:
     # ------------------------------------------------------------- concurrency
     def _concurrency():
         import psycopg2 as pg2
-        from psycopg2.extras import DictCursor
         conn = pg2.connect(
             host=settings.db_host, port=settings.db_port, dbname=settings.db_name,
             user=settings.db_user, password=settings.db_password,

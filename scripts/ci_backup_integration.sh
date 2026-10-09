@@ -12,10 +12,22 @@
 #   restore-tampered    one flipped archive byte -> exit 1, target untouched
 #   restore-refused     app DB / missing confirmation -> exit 2, nothing touched
 #   restore             correct key -> exit 0, restored DB verified
-#   cleanup             remove every ephemeral key and working file
+#   cleanup             remove every ephemeral key and working file (runs with
+#                       `if: always()`; needs only BACKUP_CI_DIR)
 set -euo pipefail
 
 : "${BACKUP_CI_DIR:?BACKUP_CI_DIR must be set (see the ephemeral-secrets step)}"
+
+# Cleanup needs only the scratch directory: it must work even when database
+# settings or the secrets step are absent, so it is handled before the guards.
+if [ "${1:-}" = "cleanup" ]; then
+  rm -rf -- "$BACKUP_CI_DIR"
+  if [ -e "$BACKUP_CI_DIR" ]; then
+    echo "ERROR: could not remove $BACKUP_CI_DIR"; exit 1
+  fi
+  echo "ephemeral keys, archives and logs removed from $BACKUP_CI_DIR"
+  exit 0
+fi
 : "${CI_SOURCE_DB:?}" "${CI_RESTORE_TARGET:?}" "${CI_DB_ADMIN_USER:?}"
 : "${CI_DB_ADMIN_PASSWORD:?}" "${CI_APP_ROLE:?}" "${CI_APP_PASSWORD:?}"
 
@@ -146,12 +158,6 @@ PY
     expect_rc 0 "$rc" "restore with the correct key"
     python3 "$FIXTURE" verify-restored --target "$CI_RESTORE_TARGET" --expected "$EXPECTED"
     python3 "$FIXTURE" counts --database "$CI_SOURCE_DB" --expected "$EXPECTED"
-    ;;
-
-  cleanup)
-    # Runs with `if: always()`. Removes every ephemeral key and working file.
-    rm -rf "$BACKUP_CI_DIR"
-    echo "ephemeral keys, archives and logs removed from $BACKUP_CI_DIR"
     ;;
 
   *)
