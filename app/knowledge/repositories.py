@@ -766,5 +766,46 @@ class KnowledgeStore:
         self.storage = KnowledgeStorageRepository(manager)
         self._manager = manager
 
+    def purge_partial_index(self, owner_user_id: int, source_id: int) -> bool:
+        """Remove every derived index row of one owner's source, atomically.
+
+        Used when ingestion fails after some index rows were written. The source
+        is not COMPLETED, so none of these rows is searchable, but they would
+        otherwise be orphaned, and a retry would build a second document beside
+        them. Deletion follows the foreign-key order (citations, embeddings,
+        chunks, sections, documents) in ONE transaction, so a failure leaves
+        either the full partial index or none of it, never a half-deleted one.
+        The source row itself is kept so its FAILED state and error stay visible.
+        """
+        scope_chunks = ("SELECT chunk_id FROM knowledge_chunks "
+                        "WHERE owner_user_id = ? AND source_id = ?")
+        statements = [
+            ("DELETE FROM knowledge_citations WHERE chunk_row_id IN (" + scope_chunks + ")",
+             (owner_user_id, source_id)),
+            ("DELETE FROM knowledge_embeddings WHERE owner_user_id = ? AND source_id = ?",
+             (owner_user_id, source_id)),
+            ("DELETE FROM knowledge_chunks WHERE owner_user_id = ? AND source_id = ?",
+             (owner_user_id, source_id)),
+            ("DELETE FROM knowledge_sections WHERE owner_user_id = ? AND source_id = ?",
+             (owner_user_id, source_id)),
+            ("DELETE FROM knowledge_documents WHERE owner_user_id = ? AND source_id = ?",
+             (owner_user_id, source_id)),
+        ]
+        with self._manager._lock:
+            conn = self._manager._get_connection()
+            try:
+                cursor = conn.cursor()
+                for sql, params in statements:
+                    cursor.execute(sql, params)
+                conn.commit()
+                return True
+            except Exception as e:  # noqa: BLE001 - report, never mask the caller's error
+                try:
+                    conn.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
+                logger.error(f"Database error purging partial knowledge index: {type(e).__name__}")
+                return False
+
 
 __all__ = ["KnowledgeStore"]

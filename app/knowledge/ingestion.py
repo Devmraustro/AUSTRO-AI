@@ -82,6 +82,9 @@ class IngestionPipeline:
                 owner_user_id, source_id, FAILED_STATUS, result.state or "EXTRACT",
                 error=safe, increment_retry=True,
             )
+            # A late failure (index/embed/verify) may have left derived rows behind.
+            # Remove them so a retry starts clean and nothing orphaned remains.
+            self._store.purge_partial_index(owner_user_id, source_id)
             result.status = FAILED_STATUS
             result.error = safe
         return result
