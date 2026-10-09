@@ -3,15 +3,16 @@
 - **Branch:** `main`
 - **Baseline commit:** `c8066f4ea9a97feed95a6c802e8cfbc477cba59f`
 - **Audit commits:** `c8066f4` (post-push correction pass), `f8c29ae`, `08e923a`
-- **CI:** GitHub Actions run to be triggered on push to `main`
+- **CI:** [run `37934832595`](https://github.com/Devmraustro/AUSTRO-AI/actions/runs/37934832595) on `a218fd2` — all jobs success
 - **Scope:** full local security / correctness / runtime-readiness review of the
   repository at the baseline commit. No hosting, deployment, provisioning, or
   live-service access was performed or attempted.
 - **Status:** 17 defects fixed (F-1 through F-17); residual risks R-2, R-4 and
   R-5 resolved and locally verified with regression tests; R-1 and R-3 remain
   open. The pre-existing `register_upload` async mismatch (4 failing upload
-  tests) is now fixed and verified locally (479 passed, 19 skipped, 0 failed).
-  Remote (GitHub Actions) verification of the new commit pending.
+  tests) is fixed — local suite 479 passed / 19 skipped / 0 failed, and CI run
+  `37934832595` is green on every job (Python 3.10–3.14, Bandit, PostgreSQL
+  integration, dependency audit, Docker/staging, performance, secret scan).
 
 This report does not claim the absence of vulnerabilities. Absence of findings
 is not proof of absence.
@@ -123,9 +124,29 @@ pre-existing and new assertions above.
 
 ### 2c. GitHub Actions results
 
-Pending — a new run is triggered by push of this commit. Previous run
-`37773381695` failed only at `test (3.11) :: pytest -v` on the four tests listed
-in §2a (all now fixed); its `dependency-audit`, `performance-tests` and
+Run [`37934832595`](https://github.com/Devmraustro/AUSTRO-AI/actions/runs/37934832595)
+on commit `a218fd23315cf2dd467b04629d0f5ce364dfd0d7` — status **success**
+(all jobs green; `head_sha` matches the pushed commit):
+
+| Job | Result | Duration |
+|---|---|---|
+| `test (3.10)` | success | 130s |
+| `test (3.11)` | success | 107s |
+| `test (3.12)` | success | 114s |
+| `test (3.13)` | success | 127s |
+| `test (3.14)` | success | 132s |
+| `Staging stack (compose + images)` | success | 51s |
+| `dependency-audit` | success | 19s |
+| `performance-tests` | success | 12s |
+
+Within each `test` job every step ran to `success` — none skipped: byte-compile,
+pyflakes, `Run tests` (`pytest -v`, all matrix versions), Bandit, offline smoke,
+PostgreSQL integration tests (the step's own gate requires `18 passed` with no
+`skipped`, so PG ran 18/18), evaluation regression harness (`scripts/verify.py`),
+security tests, and the TruffleHog repository secret scan.
+
+Previous run `37773381695` failed only at `test (3.11) :: pytest -v` on the four
+tests fixed in §2a; its `dependency-audit`, `performance-tests` and
 `Staging stack` jobs passed.
 
 ### 2d. Environment-dependent checks
@@ -480,10 +501,12 @@ now also asserts that it is invisible before approval and retrievable after.
   (fail-closed, exit 0), `scripts/verify.py` PASS, `smoke_test.py` PASSED,
   full pytest: **479 passed, 19 skipped, 0 failed**. The four upload/ingestion
   failures from run `37773381695` are fixed (§2a).
-- **CI verification:** Previous run `37773381695` on `f8c29ae` failed only on
-  the 4 upload tests now fixed (§2a); `dependency-audit`, `performance-tests`
-  and `Staging stack` jobs passed. A new run on the corrected commit is pending
-  and will be recorded here after it completes.
+- **CI verification:** Complete. Run `37934832595` on `a218fd2` — **all 8 jobs
+  success**: `test` (3.10/3.11/3.12/3.13/3.14, full `pytest -v` green on each),
+  `Staging stack`, `dependency-audit`, `performance-tests`. Every step inside a
+  `test` job ran (none skipped): Bandit, smoke, PostgreSQL integration
+  (18/18 passed, 0 skipped), `verify.py`, security tests, TruffleHog secret scan.
+  The previous run `37773381695` failure (4 upload tests) is resolved.
 - **Bandit:** Installed locally (1.9.4) and passing with the CI flags.
 - **Docker/PostgreSQL:** Not available locally; exercised in CI.
 
@@ -606,21 +629,26 @@ Do not weaken tests or CI to obtain green status.
 
 The audit can only be called remotely verified after:
 
-1. the corrected commit reaches GitHub ✓ (baseline `c8066f4` and correction
-   `f8c29ae` are both published)
+1. the corrected commit reaches GitHub ✓ (baseline `c8066f4`, corrections
+   `f8c29ae`, `08e923a`, and upload-contract fix `a218fd2` are all published)
 2. the CI workflow parses correctly ✓ (rewritten YAML with real newlines,
    validated with `yaml.safe_load`; every step has `run:`/`uses:`; the run
    spawned all defined jobs, not zero)
-3. all required jobs actually run ✗ — run `37773381695` started all jobs but
-   the `test` matrix cancelled 4 of 5 when 3.11 failed, and the failing job
-   skipped Bandit/smoke/PG/verify/security-steps; the 4 upload tests that
-   caused the failure are now fixed locally (§2a) and a new run is pending
-4. all required jobs pass □ — the previous blocker (4 upload tests) is fixed
-   and the full suite is 479/19/0 locally; result of the new run pending
-5. R-5 IDOR tests pass □ (pending CI — verified locally; owner_user_id enforced at SQL boundary)
-6. backup encryption + restore verification pass □ (pending CI — verified locally by 47 tests)
-7. no new High/Critical findings remain ✓ — CAUSE of run `37773381695` failure
-   (the 4 upload tests) is fixed locally; no findings were introduced by this pass
-8. CODE_AUDIT_REPORT.md matches the actual state ✓ (updated after the CI run)
+3. all required jobs actually run ✓ — run `37934832595` (on `a218fd2`)
+   executed every job and every step (none skipped), including Bandit, smoke,
+   PostgreSQL integration, `verify.py`, security tests and the secret scan
+4. all required jobs pass ✓ — run `37934832595`: all 8 jobs success
+   (`test` 3.10–3.14, `Staging stack`, `dependency-audit`, `performance-tests`);
+   the full `pytest -v` is green on all five Python versions, so the four
+   upload tests that failed in run `37773381695` now pass in CI
+5. R-5 IDOR tests pass ✓ (run `37934832595` — verified locally too;
+   owner_user_id enforced at SQL boundary)
+6. backup encryption + restore verification pass ✓ (run `37934832595` —
+   verified locally by 47 tests)
+7. no new High/Critical findings remain ✓ — Bandit exit 0 (`No issues
+   identified`) and `pip-audit` `No known vulnerabilities found` in the same
+   run; no findings were introduced by this pass
+8. CODE_AUDIT_REPORT.md matches the actual state ✓ (updated with the CI
+   evidence above)
 
 Return the final commit SHA, CI run URL, every job status, and all remaining risks.
