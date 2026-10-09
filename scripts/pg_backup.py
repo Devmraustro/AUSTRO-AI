@@ -97,19 +97,23 @@ def pg_bin_dir() -> str:
 
 
 def find_tool(name: str) -> Path:
+    """Locate a PostgreSQL client tool: `PG_BIN` first, then `PATH`.
+
+    The current working directory is deliberately never searched, so a binary
+    planted in it can never be executed with database credentials. The backup
+    image has no PG_BIN and relies on the PATH lookup.
+    """
     env = os.environ.get("PG_BIN", "")
-    candidates = []
     if env:
-        candidates.append(Path(env) / (name + ".exe"))
-        candidates.append(Path(env) / name)
-    candidates.append(Path(".") / name)
-    candidates.append(Path(name))  # on PATH
-    for c in candidates:
-        if c.exists():
-            return c
+        for candidate in (Path(env) / (name + ".exe"), Path(env) / name):
+            if candidate.is_file():
+                return candidate
+    found = shutil.which(name)
+    if found:
+        return Path(found)
     raise RuntimeError(
         f"Could not find {name}. Set PG_BIN to the PostgreSQL bin directory "
-        f"(e.g. C:\\...\\pgsql\\bin)."
+        f"or put {name} on PATH."
     )
 
 

@@ -777,10 +777,10 @@ class KnowledgeStore:
         either the full partial index or none of it, never a half-deleted one.
         The source row itself is kept so its FAILED state and error stay visible.
         """
-        scope_chunks = ("SELECT chunk_id FROM knowledge_chunks "
-                        "WHERE owner_user_id = ? AND source_id = ?")
         statements = [
-            ("DELETE FROM knowledge_citations WHERE chunk_row_id IN (" + scope_chunks + ")",
+            ("DELETE FROM knowledge_citations WHERE chunk_row_id IN ("
+             "SELECT chunk_id FROM knowledge_chunks "
+             "WHERE owner_user_id = ? AND source_id = ?)",
              (owner_user_id, source_id)),
             ("DELETE FROM knowledge_embeddings WHERE owner_user_id = ? AND source_id = ?",
              (owner_user_id, source_id)),

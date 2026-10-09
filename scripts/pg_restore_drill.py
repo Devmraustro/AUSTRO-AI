@@ -48,6 +48,7 @@ from scripts.pg_backup import (  # noqa: E402
     MANIFEST_SUFFIX,
     archive_is_encrypted,
     file_sha256,
+    find_tool,
     open_archive_sql,
     write_pgpass,
 )
@@ -61,19 +62,6 @@ CHUNK = 1024 * 1024
 EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_REFUSED = 2
-
-
-def find_tool(name: str) -> Path:
-    env = os.environ.get("PG_BIN", "")
-    candidates = []
-    if env:
-        candidates.append(Path(env) / (name + ".exe"))
-        candidates.append(Path(env) / name)
-    candidates.append(Path(name))
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    raise RuntimeError(f"Could not find {name}. Set PG_BIN to the PostgreSQL bin directory.")
 
 
 def _say(stage: str, message: str) -> None:

@@ -877,3 +877,49 @@ def test_scheduler_flag_must_be_truthy_to_pass_the_guard(monkeypatch):
     assert pg_backup.encryption_required() is False
     monkeypatch.setenv("BACKUP_ENCRYPTION_ENABLED", "true")
     assert pg_backup.encryption_required() is True
+
+
+def _fake_tool(directory: Path, name: str = "pg_dump") -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    tool = directory / name
+    tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    tool.chmod(0o755)
+    return tool
+
+
+def test_find_tool_uses_path_when_pg_bin_is_unset(monkeypatch, tmp_path):
+    """Regression: the backup image sets no PG_BIN. The old lookup checked
+    relative paths only, so a valid pg_dump on PATH was reported missing."""
+    tool = _fake_tool(tmp_path / "bin")
+    monkeypatch.delenv("PG_BIN", raising=False)
+    monkeypatch.setenv("PATH", str(tool.parent))
+    assert pg_backup.find_tool("pg_dump") == tool
+
+
+def test_find_tool_prefers_pg_bin_over_path(monkeypatch, tmp_path):
+    pinned = _fake_tool(tmp_path / "pinned")
+    _fake_tool(tmp_path / "other")
+    monkeypatch.setenv("PG_BIN", str(pinned.parent))
+    monkeypatch.setenv("PATH", str(tmp_path / "other"))
+    assert pg_backup.find_tool("pg_dump") == pinned
+
+
+def test_find_tool_never_searches_the_working_directory(monkeypatch, tmp_path):
+    """A pg_dump planted in the current directory must never be selected."""
+    _fake_tool(tmp_path / "cwd")
+    monkeypatch.chdir(tmp_path / "cwd")
+    monkeypatch.delenv("PG_BIN", raising=False)
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    with pytest.raises(RuntimeError, match="Could not find pg_dump"):
+        pg_backup.find_tool("pg_dump")
+
+
+def test_restore_drill_resolves_psql_from_path_without_pg_bin(monkeypatch, tmp_path):
+    """Regression: the drill had its own relative-only lookup, so with PG_BIN unset
+    (the backup image) the restore failed with 'Could not find psql'."""
+    from scripts import pg_restore_drill
+
+    tool = _fake_tool(tmp_path / "bin", name="psql")
+    monkeypatch.delenv("PG_BIN", raising=False)
+    monkeypatch.setenv("PATH", str(tool.parent))
+    assert pg_restore_drill.find_tool("psql") == tool

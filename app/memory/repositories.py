@@ -459,52 +459,63 @@ class MemoriesRepository(_MemoryBase):
         transaction: on any database error it is rolled back and EraseFailed is
         raised, so a partial erasure is never reported as success.
         """
+        # Every statement is a fixed literal. The scope is bound as parameters:
+        # a NULL memory_id or memory_type means "no restriction" (`? IS NULL`).
         owner = owner_user_id
-        conditions = ["owner_user_id = ?"]
-        params: list = [owner]
-        if memory_id is not None:
-            conditions.append("memory_id = ?")
-            params.append(memory_id)
-        if memory_type:
-            conditions.append("memory_type = ?")
-            params.append(memory_type)
-        where = " AND ".join(conditions)
-        in_scope = f"SELECT memory_id FROM memories WHERE {where}"
-        hist_where = f"owner_user_id = ? AND memory_id IN ({in_scope})"
-        hist_params = (owner, *params)
+        scope = (owner, memory_id, memory_id, memory_type, memory_type)
+        hist = (owner, owner, memory_id, memory_id, memory_type, memory_type)
         now = self._now()
 
         with self._manager._lock:
             conn = self._connection()
             try:
                 cursor = conn.cursor()
-                cursor.execute(f"SELECT COUNT(*) FROM memories WHERE {where}", tuple(params))
+                cursor.execute(
+                    "SELECT COUNT(*) FROM memories WHERE owner_user_id = ? "
+                    "AND (? IS NULL OR memory_id = ?) AND (? IS NULL OR memory_type = ?)",
+                    scope)
                 affected = int(cursor.fetchone()[0])
                 if affected == 0:
                     conn.rollback()
                     return 0
 
                 if hard:
-                    cursor.execute(f"DELETE FROM memory_versions WHERE {hist_where}",
-                                   hist_params)
                     cursor.execute(
-                        f"UPDATE memory_events SET memory_id = NULL WHERE {hist_where}",
-                        hist_params)
+                        "DELETE FROM memory_versions WHERE owner_user_id = ? "
+                        "AND memory_id IN (SELECT memory_id FROM memories "
+                        "WHERE owner_user_id = ? AND (? IS NULL OR memory_id = ?) "
+                        "AND (? IS NULL OR memory_type = ?))",
+                        hist)
                     cursor.execute(
-                        f"UPDATE memory_access_log SET memory_id = NULL WHERE {hist_where}",
-                        hist_params)
-                    cursor.execute(f"DELETE FROM memories WHERE {where}", tuple(params))
+                        "UPDATE memory_events SET memory_id = NULL WHERE owner_user_id = ? "
+                        "AND memory_id IN (SELECT memory_id FROM memories "
+                        "WHERE owner_user_id = ? AND (? IS NULL OR memory_id = ?) "
+                        "AND (? IS NULL OR memory_type = ?))",
+                        hist)
+                    cursor.execute(
+                        "UPDATE memory_access_log SET memory_id = NULL WHERE owner_user_id = ? "
+                        "AND memory_id IN (SELECT memory_id FROM memories "
+                        "WHERE owner_user_id = ? AND (? IS NULL OR memory_id = ?) "
+                        "AND (? IS NULL OR memory_type = ?))",
+                        hist)
+                    cursor.execute(
+                        "DELETE FROM memories WHERE owner_user_id = ? "
+                        "AND (? IS NULL OR memory_id = ?) AND (? IS NULL OR memory_type = ?)",
+                        scope)
                 else:
                     cursor.execute(
-                        f"UPDATE memory_versions SET claim = ? "
-                        f"WHERE {hist_where} AND claim != ?",
-                        (ERASED_PLACEHOLDER, *hist_params, ERASED_PLACEHOLDER))
+                        "UPDATE memory_versions SET claim = ? WHERE owner_user_id = ? "
+                        "AND memory_id IN (SELECT memory_id FROM memories "
+                        "WHERE owner_user_id = ? AND (? IS NULL OR memory_id = ?) "
+                        "AND (? IS NULL OR memory_type = ?)) AND claim != ?",
+                        (ERASED_PLACEHOLDER, *hist, ERASED_PLACEHOLDER))
                     cursor.execute(
                         "UPDATE memories SET status = 'forgotten', claim = ?, "
                         "subject = '', source_note = '', metadata_json = NULL, "
                         "event_date = NULL, hash_key = 'erased-' || CAST(memory_id AS TEXT), "
-                        f"updated_at = ?, last_used_at = NULL WHERE {where}",
-                        (ERASED_PLACEHOLDER, now, *params))
+                        "updated_at = ?, last_used_at = NULL WHERE owner_user_id = ? "
+                        "AND (? IS NULL OR memory_id = ?) AND (? IS NULL OR memory_type = ?)",
+                        (ERASED_PLACEHOLDER, now, *scope))
 
                 if audit:
                     cursor.execute(
