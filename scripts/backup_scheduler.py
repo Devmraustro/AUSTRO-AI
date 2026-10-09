@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.pg_backup import (  # noqa: E402
     DAILY_KEEP,
     MONTHLY_KEEP,
+    encryption_required,
     list_backups,
     log,
     run_backup,
@@ -107,6 +108,12 @@ def run_scheduled_backup(outdir: Path, daily: int, monthly: int) -> int:
 
 
 def main() -> int:
+    # The scheduled worker is encrypted-only. Refuse before touching the disk or
+    # starting the loop: a misconfigured container must never write plaintext.
+    if not encryption_required():
+        log("scheduler", "refusing to start: BACKUP_ENCRYPTION_ENABLED must be true "
+                         "(the scheduled worker writes AES-256-GCM archives only)")
+        return 2
     outdir = Path(os.environ.get("BACKUP_OUTDIR", "backups"))
     hour = int(os.environ.get("BACKUP_SCHEDULE_UTC_HOUR", DEFAULT_UTC_HOUR))
     minute = int(os.environ.get("BACKUP_SCHEDULE_UTC_MINUTE", DEFAULT_UTC_MINUTE))

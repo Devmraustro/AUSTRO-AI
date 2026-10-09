@@ -860,3 +860,20 @@ def test_key_with_leading_and_trailing_whitespace_bytes_is_not_corrupted(tmp_pat
     assert pg_backup._load_encryption_key() == key
     path.write_bytes(key)  # and the bare key is accepted as-is
     assert pg_backup._load_encryption_key() == key
+
+
+def test_scheduler_refuses_to_start_without_encryption(monkeypatch, tmp_path):
+    """The scheduled worker is encrypted-only: with the flag off it must exit 2
+    immediately, before creating the output directory or entering the loop."""
+    monkeypatch.delenv("BACKUP_ENCRYPTION_ENABLED", raising=False)
+    outdir = tmp_path / "must-not-be-created"
+    monkeypatch.setenv("BACKUP_OUTDIR", str(outdir))
+    assert backup_scheduler.main() == 2
+    assert not outdir.exists()
+
+
+def test_scheduler_flag_must_be_truthy_to_pass_the_guard(monkeypatch):
+    monkeypatch.setenv("BACKUP_ENCRYPTION_ENABLED", "false")
+    assert pg_backup.encryption_required() is False
+    monkeypatch.setenv("BACKUP_ENCRYPTION_ENABLED", "true")
+    assert pg_backup.encryption_required() is True
