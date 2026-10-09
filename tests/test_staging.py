@@ -201,7 +201,8 @@ class TestStagingComposeIsolation:
         mounts = staging_compose["services"]["app"]["volumes"]
         assert "knowledge_storage:/app/knowledge_storage" in mounts
         assert "logs:/app/logs" in mounts
-        assert "backups:/app/backups" in mounts
+        # The app container must NOT mount backup archives (least privilege).
+        assert not any("/app/backups" in str(m) for m in mounts)
         # compose prefixes volume names with the project name, so the project
         # name is what keeps them separate.
         assert staging_compose["name"] != prod_compose.get("name", "austro")

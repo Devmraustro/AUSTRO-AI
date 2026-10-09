@@ -710,3 +710,153 @@ def test_restore_drill_supports_encrypted_archives():
     )
     assert "open_archive_sql" in source
     assert "gzip.open(str(backup)" not in source
+
+# ==================== plaintext hygiene + fail-closed encryption ==================== #
+
+
+def _workdir(tmp_path: Path, monkeypatch) -> Path:
+    work = tmp_path / "scratch-work"
+    monkeypatch.setenv("BACKUP_WORKDIR", str(work))
+    return work
+
+
+def test_plaintext_dump_never_lands_in_the_backup_directory(env, tmp_path, monkeypatch):
+    outdir = tmp_path / "backups"
+    work = _workdir(tmp_path, monkeypatch)
+    runner = _DumpRunner()
+    assert run_backup(outdir, now=_moment(10), connect=_fake_connect,
+                      dump_runner=runner, tool=Path("pg_dump")) == 0
+    dump_target = Path(runner.calls[0]["argv"][runner.calls[0]["argv"].index("-f") + 1])
+    assert outdir.resolve() not in dump_target.resolve().parents
+    assert work.resolve() in dump_target.resolve().parents
+    # nothing plaintext-like survives in the persistent directory
+    assert not [p for p in outdir.iterdir() if p.suffix == ".part" or p.suffix == ".sql"]
+
+
+def test_plaintext_work_dir_is_private_and_removed_after_success(env, tmp_path, monkeypatch):
+    outdir = tmp_path / "backups"
+    work = _workdir(tmp_path, monkeypatch)
+    runner = _DumpRunner()
+    assert run_backup(outdir, now=_moment(10), connect=_fake_connect,
+                      dump_runner=runner, tool=Path("pg_dump")) == 0
+    assert work.is_dir() and list(work.iterdir()) == []
+    if os.name != "nt":
+        assert stat.S_IMODE(os.stat(work).st_mode) == 0o755  # parent created by us
+    dump_dir = Path(runner.calls[0]["argv"][runner.calls[0]["argv"].index("-f") + 1]).parent
+    assert not dump_dir.exists()
+
+
+def test_plaintext_work_dir_is_removed_after_pg_dump_failure(env, tmp_path, monkeypatch):
+    outdir = tmp_path / "backups"
+    work = _workdir(tmp_path, monkeypatch)
+    runner = _DumpRunner(returncode=1, stderr="pg_dump: error")
+    assert run_backup(outdir, now=_moment(10), connect=_fake_connect,
+                      dump_runner=runner, tool=Path("pg_dump")) == 1
+    assert list(work.iterdir()) == []
+
+
+def test_plaintext_work_dir_is_removed_after_verification_failure(env, tmp_path, monkeypatch):
+    outdir = tmp_path / "backups"
+    work = _workdir(tmp_path, monkeypatch)
+
+    def _always_fail(archive, content_sha, archive_sha, key=None, **_):
+        raise AssertionError("archive sha256 mismatch after publish")
+
+    monkeypatch.setattr(pg_backup, "verify_archive", _always_fail)
+    assert run_backup(outdir, now=_moment(10), connect=_fake_connect,
+                      dump_runner=_DumpRunner(), tool=Path("pg_dump")) == 1
+    assert list(work.iterdir()) == []
+    assert list_backups(outdir) == []
+
+
+def test_stale_plaintext_from_killed_run_is_purged(env, tmp_path, monkeypatch):
+    outdir = tmp_path / "backups"
+    outdir.mkdir()
+    work = _workdir(tmp_path, monkeypatch)
+    legacy = outdir / f".{BACKUP_PREFIX}20251201_020000.sql.part"
+    legacy.write_text("PLAINTEXT SECRET DUMP", encoding="utf-8")
+    old_work = work / f"{pg_backup.WORK_PREFIX}abandoned"
+    old_work.mkdir(parents=True)
+    (old_work / "dump.sql").write_text("PLAINTEXT SECRET DUMP", encoding="utf-8")
+    ancient = (_moment(10) - dt.timedelta(hours=5)).timestamp()
+    os.utime(old_work, (ancient, ancient))
+    assert run_backup(outdir, now=_moment(10), connect=_fake_connect,
+                      dump_runner=_DumpRunner(), tool=Path("pg_dump")) == 0
+    assert not legacy.exists()
+    assert not old_work.exists()
+    assert list(work.iterdir()) == []
+
+
+def test_fresh_foreign_work_dir_is_not_purged(env, tmp_path, monkeypatch):
+    outdir = tmp_path / "backups"
+    outdir.mkdir()
+    work = _workdir(tmp_path, monkeypatch)
+    live = work / f"{pg_backup.WORK_PREFIX}concurrent"
+    live.mkdir(parents=True)
+    assert run_backup(outdir, now=_moment(10), connect=_fake_connect,
+                      dump_runner=_DumpRunner(), tool=Path("pg_dump")) == 0
+    assert live.is_dir()
+
+
+def test_encryption_required_without_key_fails_before_any_database_contact(
+        env, tmp_path, monkeypatch):
+    monkeypatch.setenv("BACKUP_ENCRYPTION_ENABLED", "true")
+    monkeypatch.delenv("BACKUP_ENCRYPTION_KEY_FILE", raising=False)
+    _workdir(tmp_path, monkeypatch)
+    calls = {"connect": 0}
+
+    def _counting_connect(**kwargs):
+        calls["connect"] += 1
+        return _fake_connect(**kwargs)
+
+    runner = _DumpRunner()
+    assert run_backup(tmp_path / "b", now=_moment(10), connect=_counting_connect,
+                      dump_runner=runner, tool=Path("pg_dump")) == 1
+    assert calls["connect"] == 0 and runner.calls == []
+    assert not (tmp_path / "scratch-work").exists() or not list(
+        (tmp_path / "scratch-work").iterdir())
+
+
+def test_encryption_required_with_invalid_key_fails_before_dump(env, tmp_path, monkeypatch):
+    monkeypatch.setenv("BACKUP_ENCRYPTION_ENABLED", "true")
+    key_file = tmp_path / "short.key"
+    key_file.write_bytes(b"too-short")
+    monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", str(key_file))
+    _workdir(tmp_path, monkeypatch)
+    runner = _DumpRunner()
+    assert run_backup(tmp_path / "b", now=_moment(10), connect=_fake_connect,
+                      dump_runner=runner, tool=Path("pg_dump")) == 1
+    assert runner.calls == []
+    assert list_backups(tmp_path / "b") == []
+
+
+def test_encrypted_run_publishes_no_plaintext_and_declares_encryption(env, tmp_path, monkeypatch):
+    key = bytes(range(32))
+    key_file = tmp_path / "backup.key"
+    key_file.write_bytes(key)
+    monkeypatch.setenv("BACKUP_ENCRYPTION_ENABLED", "true")
+    monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", str(key_file))
+    _workdir(tmp_path, monkeypatch)
+    outdir = tmp_path / "backups"
+    assert run_backup(outdir, now=_moment(10), connect=_fake_connect,
+                      dump_runner=_DumpRunner(), tool=Path("pg_dump")) == 0
+    record = list_backups(outdir)[0]
+    blob = record.archive.read_bytes()
+    assert blob[:1] == b"\x01"                      # encrypted container version byte
+    assert b"AUSTRO dump" not in blob and b"CREATE TABLE" not in blob
+    manifest = json.loads(record.manifest.read_text(encoding="utf-8"))
+    assert manifest["encryption"]["enabled"] is True
+    assert key.hex() not in record.manifest.read_text(encoding="utf-8")
+
+
+def test_key_with_leading_and_trailing_whitespace_bytes_is_not_corrupted(tmp_path, monkeypatch):
+    """A random key may start/end with \\r, \\t, space or \\n. Only the single
+    trailing line terminator may be removed; stripping key bytes is corruption."""
+    key = b"\r" + bytes(range(1, 31)) + b"\t"  # 32 bytes, both ends whitespace
+    assert len(key) == 32
+    path = tmp_path / "ws.key"
+    path.write_bytes(key + b"\n")
+    monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", str(path))
+    assert pg_backup._load_encryption_key() == key
+    path.write_bytes(key)  # and the bare key is accepted as-is
+    assert pg_backup._load_encryption_key() == key

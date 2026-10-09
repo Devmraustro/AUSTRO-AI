@@ -84,7 +84,7 @@ services:
     volumes:
       - knowledge_storage:/app/knowledge_storage
       - logs:/app/logs
-      - backups:/app/backups
+      # The app container has no access to backup archives (see backup below).
     networks:
       - staging
     restart: unless-stopped
@@ -119,7 +119,26 @@ services:
       BACKUP_DAILY_KEEP: ${BACKUP_DAILY_KEEP:-7}
       BACKUP_MONTHLY_KEEP: ${BACKUP_MONTHLY_KEEP:-30}
       BACKUP_RETRY_MINUTES: ${BACKUP_RETRY_MINUTES:-60}
+      # Encryption is mandatory for staging backups too. The key is a read-only
+      # secret file; a missing/invalid key fails closed before any dump.
+      BACKUP_ENCRYPTION_ENABLED: "true"
+      BACKUP_ENCRYPTION_KEY_FILE: /run/secrets/staging_backup_encryption_key
+      BACKUP_WORKDIR: /var/tmp/austro-backup-work
+    secrets:
+      - staging_backup_encryption_key
+    # Plaintext dumps live only in this tmpfs work directory and the root
+    # filesystem is read-only. The backups volume never receives plaintext.
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
     volumes:
+      - type: tmpfs
+        target: /var/tmp/austro-backup-work
+        tmpfs:
+          size: ${BACKUP_WORKDIR_TMPFS_BYTES:-4294967296}
+          mode: 1777
       - backups:/app/backups
     networks:
       - staging
@@ -158,3 +177,9 @@ volumes:
 networks:
   staging:
     name: austro-staging-network
+
+# Staging-only backup encryption key. Lives OUTSIDE the repository and is never
+# shared with production (a distinct key file path is required).
+secrets:
+  staging_backup_encryption_key:
+    file: ${STAGING_BACKUP_ENCRYPTION_KEY_FILE:-./secrets/staging_backup_encryption_key}

@@ -163,6 +163,11 @@ jobs:
 
       - name: Validate the staging and production compose files
         run: |
+          mkdir -p secrets
+          head -c 32 /dev/urandom > secrets/backup_encryption_key
+          head -c 32 /dev/urandom > secrets/staging_backup_encryption_key
+          chmod 0400 secrets/*
+          docker compose -f docker-compose.yml --env-file .env config -q
           docker compose -f docker-compose.staging.yml -p austro-staging \
             --env-file .env.staging config -q
           docker compose -f docker-compose.staging.yml -p austro-staging \
@@ -233,6 +238,108 @@ jobs:
             echo "ERROR: an unidentifiable image was not refused"; exit 1
           fi
           echo "rollback guards: OK"
+
+  # ----------------------------------------------------------------------- #
+  # Encrypted backup + disposable restore, proven end to end in CI.
+  # Everything is created by this job: an ephemeral postgres:16 service, a
+  # random 32-byte key generated on the runner, and two disposable databases.
+  # No developer secret file, no pre-provisioned database, no paid service.
+  # ----------------------------------------------------------------------- #
+  backup-integration:
+    name: Encrypted backup and disposable restore (PostgreSQL 16)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: austro_ai_ci_source
+          POSTGRES_USER: austro
+          POSTGRES_PASSWORD: austro_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U austro -d austro_ai_ci_source"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      CI_DB_HOST: 127.0.0.1
+      CI_DB_PORT: "5432"
+      CI_DB_ADMIN_USER: austro
+      CI_DB_ADMIN_PASSWORD: austro_ci
+      CI_SOURCE_DB: austro_ai_ci_source
+      CI_RESTORE_TARGET: austro_ai_restore_ci
+      CI_APP_ROLE: austro_app
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies (fixture helper needs psycopg2)
+        run: pip install -r requirements-dev.txt
+
+      - name: Generate ephemeral secrets on the runner (values never printed)
+        run: |
+          set -euo pipefail
+          umask 077
+          D="${RUNNER_TEMP}/backup-ci"
+          rm -rf "$D"
+          mkdir -p "$D/keys" "$D/out"
+          head -c 32 /dev/urandom > "$D/keys/backup.key"
+          head -c 32 /dev/urandom > "$D/keys/wrong.key"
+          chmod 0400 "$D/keys/backup.key" "$D/keys/wrong.key"
+          test "$(stat -c %s "$D/keys/backup.key")" -eq 32
+          test "$(stat -c %s "$D/keys/wrong.key")" -eq 32
+          APP_PW="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
+          echo "::add-mask::$APP_PW"
+          {
+            echo "BACKUP_CI_DIR=$D"
+            echo "CI_APP_PASSWORD=$APP_PW"
+          } >> "$GITHUB_ENV"
+          echo "ephemeral 32-byte backup key and wrong key generated (not printed)"
+
+      - name: Build the real backup image
+        run: docker build -f Dockerfile.backup -t austro-backup:ci .
+
+      - name: The built image imports cryptography and psycopg2
+        run: |
+          set -euo pipefail
+          out="$(docker run --rm --entrypoint python austro-backup:ci -c 'import cryptography, psycopg2; from cryptography.hazmat.primitives.ciphers.aead import AESGCM; print("cryptography", cryptography.__version__, "psycopg2", psycopg2.__version__, "AESGCM ok")')"
+          echo "$out"
+          echo "$out" | grep -q "^cryptography .* AESGCM ok$"
+
+      - name: Seed disposable source database, restore target and app role
+        run: python scripts/ci_backup_fixture.py seed --expected "$BACKUP_CI_DIR/expected.json"
+
+      - name: Encrypted backup (pg_dump -> AES-256-GCM, key from read-only secret)
+        run: bash scripts/ci_backup_integration.sh backup
+
+      - name: Wrong key is refused before any database change
+        run: bash scripts/ci_backup_integration.sh restore-wrong-key
+
+      - name: Tampered archive is refused before any database change
+        run: bash scripts/ci_backup_integration.sh restore-tampered
+
+      - name: Unsafe restore targets and missing authorisation are refused
+        run: bash scripts/ci_backup_integration.sh restore-refused
+
+      - name: Restore into the disposable database with the correct key
+        run: bash scripts/ci_backup_integration.sh restore
+
+      - name: Remove ephemeral keys and working files
+        if: always()
+        run: |
+          if [ -n "${BACKUP_CI_DIR:-}" ]; then
+            bash scripts/ci_backup_integration.sh cleanup
+          else
+            echo "nothing to clean: secrets step did not run"
+          fi
+          if [ -n "${BACKUP_CI_DIR:-}" ] && [ -e "$BACKUP_CI_DIR" ]; then
+            echo "ERROR: ephemeral directory still present"; exit 1
+          fi
 
   dependency-audit:
     runs-on: ubuntu-latest

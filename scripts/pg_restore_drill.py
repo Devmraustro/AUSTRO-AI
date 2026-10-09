@@ -1,51 +1,66 @@
-"""
-AUSTRO AI - Real PostgreSQL restore drill.
+"""AUSTRO AI - PostgreSQL restore drill (DESTRUCTIVE, disposable target only).
 
-Restores a backup produced by scripts/pg_backup.py onto the configured
-PostgreSQL instance: verifies integrity, drops & recreates the target database,
-re-applies the SQL backup, then validates schema (table count) and row counts
-against the recorded manifest. Finally re-connects through the application
-DatabaseManager and confirms the application can query the restored DB.
+Restores a backup produced by scripts/pg_backup.py into an EXPLICIT, disposable
+target database and verifies it. Plain gzip and AES-256-GCM encrypted archives
+are both supported.
 
-Both plain gzip and AES-256-GCM encrypted archives are supported: the container
-is detected from its version byte, decrypted, and gunzipped on the fly, so the
-drill never needs the dump to fit in memory.
+Execution order (each step fails closed before the next):
+
+  1. Refuse unless every safety rule in scripts/restore_safety.py passes:
+     explicit RESTORE_TARGET_DB (must contain "restore", must not be DB_NAME),
+     exact RESTORE_CONFIRM_DESTRUCTIVE=DROP-AND-RESTORE:<target>, and explicit
+     RESTORE_ADMIN_USER / RESTORE_ADMIN_PASSWORD. No database is touched.
+  2. Authenticate the archive end to end: manifest/archive checksums, key
+     validation and decryption, decompression, and content SHA-256. No database
+     is touched. A wrong key or any tampered byte stops the drill here.
+  3. Drop and recreate the target (owner DB_USER) as the administrative role.
+  4. Stream the verified SQL into the target with psql (ON_ERROR_STOP=1) as the
+     administrative role. Grant the application role access when it differs.
+  5. Validate table set, row counts and connectivity (as the application role)
+     against the manifest.
 
 Usage:
-    python scripts/pg_restore_drill.py <backup.sql.gz> <manifest.json>
-    or:  python scripts/pg_restore_drill.py <backup.sql.gz>   (manifest next to it)
+    RESTORE_TARGET_DB=austro_ai_restore_drill \\
+    RESTORE_CONFIRM_DESTRUCTIVE=DROP-AND-RESTORE:austro_ai_restore_drill \\
+    RESTORE_ADMIN_USER=... RESTORE_ADMIN_PASSWORD=... \\
+    python scripts/pg_restore_drill.py <backup.sql.gz> [manifest.json]
 
-Exit code 0 on success, non-zero on failure.
+Exit code 0 on success, non-zero on failure. Exit code 2 means a safety rule
+refused the request before any archive or database work was done.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
-
-# Force the PostgreSQL backend for the application-connection step. This must
-# happen before the app modules are imported: they read settings at import time.
-os.environ["DB_ENGINE"] = "postgresql"
+from typing import Callable, Dict, Mapping, Optional, Tuple
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from app.config.settings import settings  # noqa: E402
-from app.database.connection import DatabaseManager  # noqa: E402
 from scripts.pg_backup import (  # noqa: E402
     ARCHIVE_SUFFIX,
     MANIFEST_SUFFIX,
     archive_is_encrypted,
     file_sha256,
     open_archive_sql,
+    write_pgpass,
+)
+from scripts.restore_safety import (  # noqa: E402
+    RestoreRefused,
+    validate_restore_request,
+    verify_backup_before_restore,
 )
 
 CHUNK = 1024 * 1024
+EXIT_OK = 0
+EXIT_FAILED = 1
+EXIT_REFUSED = 2
 
 
 def find_tool(name: str) -> Path:
@@ -55,182 +70,255 @@ def find_tool(name: str) -> Path:
         candidates.append(Path(env) / (name + ".exe"))
         candidates.append(Path(env) / name)
     candidates.append(Path(name))
-    for c in candidates:
-        if c.exists():
-            return c
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
     raise RuntimeError(f"Could not find {name}. Set PG_BIN to the PostgreSQL bin directory.")
 
 
-def dsn_env(superuser: bool = False):
+def _say(stage: str, message: str) -> None:
+    print(f"[{stage}] {message}", flush=True)
+
+
+def _psycopg2_connect(**kwargs):
+    import psycopg2  # imported lazily so pure helpers stay import-safe
+
+    return psycopg2.connect(**kwargs)
+
+
+def _pg_conn_args(env: Mapping[str, str]) -> Dict[str, str]:
     return {
-        "PGHOST": os.environ.get("DB_HOST", "127.0.0.1"),
-        "PGPORT": os.environ.get("DB_PORT", "5432"),
-        "PGDATABASE": os.environ.get("DB_NAME", "austro_ai") if not superuser else "postgres",
-        "PGUSER": "postgres" if superuser else os.environ.get("DB_USER", "austro"),
+        "host": env.get("DB_HOST", "127.0.0.1"),
+        "port": env.get("DB_PORT", "5432"),
     }
 
 
-def _run_psql(dbname: str, stream) -> "subprocess.CompletedProcess[bytes]":
-    """Stream the decrypted SQL into psql without buffering it in memory."""
-    env = {**os.environ, **dsn_env(superuser=False)}
-    env["PGDATABASE"] = dbname
-    env["PGCLIENTENCODING"] = "UTF8"
-    psql = find_tool("psql")
-    proc = subprocess.Popen(
-        [str(psql), "-h", dsn_env(False)["PGHOST"], "-p", dsn_env(False)["PGPORT"],
-         "-U", dsn_env(False)["PGUSER"], "-v", "ON_ERROR_STOP=1", "-d", dbname],
-        stdin=stream, env=env,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    out, err = proc.communicate(timeout=600)
-    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+def _run_psql(
+    dbname: str,
+    stream,
+    *,
+    env: Mapping[str, str],
+    user: str,
+    pgpass: Path,
+    runner: Optional[Callable[..., "subprocess.CompletedProcess[bytes]"]] = None,
+) -> "subprocess.CompletedProcess[bytes]":
+    """Stream SQL into psql. The password reaches libpq only through PGPASSFILE."""
+    if runner is not None:
+        return runner(dbname, stream)
+    conn = _pg_conn_args(env)
+    psql_env = {
+        **{k: v for k, v in os.environ.items() if k not in ("PGPASSWORD",)},
+        "PGHOST": conn["host"],
+        "PGPORT": conn["port"],
+        "PGDATABASE": dbname,
+        "PGUSER": user,
+        "PGPASSFILE": str(pgpass),
+        "PGCLIENTENCODING": "UTF8",
+    }
+    # psql reads the verified SQL from its stdin pipe. The decrypted stream is a
+    # Python object without a file descriptor, so it is copied in bounded
+    # chunks. stderr goes to a temp file so a noisy psql cannot deadlock on a
+    # full pipe while we are still writing stdin.
+    with tempfile.TemporaryFile() as err_file:
+        proc = subprocess.Popen(
+            [str(find_tool("psql")), "-h", conn["host"], "-p", conn["port"],
+             "-U", user, "-v", "ON_ERROR_STOP=1", "-d", dbname, "--no-password"],
+            stdin=subprocess.PIPE, env=psql_env,
+            stdout=subprocess.DEVNULL, stderr=err_file,
+        )
+        try:
+            for block in iter(lambda: stream.read(CHUNK), b""):
+                proc.stdin.write(block)
+        except BrokenPipeError:
+            pass  # psql exited early; its exit code and stderr decide the outcome
+        finally:
+            try:
+                proc.stdin.close()
+            except BrokenPipeError:
+                pass
+        returncode = proc.wait(timeout=1800)
+        err_file.seek(0)
+        err = err_file.read()
+    return subprocess.CompletedProcess(proc.args, returncode, b"", err)
 
 
-def _recreate_database(psycopg2, isolation_autocommit, dbname: str, owner: str) -> None:
-    adm = psycopg2.connect(
-        host=dsn_env(True)["PGHOST"], port=dsn_env(True)["PGPORT"],
-        dbname="postgres", user="postgres", password=os.environ.get("DB_PASSWORD", ""),
-    )
-    adm.set_isolation_level(isolation_autocommit)
-    with adm.cursor() as cur:
-        cur.execute(f'DROP DATABASE IF EXISTS "{dbname}" WITH (FORCE)')
-        cur.execute(f'CREATE DATABASE "{dbname}" OWNER "{owner}"')
-    adm.close()
-
-
-def main() -> int:
-    import psycopg2
+def _recreate_database(conn_factory, target: str, owner: str) -> None:
+    from psycopg2 import sql
     from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
-    if len(sys.argv) < 2:
-        print(f"usage: pg_restore_drill.py <backup{ARCHIVE_SUFFIX}> [{MANIFEST_SUFFIX}]")
-        return 1
-    backup = Path(sys.argv[1])
-    manifest_path = Path(sys.argv[2]) if len(sys.argv) > 2 else None
-    if manifest_path is None:
-        manifest_path = backup.with_name(backup.name.replace(ARCHIVE_SUFFIX, MANIFEST_SUFFIX))
-    if not backup.exists() or not manifest_path.exists():
-        print("backup or manifest not found")
-        return 1
-
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    db = os.environ.get("DB_NAME", "austro_ai")
-    owner = os.environ.get("DB_USER", "austro")
-
-    encrypted = archive_is_encrypted(backup)
-    declared = bool((manifest.get("encryption") or {}).get("enabled"))
-    if declared and not encrypted:
-        print("integrity FAILED: manifest declares encryption but archive is not encrypted")
-        return 1
-    if encrypted and not declared:
-        print("integrity FAILED: archive is encrypted but manifest does not declare it")
-        return 1
-
-    print(f"[1/6] Integrity check of {backup.name}"
-          f"{' (encrypted)' if encrypted else ''}")
-    expected_archive_sha = manifest.get("archive_sha256")
-    if expected_archive_sha:
-        actual_archive_sha = file_sha256(backup)
-        if actual_archive_sha != expected_archive_sha:
-            print("integrity FAILED: archive sha256 mismatch")
-            return 1
-        print("      archive sha256 matches manifest")
-
-    # Stream the plaintext SQL through the same decrypt/decompress path the
-    # backup uses, so the checksum proves the *content* survived encryption.
-    digest = hashlib.sha256()
+    admin = conn_factory(dbname="postgres")
     try:
-        with open_archive_sql(backup) as handle:
-            for chunk in iter(lambda: handle.read(CHUNK), b""):
-                digest.update(chunk)
-    except ValueError as exc:
-        print(f"integrity FAILED: {exc}")
-        return 1
-    if digest.hexdigest() != manifest["checksum_sha256"]:
-        print("integrity FAILED: content checksum mismatch")
-        return 1
-    print("      decompressed SQL sha256 matches manifest")
+        admin.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+        with admin.cursor() as cur:
+            cur.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)")
+                        .format(sql.Identifier(target)))
+            cur.execute(sql.SQL("CREATE DATABASE {} OWNER {}")
+                        .format(sql.Identifier(target), sql.Identifier(owner)))
+    finally:
+        admin.close()
 
-    print("[2/6] Verify SQL parses by applying to a disposable database")
-    try_db = f"{db}_restore_probe"
-    _recreate_database(psycopg2, ISOLATION_LEVEL_AUTOCOMMIT, try_db, owner)
-    with open_archive_sql(backup) as stream:
-        p = _run_psql(try_db, stream)
-    if p.returncode != 0:
-        print("probe apply FAILED:", p.stderr[-2000:].decode("utf-8", errors="replace"))
-        return 1
-    print("      disposable apply exit=0 (SQL backups cleanly)")
 
-    print(f"[3/6] Drop + recreate target database {db}")
-    _recreate_database(psycopg2, ISOLATION_LEVEL_AUTOCOMMIT, db, owner)
-    print("      dropped + recreated")
+def _grant_application_role(conn_factory, target: str, app_role: str) -> None:
+    from psycopg2 import sql
 
-    print(f"[4/6] Restore SQL into {db}")
-    with open_archive_sql(backup) as stream:
-        p = _run_psql(db, stream)
-    if p.returncode != 0:
-        print("restore FAILED:", p.stderr[-2000:].decode("utf-8", errors="replace"))
-        return 1
+    conn = conn_factory(dbname=target)
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
+                sql.Identifier(target), sql.Identifier(app_role)))
+            cur.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(
+                sql.Identifier(app_role)))
+            cur.execute(sql.SQL(
+                "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {}"
+            ).format(sql.Identifier(app_role)))
+            cur.execute(sql.SQL(
+                "GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO {}"
+            ).format(sql.Identifier(app_role)))
+    finally:
+        conn.close()
 
-    print("[5/6] Validate schema + row counts against manifest")
-    c = psycopg2.connect(
-        host=dsn_env(False)["PGHOST"], port=dsn_env(False)["PGPORT"], dbname=db,
-        user=dsn_env(False)["PGUSER"], password=os.environ.get("DB_PASSWORD", ""),
-    )
-    c.autocommit = True
-    with c.cursor() as cur:
-        cur.execute(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema='public' AND table_type='BASE TABLE' ORDER BY table_name"
+
+def _validate_restored(conn_factory, manifest: Mapping, target: str) -> Tuple[int, int]:
+    """Table set, row counts and connectivity as the application role."""
+    conn = conn_factory(dbname=target)
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            if cur.fetchone()[0] != 1:
+                raise AssertionError("connectivity probe returned an unexpected value")
+            cur.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema='public' AND table_type='BASE TABLE' ORDER BY table_name"
+            )
+            restored_tables = [r[0] for r in cur.fetchall()]
+            restored_counts: Dict[str, int] = {}
+            for table in restored_tables:
+                cur.execute(f'SELECT count(*) FROM "{table}"')
+                restored_counts[table] = int(cur.fetchone()[0])
+    finally:
+        conn.close()
+
+    expected = dict(manifest.get("row_counts") or {})
+    if set(restored_tables) != set(expected):
+        raise AssertionError(
+            f"table mismatch missing={sorted(set(expected) - set(restored_tables))} "
+            f"extra={sorted(set(restored_tables) - set(expected))}"
         )
-        restored_tables = [r[0] for r in cur.fetchall()]
-        restored_counts = {}
-        for t in restored_tables:
-            try:
-                cur.execute(f'SELECT count(*) FROM "{t}"')
-                restored_counts[t] = int(cur.fetchone()[0])
-            except Exception:
-                restored_counts[t] = -1
-    c.close()
-    expected_tables = set(manifest["row_counts"].keys())
-    if set(restored_tables) != expected_tables:
-        missing = expected_tables - set(restored_tables)
-        extra = set(restored_tables) - expected_tables
-        raise AssertionError(f"table mismatch missing={missing} extra={extra}")
     mismatches = {
-        t: (manifest["row_counts"].get(t), restored_counts.get(t))
-        for t in expected_tables
-        if manifest["row_counts"].get(t) != restored_counts.get(t)
+        t: (expected[t], restored_counts.get(t))
+        for t in expected
+        if expected[t] != restored_counts.get(t)
     }
     if mismatches:
         raise AssertionError(f"row-count mismatches: {mismatches}")
     total = sum(v for v in restored_counts.values() if v > 0)
-    print(f"      tables={len(restored_tables)} total_rows={total} ALL ROW COUNTS MATCH")
+    return len(restored_tables), total
 
-    print("[6/6] Application reconnect (DatabaseManager against restored DB)")
-    # `settings` is a module-level singleton resolved at import time, so
-    # mutating os.environ here would NOT repoint DatabaseManager. Fail loudly
-    # instead of reporting a pass against the wrong database.
-    if (settings.db_name or "austro_ai") != db:
-        raise AssertionError(
-            f"DatabaseManager would validate settings.db_name="
-            f"{settings.db_name!r}, not the restored {db!r}"
+
+def run_restore_drill(
+    backup: Path,
+    manifest_path: Path,
+    env: Optional[Mapping[str, str]] = None,
+    *,
+    connect: Optional[Callable[..., object]] = None,
+    psql_runner: Optional[Callable[..., object]] = None,
+) -> int:
+    env = dict(os.environ if env is None else env)
+    connect = connect or _psycopg2_connect
+    app_db = env.get("DB_NAME") or None
+    app_role = env.get("DB_USER", "austro")
+
+    # 1. Safety rules (no I/O against the database or the archive).
+    try:
+        target, admin_user, admin_password = validate_restore_request(
+            env, app_db=app_db
         )
-    mgr = DatabaseManager()
-    conn = mgr._get_connection()
-    with conn.cursor() as cur:
-        cur.execute("SELECT count(*) FROM information_schema.tables WHERE table_schema='public'")
-        n_tables = int(cur.fetchone()[0])
-        cur.execute("SELECT count(*) FROM users")
-        n_users = int(cur.fetchone()[0])
-    conn.commit()
-    mgr._close_connection()
-    print(f"      app manager query OK: tables={n_tables}, users={n_users}")
-    if n_users != manifest["row_counts"].get("users", n_users):
-        raise AssertionError("users row count mismatch after app reconnect")
+    except RestoreRefused as exc:
+        _say("refused", f"{exc}. No archive or database work was performed.")
+        return EXIT_REFUSED
 
-    print("\nRESTORE DRILL: ALL CHECKS PASSED")
-    return 0
+    if not backup.is_file() or not manifest_path.is_file():
+        _say("refused", "backup or manifest not found. Nothing was changed.")
+        return EXIT_REFUSED
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    # 2. Archive authentication BEFORE any destructive database operation.
+    _say("1/5", f"authenticating {backup.name}"
+                f"{' (encrypted)' if archive_is_encrypted(backup) else ''}")
+    try:
+        verify_backup_before_restore(
+            backup, manifest,
+            archive_is_encrypted=archive_is_encrypted,
+            file_sha256=file_sha256,
+            open_sql=open_archive_sql,
+            chunk=CHUNK,
+        )
+    except Exception as exc:  # noqa: BLE001 - IntegrityError, missing/invalid key, I/O
+        _say("refused", f"integrity FAILED: {type(exc).__name__}: {exc}. "
+                        "The target database was NOT modified.")
+        return EXIT_FAILED
+    _say("1/5", "archive, key, decompression and content checksum verified")
+
+    def conn_factory(dbname: str, *, user: str = admin_user, password: str = admin_password):
+        args = _pg_conn_args(env)
+        return connect(dbname=dbname, user=user, password=password, **args)
+
+    with tempfile.TemporaryDirectory(prefix="austro-restore-") as tmp:
+        pgpass = write_pgpass(Path(tmp), env.get("DB_HOST", "127.0.0.1"),
+                              env.get("DB_PORT", "5432"), "*", admin_user, admin_password)
+        try:
+            _say("2/5", f"drop and recreate target '{target}' (owner {app_role})")
+            _recreate_database(conn_factory, target, app_role)
+
+            _say("3/5", f"restore verified SQL into '{target}' as administrative role")
+            with open_archive_sql(backup) as stream:
+                proc = _run_psql(target, stream, env=env, user=admin_user,
+                                 pgpass=pgpass, runner=psql_runner)
+            if proc.returncode != 0:
+                err = (proc.stderr or b"")
+                if isinstance(err, bytes):
+                    err = err.decode("utf-8", errors="replace")
+                _say("error", f"restore FAILED (psql exit={proc.returncode}): {err[-800:]}")
+                return EXIT_FAILED
+
+            if app_role and app_role != admin_user:
+                _say("3/5", f"grant application role '{app_role}' access")
+                _grant_application_role(conn_factory, target, app_role)
+
+            _say("4/5", "validate table set, row counts and connectivity")
+            tables, total = _validate_restore_as_app(
+                connect, env, manifest, target, app_role
+            )
+            _say("4/5", f"tables={tables} total_rows={total} ALL ROW COUNTS MATCH")
+        except Exception as exc:  # noqa: BLE001 - any failure is reported, fail closed
+            _say("error", f"restore drill FAILED: {type(exc).__name__}: {exc}")
+            return EXIT_FAILED
+
+    _say("5/5", "RESTORE DRILL: ALL CHECKS PASSED")
+    return EXIT_OK
+
+
+def _validate_restore_as_app(connect, env, manifest, target, app_role):
+    password = env.get("DB_PASSWORD", "")
+
+    def app_factory(dbname: str):
+        return connect(dbname=dbname, user=app_role, password=password,
+                       **_pg_conn_args(env))
+
+    return _validate_restored(app_factory, manifest, target)
+
+
+def main(argv: Optional[list] = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args:
+        print(f"usage: pg_restore_drill.py <backup{ARCHIVE_SUFFIX}> [{MANIFEST_SUFFIX}]")
+        return EXIT_REFUSED
+    backup = Path(args[0])
+    manifest_path = (Path(args[1]) if len(args) > 1 else
+                     backup.with_name(backup.name.replace(ARCHIVE_SUFFIX, MANIFEST_SUFFIX)))
+    return run_restore_drill(backup, manifest_path)
 
 
 if __name__ == "__main__":
