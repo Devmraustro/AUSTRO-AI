@@ -35,7 +35,7 @@ packing, security boundaries, limits, observability and tests.
 | Module          | Responsibility |
 |-----------------|----------------|
 | `models.py`     | Constants (15 `MEMORY_TYPES`, confidence/scope/provenance/consent/decay/status/action), DTOs (`MemoryItem`, `MemoryCandidate`, `MemoryDecision`, `MemoryEventRecord`, `MemoryAccessRecord`, `MemoryPrefs`, `TaskContext`, `MemoryContextPack`), helpers `normalize_text`, `build_hash_key`, `subject_key`; `ORIGIN_KNOWLEDGE_DOCUMENT`. |
-| `repositories.py`| `MemoryStore` aggregate: memories (create/get/by_hash/find_slot/list/search/counts/update/hash/touch/confirm/status/forget/resurrect/clear/export/recent-used-id), versions, events, access log, prefs. |
+| `repositories.py`| `MemoryStore` aggregate: memories (create/get/by_hash/find_slot/list/search/counts/update/hash/touch/confirm/status/erase/forget/delete/clear/export/recent-used-id). `erase()` is the single erasure path: one transaction, owner-bound, all-or-nothing (`EraseFailed` on any database error), versions, events, access log, prefs. |
 | `write_gate.py` | `MemoryWriteGate`: structural validation, origin isolation, sensitive check, provenance↔confidence matrix, small-talk rejection, hash dedup, §21 conflict resolution, `to_item()`. |
 | `extractors.py` | `CandidateExtractor`: Arabic+English typed rules (preference/gpal/habit/...) with 4-candidate cap, clause bounds, typed subject/claim capture; `from_conversation` / `derive_event` / `imported_profile` / `confirmed_fact` helpers. |
 | `retrieval.py`  | `MemoryRetrieval`: bounded ranking (importance/confidence/recency/lexical relevance), low-confidence gating, instruction boost, `last_used_at` touch, access logging, budget-capped pack. |
@@ -60,9 +60,22 @@ Runs idempotently after `KNOWLEDGE_V1` in `app/database/migrations.py`:
 - `memory_access_log` — every retrieval (query, memory ids, `top_k`) for
   observability.
 
-Soft deletion (`forgotten`) is used for clear/forget/delete so audit history
-survives; re-learning the exact same statement reactivates the old row instead
-of violating the UNIQUE hash.
+Erasure (one transaction, see `MemoriesRepository.erase`):
+
+- **forget / clear / rejected pending item** keep a content-free tombstone:
+  status `forgotten`; claim replaced by `(forgotten - content redacted)`;
+  subject, source note, metadata and event date cleared; dedup hash replaced by
+  the unique key `erased-<memory_id>`; version claims redacted (version numbers
+  kept). A typed clear touches only its type and that type's history.
+- **delete** removes the row and its version history, detaches audit and access
+  rows (`memory_id` set to NULL), and writes an audit event without a memory id.
+- The audit event is written in the same transaction and holds only action,
+  source and actor, never claim text.
+- **Relearning** a forgotten statement creates a NEW memory. The tombstone is
+  never reactivated, so no old plaintext is retained for matching.
+- The erasure suite inspects stored values directly with raw SQL:
+  `tests/test_memory_erasure.py` (SQLite) and `tests/test_memory_erasure_pg.py`
+  (the same 22 tests on PostgreSQL 16).
 
 ## 5. Extraction
 
@@ -148,8 +161,8 @@ Every candidate passes `MemoryWriteGate.process()`:
   `ChatService` receives it.
 - `tests/test_handlers.py`, `tests/test_smoke.py` assert the 🧠 ذاكرتي menu,
   `/memory` handlers, `memory_text` routing and that the application builds.
-- Full suite: **130 passed** (Phase A/B contract + Phase C knowledge + 57
-  Phase D memory).
+- Historical: the Phase D suite had 57 memory tests. The current memory suite
+  (`tests/test_memory.py` plus the erasure suites) is listed in the release checklist.
 
 ## 11. Limitations
 

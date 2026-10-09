@@ -11,8 +11,8 @@ Stages, in order (each aborts with a non-zero exit code on failure):
 
   1. duplicate-run lock      O_EXCL lock file, stale lock reclaim
   2. row-count snapshot      per-table counts via psycopg2
-  3. pg_dump                 plain SQL; credentials via PGPASSFILE only
-  4. gzip + manifest         streaming compression, atomic publish
+  3. pg_dump                 plain SQL into a private 0700 work dir; PGPASSFILE only
+  4. gzip (+ AES-256-GCM)    streaming compression and encryption, atomic publish
   5. integrity verification  gzip round-trip + SHA-256 of content and archive
   6. retention pruning       reached ONLY after stage 5 succeeded
 

@@ -66,6 +66,13 @@ Users can delete their data via Telegram commands:
 | `/delete` | Full account deletion: users row + all associated data | Cascades to: goals, habits, memories, knowledge sources, learning sessions, coach logs, activity log |
 | `/export` | Exports complete user data snapshot | Read-only; does not delete |
 
+**Memory erasure** (coach menu, forget/clear/delete): forget and clear scrub the
+memory's text, subject, source note, metadata and version history, and keep only a
+content-free tombstone. Delete removes the row and its history. Audit rows keep
+action, source and time, never claim text. Each erasure is atomic: if it cannot
+complete, nothing is changed and the user is told it failed. Details:
+`MEMORY_ARCHITECTURE.md` §4.
+
 ### 3.2 Deletion Cascade Order (per schema_migrations)
 1. **knowledge** (v1) - knowledge sources and all derived data
 2. **memory** (v1) - memories, memory versions, memory events, memory access log

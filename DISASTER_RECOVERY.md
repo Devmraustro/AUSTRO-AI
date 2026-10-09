@@ -1,15 +1,18 @@
 # AUSTRO AI — Disaster Recovery & PostgreSQL Backup/Restore Plan
 
-Status: **DRILL-VERIFIED on real PostgreSQL 16.6** (2026-09-24).
-Automation: daily 02:00 UTC backup worker **implemented and unit-tested**
-(`Dockerfile.backup` + `backup` Compose service + `scripts/backup_scheduler.py`
-+ `scripts/pg_backup.py`, 31 tests in `tests/test_backup.py`); **not yet
-installed on production infrastructure** — item 10 stays open until an actual
-scheduled run is observed on the host (§2.4).
+Status: **encrypted-only backup worker and fail-closed restore drill
+implemented and unit-tested** (`tests/test_backup.py`: 59 tests,
+`tests/test_restore_safety.py`: 33 tests). The end-to-end proof (encrypted
+backup, wrong-key refusal, tampered-archive refusal, unsafe-target refusal,
+correct-key restore) runs in the GitHub Actions job `backup-integration` against
+an ephemeral PostgreSQL 16 service with a runner-generated 32-byte key. §7 records
+that run. **Not yet installed on production infrastructure**: item 10 stays open
+until a scheduled run is observed on the host (§2.4).
 
 This document defines the operational backup/restore and disaster-recovery
-procedure. It was validated by a real `pg_dump` -> integrity check -> clean
-restore -> schema/row-count -> application-reconnect drill.
+procedure. The earlier plaintext drill (2026-09-24, PostgreSQL 16.6) is
+superseded: archives are now always encrypted, and the restore path has the
+safety gates described in §3.
 
 ---
 
@@ -17,11 +20,12 @@ restore -> schema/row-count -> application-reconnect drill.
 
 | Property | Value |
 |---|---|
-| Backup tool | PostgreSQL `pg_dump` (logical, plain SQL, `--clean --if-exists --no-owner --no-acl`) |
+| Backup tool | PostgreSQL `pg_dump` (logical, plain SQL, `--clean --if-exists --no-owner --no-acl`), piped through gzip into an AES-256-GCM container. The plain SQL dump lives only in a private 0700 work directory and is deleted on success, failure and stale-run recovery. It never reaches the shared backup volume. |
 | pg_dump client | `postgresql-client-16` in `Dockerfile.backup` (must match the server major version) |
 | Authentication | `0600` `.pgpass` via `PGPASSFILE` + `--no-password`; the password never appears in argv, logs, or the manifest |
+| Encryption | **Always on in the worker** (`BACKUP_ENCRYPTION_ENABLED=true`). AES-256-GCM, key = raw 32-byte file at `BACKUP_ENCRYPTION_KEY_FILE` (a Compose secret). A missing or wrong-sized key stops the run before any dump. Container layout: `0x01 \|\| nonce(12) \|\| ciphertext \|\| tag(16)`. The scheduler refuses to start with the flag off. |
 | Compression | gzip (level 6), streamed so memory stays flat on large dumps |
-| Integrity | SHA-256 recorded in a JSON manifest next to each archive: `checksum_sha256` (decompressed SQL, used by the restore drill) and `archive_sha256` (gzip file) |
+| Integrity | SHA-256 recorded in a JSON manifest next to each archive: `checksum_sha256` (decompressed SQL) and `archive_sha256` (the published, encrypted file). The manifest also records `encryption.enabled` and `encryption.algo = aes-256-gcm`. |
 | Row-count manifest | per-table row counts captured at backup time |
 | Frequency | Daily **02:00 UTC** by the independent `backup` container; manual on-demand before migrations/releases |
 | Scheduling | `scripts/backup_scheduler.py` (separate container/service) — **never** inside the Telegram update loop |
@@ -87,9 +91,13 @@ python scripts/pg_backup.py /var/backups/austro
 
 Outputs (same layout either way):
 ```
-austro_ai_backup_<UTCTIMESTAMP>.sql.gz
+austro_ai_backup_<UTCTIMESTAMP>.sql.gz            # AES-256-GCM container when a key is configured
 austro_ai_backup_<UTCTIMESTAMP>.manifest.json
 ```
+The `.sql.gz` name is kept for compatibility. With a key configured, the file is
+the encrypted container above. Without one (only possible when
+`BACKUP_ENCRYPTION_ENABLED` is unset, i.e. a manual local run), it is plain gzip.
+The production worker never runs in that mode.
 
 Requirements: `DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD` and
 `PG_BIN` pointing at the PostgreSQL `bin` directory (not needed in the
@@ -139,25 +147,44 @@ release. The nightly job only takes a backup and verifies its own integrity.
 ## 3. Restore Procedure (commands)
 
 > **Destructive.** `pg_restore_drill.py` drops and recreates the target
-> database. Only ever point it at an explicitly disposable/probe database.
+> database. It refuses to run unless **all** of the following hold, and it
+> refuses before opening any archive or database connection (exit 2):
+>
+> - `RESTORE_TARGET_DB` is set explicitly. There is **no default**, so a restore
+>   never falls back to the application database. The name must contain
+>   `restore` and must differ from `DB_NAME`.
+> - `RESTORE_CONFIRM_DESTRUCTIVE=DROP-AND-RESTORE:<RESTORE_TARGET_DB>` matches
+>   the target exactly.
+> - `RESTORE_ADMIN_USER` and `RESTORE_ADMIN_PASSWORD` are set. The drill never
+>   assumes a `postgres` superuser.
 
 ```bash
-# Purposely destructive: drops and recreates <DB_NAME> from the backup.
+RESTORE_TARGET_DB=austro_ai_restore_drill \
+RESTORE_CONFIRM_DESTRUCTIVE=DROP-AND-RESTORE:austro_ai_restore_drill \
+RESTORE_ADMIN_USER=<admin> RESTORE_ADMIN_PASSWORD=<from secret store> \
+DB_NAME=<application db> DB_USER=<application role> DB_PASSWORD=<app password> \
+BACKUP_ENCRYPTION_KEY_FILE=/run/secrets/backup_encryption_key \
 python scripts/pg_restore_drill.py /var/backups/austro_ai_backup_<TS>.sql.gz \
     /var/backups/austro_ai_backup_<TS>.manifest.json
 ```
 
-The restore script:
-1. Verifies archive checksum against the manifest.
-2. Applies the SQL to a **disposable probe database** first to prove the backup
-   parses cleanly (`ON_ERROR_STOP=1`).
-3. Drops and recreates the target database (`DROP DATABASE ... WITH (FORCE)`).
-4. Restores the SQL.
-5. Validates: table set == manifest table set, per-table row counts == manifest
-   row counts.
-6. Reconnects through the application `DatabaseManager` and confirms queries.
+Steps, in order. Each step fails closed before the next:
+1. Safety rules above (exit 2 on refusal, nothing touched).
+2. **Authenticate the archive before any database work**: manifest and archive
+   checksums, key length and decryption (AES-GCM authentication), decompression,
+   and the content SHA-256 against the manifest. A wrong key or a single
+   tampered byte stops the drill here (exit 1). The target database is
+   unchanged, and the log says so.
+3. Drop and recreate the target as the administrative role
+   (`DROP DATABASE ... WITH (FORCE)`, then create, owner `DB_USER`).
+4. Stream the verified SQL into the target with `psql -v ON_ERROR_STOP=1` as the
+   administrative role, and grant the application role access when it differs.
+5. Validate the table set, per-table row counts, and connectivity as the
+   application role, against the manifest.
 
-Exit code 0 = restored and verified.
+Exit codes: **0** restored and verified; **1** failed (for authentication
+failures no database was changed); **2** refused by a safety rule before any
+archive or database work.
 
 ## 4. Application Reconnect
 
@@ -181,6 +208,14 @@ SQLite file-copy backups remain valid for the local/dev engine, but they are
 - Prometheus/alertmanager alert: `backup_failed` if the daily job fails. The
   worker currently only logs a non-zero exit signal; alerting is left to the
   deployment's own scheduler/monitoring.
-- Encryption at rest for backup archives (age/KMS).
 - Off-host copy of the `backups` volume (the volume is persistent but still
   local to the host).
+- Key management beyond a file secret (KMS/age-wrapped keys, rotation). The key
+  is currently a single 32-byte file; rotating it means writing new backups
+  with the new key and keeping the old key until older archives expire.
+
+## 7. CI evidence (GitHub Actions `backup-integration`)
+
+_Filled in from the remote run for the final commit of this branch; see the final
+report for the run URL and HEAD SHA._
+

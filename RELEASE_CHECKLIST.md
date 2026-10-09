@@ -116,6 +116,12 @@ Each step lists the command or file to use and what "done" means.
     → one-shot `scripts/pg_backup.py`), daily 02:00 UTC, 7 daily + 30 monthly
     retention, `PGPASSFILE` auth, lock + missed-run recovery, 31 tests in
     `tests/test_backup.py`. See `DISASTER_RECOVERY.md` §2.
+  - ✅ **Encryption and restore safety (2026-10-09):** the scheduled worker is
+    encrypted-only (AES-256-GCM, 32-byte key file; the scheduler refuses to start
+    without it). The restore drill authenticates the archive before any database
+    change, refuses unsafe targets (exit 2), and never defaults to the application
+    database. The CI job `backup-integration` proves this end to end on an
+    ephemeral PostgreSQL 16 (`DISASTER_RECOVERY.md` §7).
   - ⬜ **Still open (needs the host):** start the service in production
     (`docker compose --env-file .env up -d app backup`) and observe one real
     `6/6: SUCCESS` at 02:00 UTC (`DISASTER_RECOVERY.md` §2.4), then run the
