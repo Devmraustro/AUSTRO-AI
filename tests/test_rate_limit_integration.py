@@ -545,7 +545,7 @@ def _fake_container():
         ),
         knowledge=_FakeService(
             settings_info=Mock(return_value={"max_file_size_mb": 50, "max_pages": 100}),
-            register_upload=Mock(return_value={"source_id": 7, "duplicate": False}),
+            register_upload=AsyncMock(return_value={"source_id": 7, "duplicate": False}),
             process_source=AsyncMock(return_value=_FakeService(status="completed", error=None)),
         ),
     )

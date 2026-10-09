@@ -20,7 +20,7 @@ import inspect
 import os
 import pathlib
 import tempfile
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock, Mock
 
 os.environ.setdefault("BOT_TOKEN", "123456789:TEST-rate-limit-guards-token")
 os.environ["GEMINI_API_KEY"] = ""
@@ -30,6 +30,7 @@ os.environ["DB_PATH"] = str(
 
 import pytest
 
+from app.core.errors import ValidationError
 from app.security.rate_limiter import (
     RateLimitConfig,
     RateLimiter,
@@ -166,7 +167,7 @@ def _services(**overrides):
                                              "chunk_size": 800, "chunk_overlap": 100,
                                              "embedding_model": "m", "embedding_version": 1,
                                              "dimensions": 768, "top_k": 5}),
-            register_upload=Mock(return_value={"source_id": 7, "duplicate": False}),
+            register_upload=AsyncMock(return_value={"source_id": 7, "duplicate": False}),
             process_source=AsyncMock(return_value=_Svc(status="completed", error=None)),
             counts=Mock(return_value={"total": 0, "ready": 0, "processing": 0, "failed": 0}),
             list_sources=Mock(return_value=[]),
@@ -556,6 +557,75 @@ async def test_allowed_upload_registers_and_schedules_once():
     svcs.knowledge.register_upload.assert_called_once()
     svcs.knowledge.process_source.assert_awaited_once()
     assert len(ctx.application.tasks) == 1
+
+
+@pytest.mark.asyncio
+async def test_allowed_upload_passes_source_id_to_background_ingestion():
+    """Background ingestion receives the source id returned by registration."""
+    svcs = _services()
+    upd = _FakeUpdate(document=_FakeDocument())
+    ctx = _FakeContext(container=svcs)
+
+    await _run(H.knowledge_document, svcs, upd, ctx)
+    await asyncio.sleep(0.01)
+
+    svcs.knowledge.register_upload.assert_awaited_once()
+    svcs.knowledge.process_source.assert_awaited_once_with(42, 7, progress=ANY)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_upload_does_not_schedule_ingestion():
+    """A checksum duplicate is reported but never re-ingested or re-charged."""
+    svcs = _services()
+    svcs.knowledge.register_upload = AsyncMock(
+        return_value={"source_id": 7, "duplicate": True}
+    )
+    upd = _FakeUpdate(document=_FakeDocument())
+    ctx = _FakeContext(container=svcs)
+
+    await _run(H.knowledge_document, svcs, upd, ctx)
+    await asyncio.sleep(0.01)
+
+    svcs.knowledge.register_upload.assert_awaited_once()
+    svcs.knowledge.process_source.assert_not_awaited()
+    assert ctx.application.tasks == []
+    upd.message.reply_text.assert_awaited_once_with(
+        "📚 هذا الكتاب موجود في مكتبتك بالفعل."
+    )
+
+
+@pytest.mark.asyncio
+async def test_upload_validation_error_aborts_with_message_only():
+    """A rejected upload replies with the validation message and schedules nothing."""
+    svcs = _services()
+    svcs.knowledge.register_upload = AsyncMock(side_effect=ValidationError("الملف فارغ"))
+    upd = _FakeUpdate(document=_FakeDocument())
+    ctx = _FakeContext(container=svcs)
+
+    await _run(H.knowledge_document, svcs, upd, ctx)
+    await asyncio.sleep(0.01)
+
+    svcs.knowledge.register_upload.assert_awaited_once()
+    svcs.knowledge.process_source.assert_not_awaited()
+    assert ctx.application.tasks == []
+    upd.message.reply_text.assert_awaited_once_with("الملف فارغ")
+
+
+@pytest.mark.asyncio
+async def test_upload_registration_error_aborts_without_scheduling():
+    """A storage/database failure replies with the generic error and schedules nothing."""
+    svcs = _services()
+    svcs.knowledge.register_upload = AsyncMock(side_effect=OSError("disk full"))
+    upd = _FakeUpdate(document=_FakeDocument())
+    ctx = _FakeContext(container=svcs)
+
+    await _run(H.knowledge_document, svcs, upd, ctx)
+    await asyncio.sleep(0.01)
+
+    svcs.knowledge.register_upload.assert_awaited_once()
+    svcs.knowledge.process_source.assert_not_awaited()
+    assert ctx.application.tasks == []
+    upd.message.reply_text.assert_awaited_once()
 
 
 @pytest.mark.asyncio

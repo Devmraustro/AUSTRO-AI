@@ -213,7 +213,7 @@ def test_weekly_review_returns_summary_keys(engine):
 
 async def test_book_course_creates_curriculum_from_source(engine):
     services = build_container()
-    upload = services.knowledge.register_upload(
+    upload = await services.knowledge.register_upload(
         owner_user_id=OWNER,
         file_name="مبادئ البرمجة.txt",
         data="المتغيرات تخزن القيم. الحلقات تكرر التنفيذ. الدوال تعيد الاستخدام.".encode("utf-8"),

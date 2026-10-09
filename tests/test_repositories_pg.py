@@ -434,7 +434,7 @@ def test_knowledge_collections_ignore_and_storage_verified(pg_knowledge):
 
 async def test_knowledge_ingestion_end_to_end_on_postgres(pg_container):
     knowledge = pg_container.knowledge
-    upload = knowledge.register_upload(
+    upload = await knowledge.register_upload(
         owner_user_id=7,
         file_name="notes.txt",
         data=b"Time management is the key skill. Focus on one task at a time.",

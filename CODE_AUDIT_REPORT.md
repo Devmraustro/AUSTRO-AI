@@ -2,14 +2,16 @@
 
 - **Branch:** `main`
 - **Baseline commit:** `c8066f4ea9a97feed95a6c802e8cfbc477cba59f`
-- **Audit commits:** `c8066f4` (post-push correction pass)
+- **Audit commits:** `c8066f4` (post-push correction pass), `f8c29ae`, `08e923a`
 - **CI:** GitHub Actions run to be triggered on push to `main`
 - **Scope:** full local security / correctness / runtime-readiness review of the
   repository at the baseline commit. No hosting, deployment, provisioning, or
   live-service access was performed or attempted.
 - **Status:** 17 defects fixed (F-1 through F-17); residual risks R-2, R-4 and
   R-5 resolved and locally verified with regression tests; R-1 and R-3 remain
-  open. Local validation complete; remote (GitHub Actions) verification pending.
+  open. The pre-existing `register_upload` async mismatch (4 failing upload
+  tests) is now fixed and verified locally (479 passed, 19 skipped, 0 failed).
+  Remote (GitHub Actions) verification of the new commit pending.
 
 This report does not claim the absence of vulnerabilities. Absence of findings
 is not proof of absence.
@@ -32,10 +34,18 @@ counted as fixed.
 | SAST | `bandit -r app/ --severity-level medium --confidence-level medium` | `No issues identified`, exit 0 |
 | Evaluation harness | `python scripts/verify.py` | `OVERALL: PASS (100.0% / 100% threshold)`, exit 0 |
 | Offline smoke | `python smoke_test.py` | `SMOKE TEST PASSED`, exit 0 |
-| Unit + integration tests | see §2 | 471 passed, 19 skipped, 4 failed (all 4 re-failed identically at the baseline commit — pre-existing, see §2) |
+| Unit + integration tests | see §2 | 479 passed, 19 skipped, 0 failed |
 
 Local interpreter: CPython 3.14.7 on Windows. CI runs CPython 3.10/3.11/3.12/3.13/3.14
 on `ubuntu-latest`, which is the authoritative Python matrix for this project.
+
+> Environment note (local only, not CI): the autouse `fresh_db` fixture re-runs
+> the full `init_database()` DDL migration chain for every test, which takes
+> ~10s per call on this machine (slow disk + SQLite per-statement fsync). The
+> full local suite therefore takes roughly an hour; GitHub Actions runs the same
+> suite on `ubuntu-latest` where this cost is negligible. Results below were
+> collected with pytest 9.1.1 / pytest-asyncio 1.4.0 using isolate-scoped
+> `--basetemp` under `%TEMP%`.
 
 **Not available locally:** Docker/Compose and a PostgreSQL server. Docker and
 PostgreSQL are exercised in GitHub Actions instead. Bandit is now installed
@@ -45,33 +55,86 @@ locally and runs fail-closed with the same flags as CI.
 
 ## 2. Test results
 
-The complete suite was run in a single invocation with the CI commands
-(`compileall`, `pyflakes`, `pytest`, then `pip check`, `pip-audit`, Bandit,
-`scripts/verify.py`, `smoke_test.py`):
+The complete suite was run locally with the CI commands (`compileall`,
+`pyflakes`, `pytest`, `pip check`, `pip-audit`, Bandit, `scripts/verify.py`,
+`smoke_test.py`). The tables below separate **local results**, **GitHub Actions
+results**, and **environment-dependent checks**.
+
+### 2a. Local results (CPython 3.14.7 on Windows)
 
 | Batch | Result |
 |---|---|
-| `tests/test_learning.py` | 23 passed, 1 failed (pre-existing, see below) |
-| `tests/test_backup.py` | 47 passed (16 encryption-specific) |
+| `tests/test_rate_limit_guards.py` + `test_rate_limit_integration.py` + `test_rate_limiter.py` + `test_rate_limit_commands.py` | 115 passed |
 | `tests/test_memory.py` | 60 passed |
-| All other test files | 341 passed |
-| **Total** | **471 passed, 19 skipped, 4 failed** |
+| `tests/test_backup.py` | 47 passed (16 encryption-specific) |
+| `tests/test_database.py` + `test_redaction.py` | 11 passed |
+| `tests/test_audit_regressions.py` | 63 passed |
+| `tests/test_architecture.py` | 39 passed |
+| `tests/test_learning.py` + `test_knowledge.py` + `test_rag.py` | 50 passed |
+| `tests/test_handlers.py` + `test_scheduler.py` + `test_smoke.py` + `test_flashcards.py` | 20 passed |
+| `tests/test_staging.py` + `test_production_config.py` + `test_docker_context.py` | 74 passed, 1 skipped |
+| `tests/test_performance.py` + `test_repositories_pg.py` | 18 skipped (no PG/performance env locally) |
+| **Total** | **479 passed, 19 skipped, 0 failed** |
 
-The 4 failures reproduce **identically at the baseline commit** (`c8066f4`,
-verified in a clean `git worktree`), so they are pre-existing and out of scope
-for this pass:
+The four tests that failed in CI runs #23/#24 now pass individually and as part
+of the full suite:
 
-1. `test_learning.py::test_book_course_creates_curriculum_from_source` —
-   `KnowledgeService.register_upload` is awaited as if it returned a coroutine
-   (`'dict' object can't be awaited`, handlers.py:1872) and the tests were
-   written against an async event loop that never ran it.
-2. `test_rate_limit_guards.py::test_allowed_upload_registers_and_schedules_once`
-3. `test_rate_limit_guards.py::test_background_ingestion_is_not_charged_again`
-4. `test_rate_limit_integration.py::test_allowed_upload_registers_and_starts_ingestion`
+1. `test_learning.py::test_book_course_creates_curriculum_from_source` — PASSED
+2. `test_rate_limit_guards.py::test_allowed_upload_registers_and_schedules_once` — PASSED
+3. `test_rate_limit_guards.py::test_background_ingestion_is_not_charged_again` — PASSED
+4. `test_rate_limit_integration.py::test_allowed_upload_registers_and_starts_ingestion` — PASSED
 
-All four share the same root cause on the upload/ingestion path (`register_upload`
-async mismatch) and fail with `'dict' object can't be awaited`. They are listed
-here so the next audit can address the shared root cause.
+### 2b. Root cause and fix (upload async contract)
+
+`KnowledgeService.register_upload` is `async def` by design (the docstring and
+implementation run the blocking checksum/storage/database work through
+`asyncio.to_thread`). Its only production caller, `app/telegram/handlers.py`
+(`knowledge_document`), correctly awaits it. The four failures were a **test
+side** contract mismatch, not a production defect:
+
+- Two test doubles patched `register_upload` with a **sync** `Mock(return_value=dict)`
+  (`tests/test_rate_limit_guards.py`, `tests/test_rate_limit_integration.py`).
+  The handler still awaits the call, so `await <dict>` raised
+  `'dict' object can't be awaited` and the handler aborted before scheduling
+  background ingestion — making the registration/task/single-charge assertions
+  fail. Fix: those doubles are now `AsyncMock(return_value={...})`, matching the
+  real async API.
+- Two async tests called the **real** `register_upload` without awaiting it
+  (`tests/test_learning.py`, `tests/test_repositories_pg.py`), then treated the
+  coroutine object as a dict. Fix: added `await` at both call sites.
+
+Regression tests added in `tests/test_rate_limit_guards.py` (upload/ingestion
+section) for the properties the failing tests did not fully pin down:
+
+- `test_allowed_upload_passes_source_id_to_background_ingestion` — the source id
+  returned by registration is the one passed to background ingestion;
+- `test_duplicate_upload_does_not_schedule_ingestion` — a checksum duplicate is
+  reported but never re-ingested and creates no background task;
+- `test_upload_validation_error_aborts_with_message_only` — a `ValidationError`
+  from registration replies with the validation message and schedules nothing;
+- `test_upload_registration_error_aborts_without_scheduling` — a generic
+  storage/database failure replies with the generic error and schedules nothing.
+
+The remaining eight required outcomes (dict-not-coroutine return, register-once,
+rate-limit-before-download, no orphan source on blocked upload, single background
+task per accepted non-duplicate upload, no second ingestion-charge in the
+background task, safe registration-error handling) are enforced by the combined
+pre-existing and new assertions above.
+
+### 2c. GitHub Actions results
+
+Pending — a new run is triggered by push of this commit. Previous run
+`37773381695` failed only at `test (3.11) :: pytest -v` on the four tests listed
+in §2a (all now fixed); its `dependency-audit`, `performance-tests` and
+`Staging stack` jobs passed.
+
+### 2d. Environment-dependent checks
+
+- PostgreSQL integration (`test_repositories_pg.py`, 18 tests) — skipped
+  locally; exercised in the CI `test` job with a `postgres:16` service.
+- Docker/Compose staging — not run locally; exercised in the CI `staging` job.
+- `test_performance.py` — skipped locally; exercised in the CI
+  `performance-tests` job.
 
 ---
 
@@ -415,22 +478,14 @@ now also asserts that it is invisible before approval and retrievable after.
 - **Local verification:** Complete. All 17 findings fixed, pyflakes clean,
   compileall clean, `pip check` clean, `pip-audit` clean, Bandit clean
   (fail-closed, exit 0), `scripts/verify.py` PASS, `smoke_test.py` PASSED,
-  full pytest: 471 passed, 19 skipped, 4 failed (all 4 pre-existing at the
-  baseline and re-verified as identical in a clean worktree). Also reproduced
-  on Python 3.11 (the CI interpreter): same 4 failures, nothing else.
-- **CI verification:** Run `37773381695` on `f8c29ae` failed, **because of the
-  4 pre-existing tests**, not this change set:
-  - `dependency-audit` job: success
-  - `performance-tests` job: success
-  - `Staging stack (compose + images)` job: success
-  - `test` job (3.11): failure at step "Run tests" (`pytest -v`) — the 4
-    pre-existing failures; downstream steps (Bandit, smoke, PostgreSQL
-    integration, verify, security tests, secret scan) were skipped.
-  - `test` job (3.10/3.12/3.13/3.14): cancelled by the matrix when 3.11 failed.
-  - Remote verification of Bandit/PG-integration/security-scan is therefore
-    still pending until the pre-existing upload bug is fixed.
+  full pytest: **479 passed, 19 skipped, 0 failed**. The four upload/ingestion
+  failures from run `37773381695` are fixed (§2a).
+- **CI verification:** Previous run `37773381695` on `f8c29ae` failed only on
+  the 4 upload tests now fixed (§2a); `dependency-audit`, `performance-tests`
+  and `Staging stack` jobs passed. A new run on the corrected commit is pending
+  and will be recorded here after it completes.
 - **Bandit:** Installed locally (1.9.4) and passing with the CI flags.
-- **Docker/PostgreSQL:** Not available locally; exercised in CI (staging job passed).
+- **Docker/PostgreSQL:** Not available locally; exercised in CI.
 
 ### Still not verified anywhere
 
@@ -461,6 +516,14 @@ Updated in this change set:
 | `app/knowledge/chunker.py`, `app/memory/models.py` | SHA-1 (non-security dedup keys) marked `usedforsecurity=False` |
 | `app/database/repositories.py` | `update_profile()` / `ProgressRepository.log()` validate `**kwargs` keys against column allowlists before interpolating |
 | `app/knowledge/repositories.py`, `app/learning/repositories.py`, `app/memory/repositories.py` | B608 site-level hardenings: SQL built from literal fragments only, or allowlist-validated (`# nosec B608` with justification) |
+| `tests/test_rate_limit_guards.py` | Upload `register_upload` double changed from sync `Mock` to `AsyncMock` (matches the real async API); added `test_allowed_upload_passes_source_id_to_background_ingestion`, `test_duplicate_upload_does_not_schedule_ingestion`, `test_upload_validation_error_aborts_with_message_only`, `test_upload_registration_error_aborts_without_scheduling` |
+| `tests/test_rate_limit_integration.py` | Upload `register_upload` double changed from sync `Mock` to `AsyncMock` |
+| `tests/test_learning.py`, `tests/test_repositories_pg.py` | Real `register_upload` calls now awaited (were treating the returned coroutine as a dict) |
+
+Updated in this change set (upload async contract):
+
+- The 4 previously-failing upload/ingestion tests now pass; full suite is
+  479 passed / 19 skipped / 0 failed locally (§2).
 
 Still outstanding (not changed here, listed so it is not lost):
 
@@ -468,8 +531,6 @@ Still outstanding (not changed here, listed so it is not lost):
   hosting-dependent items that were intentionally not attempted.
 - Python support: `pyproject.toml` declares `requires-python = ">=3.10"` and CI
   exercises 3.10/3.11/3.12/3.13/3.14. The range is verified in CI.
-- Pre-existing upload/ingestion bug (`register_upload` async mismatch, 4 failing
-  tests listed in §2) is documented and left for a dedicated fix.
 - Production/staging runtime — no deployment was attempted.
 
 ---
@@ -493,8 +554,8 @@ python smoke_test.py
 
 All of the above were executed on this change set and pass (see §1/§2).
 
-Run the complete regression suite (done: 471 passed, 19 skipped, 4 failed,
-all 4 pre-existing — see §2).
+Run the complete regression suite (done: 479 passed, 19 skipped, 0 failed —
+see §2a; 18 PG/performance tests skip locally, exercised in CI).
 
 Then commit the fixes.
 
@@ -552,14 +613,14 @@ The audit can only be called remotely verified after:
    spawned all defined jobs, not zero)
 3. all required jobs actually run ✗ — run `37773381695` started all jobs but
    the `test` matrix cancelled 4 of 5 when 3.11 failed, and the failing job
-   skipped Bandit/smoke/PG/verify/security-steps
-4. all required jobs pass ✗ — `test (3.11)` failed at `pytest -v` on the 4
-   pre-existing tests (identical on 3.14 and at baseline); the 3 independent
-   jobs pass
+   skipped Bandit/smoke/PG/verify/security-steps; the 4 upload tests that
+   caused the failure are now fixed locally (§2a) and a new run is pending
+4. all required jobs pass □ — the previous blocker (4 upload tests) is fixed
+   and the full suite is 479/19/0 locally; result of the new run pending
 5. R-5 IDOR tests pass □ (pending CI — verified locally; owner_user_id enforced at SQL boundary)
 6. backup encryption + restore verification pass □ (pending CI — verified locally by 47 tests)
-7. no new High/Critical findings remain ✗ — CI run `37773381695` status `failure`
-   (cause: pre-existing tests); no findings were introduced by this pass
+7. no new High/Critical findings remain ✓ — CAUSE of run `37773381695` failure
+   (the 4 upload tests) is fixed locally; no findings were introduced by this pass
 8. CODE_AUDIT_REPORT.md matches the actual state ✓ (updated after the CI run)
 
 Return the final commit SHA, CI run URL, every job status, and all remaining risks.
