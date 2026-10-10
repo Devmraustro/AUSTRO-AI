@@ -255,3 +255,223 @@ def test_owner_can_mark_and_read_verification(store, manager, a):
 def test_mark_verified_without_storage_row_reports_false(store, b):
     assert store.storage.mark_verified(OWNER_B, b["source"]) is False
     assert store.storage.verified(OWNER_B, b["source"]) is False
+
+
+# --- Parent-child creation: documents, sections, chunks ---------------------
+#
+# Every rejected create must return None and leave no row behind. Each test
+# checks the table directly with raw SQL, not only the return value.
+
+def _extra_parents(store, owner: int, tag: str):
+    """A second source, document and section for one owner (no chunk)."""
+    source_id = store.sources.create(
+        owner_user_id=owner, source_type="book", title=f"{tag} source",
+        file_name=f"{tag}.txt", file_format="txt", mime_type="text/plain",
+        file_size_bytes=10, checksum=f"sum-{tag}", storage_key=f"key/{tag}",
+        original_ref=None)
+    document_id = store.documents.create(
+        source_id=source_id, owner_user_id=owner, title=f"{tag} doc", author=None,
+        language="en", toc=[], total_chars=10, total_pages=1)
+    section_id = store.sections.create(
+        document_id=document_id, owner_user_id=owner, source_id=source_id,
+        level=1, title=f"{tag} section", order_index=0, start_char=0, end_char=10)
+    assert source_id and document_id and section_id
+    return {"source": source_id, "document": document_id, "section": section_id}
+
+
+def _doc_rows(manager, owner: int, source_id: int) -> int:
+    return _scalar(manager, "SELECT COUNT(*) FROM knowledge_documents "
+                   "WHERE owner_user_id = ? AND source_id = ?", (owner, source_id))
+
+
+def _section_rows(manager, owner: int, document_id: int) -> int:
+    return _scalar(manager, "SELECT COUNT(*) FROM knowledge_sections "
+                   "WHERE owner_user_id = ? AND document_id = ?", (owner, document_id))
+
+
+def _chunk_rows(manager, owner: int, chunk_key: str) -> int:
+    return _scalar(manager, "SELECT COUNT(*) FROM knowledge_chunks "
+                   "WHERE owner_user_id = ? AND chunk_key = ?", (owner, chunk_key))
+
+
+def _create_chunk(store, owner, source_id, document_id, section_id, chunk_key):
+    return store.chunks.create(
+        owner_user_id=owner, source_id=source_id, document_id=document_id,
+        section_id=section_id, chunk_key=chunk_key, content="text",
+        content_hash=f"h-{chunk_key}", token_count=1, char_count=4, page=None,
+        order_index=0)
+
+
+# Documents ------------------------------------------------------------------
+
+def test_b_cannot_create_document_against_a_source(store, manager, a, b):
+    before = _doc_rows(manager, OWNER_B, a["source"])
+    result = store.documents.create(
+        source_id=a["source"], owner_user_id=OWNER_B, title="stolen", author=None,
+        language="en", toc=[], total_chars=1, total_pages=1)
+    assert result is None
+    assert _doc_rows(manager, OWNER_B, a["source"]) == before == 0
+    assert _scalar(manager, "SELECT COUNT(*) FROM knowledge_documents "
+                   "WHERE title = ?", ("stolen",)) == 0
+
+
+def test_document_with_missing_source_is_rejected(store, manager, b):
+    for missing in (None, 999999):
+        result = store.documents.create(
+            source_id=missing, owner_user_id=OWNER_B, title="ghost", author=None,
+            language="en", toc=[], total_chars=1, total_pages=1)
+        assert result is None
+    assert _scalar(manager, "SELECT COUNT(*) FROM knowledge_documents "
+                   "WHERE title = ?", ("ghost",)) == 0
+
+
+def test_same_owner_document_creation_succeeds(store, manager, b):
+    document_id = store.documents.create(
+        source_id=b["source"], owner_user_id=OWNER_B, title="b doc", author=None,
+        language="en", toc=[], total_chars=1, total_pages=1, version=2)
+    assert isinstance(document_id, int) and document_id > 0
+    # The fixture already holds version 1 for this source; (source_id, version)
+    # is unique, so this success case uses version 2.
+    assert _doc_rows(manager, OWNER_B, b["source"]) == 2
+
+
+# Sections -------------------------------------------------------------------
+
+def test_b_cannot_create_section_against_a_document(store, manager, a, b):
+    result = store.sections.create(
+        document_id=a["document"], owner_user_id=OWNER_B, source_id=b["source"],
+        level=1, title="stolen section", order_index=0, start_char=0, end_char=1)
+    assert result is None
+    assert _section_rows(manager, OWNER_B, a["document"]) == 0
+    assert _scalar(manager, "SELECT COUNT(*) FROM knowledge_sections "
+                   "WHERE title = ?", ("stolen section",)) == 0
+
+
+def test_b_cannot_create_section_against_a_source(store, manager, a, b):
+    result = store.sections.create(
+        document_id=b["document"], owner_user_id=OWNER_B, source_id=a["source"],
+        level=1, title="stolen source section", order_index=0, start_char=0, end_char=1)
+    assert result is None
+    assert _scalar(manager, "SELECT COUNT(*) FROM knowledge_sections "
+                   "WHERE title = ?", ("stolen source section",)) == 0
+
+
+def test_b_cannot_create_section_against_a_document_and_source_of_a(store, manager, a, b):
+    result = store.sections.create(
+        document_id=a["document"], owner_user_id=OWNER_B, source_id=a["source"],
+        level=1, title="all-a section", order_index=0, start_char=0, end_char=1)
+    assert result is None
+    assert _scalar(manager, "SELECT COUNT(*) FROM knowledge_sections "
+                   "WHERE title = ?", ("all-a section",)) == 0
+
+
+def test_section_with_mismatched_document_and_source_is_rejected(store, manager, a):
+    """Both parents belong to A, but the document is stored under another source."""
+    other = _extra_parents(store, OWNER_A, "other")
+    before = _section_rows(manager, OWNER_A, a["document"])
+    result = store.sections.create(
+        document_id=a["document"], owner_user_id=OWNER_A, source_id=other["source"],
+        level=1, title="mismatch section", order_index=0, start_char=0, end_char=1)
+    assert result is None
+    assert _section_rows(manager, OWNER_A, a["document"]) == before
+    assert _scalar(manager, "SELECT COUNT(*) FROM knowledge_sections "
+                   "WHERE title = ?", ("mismatch section",)) == 0
+
+
+def test_section_with_missing_document_is_rejected(store, manager, a):
+    result = store.sections.create(
+        document_id=999999, owner_user_id=OWNER_A, source_id=a["source"],
+        level=1, title="ghost section", order_index=0, start_char=0, end_char=1)
+    assert result is None
+    assert _scalar(manager, "SELECT COUNT(*) FROM knowledge_sections "
+                   "WHERE title = ?", ("ghost section",)) == 0
+
+
+def test_same_owner_section_creation_succeeds(store, manager, a):
+    section_id = store.sections.create(
+        document_id=a["document"], owner_user_id=OWNER_A, source_id=a["source"],
+        level=2, title="valid section", order_index=1, start_char=0, end_char=1)
+    assert isinstance(section_id, int) and section_id > 0
+    assert _scalar(manager, "SELECT COUNT(*) FROM knowledge_sections "
+                   "WHERE section_id = ? AND document_id = ? AND source_id = ?",
+                   (section_id, a["document"], a["source"])) == 1
+
+
+# Chunks ---------------------------------------------------------------------
+
+def test_b_cannot_create_chunk_against_a_source(store, manager, a, b):
+    result = _create_chunk(store, OWNER_B, a["source"], b["document"], None, "steal-src")
+    assert result is None
+    assert _chunk_rows(manager, OWNER_B, "steal-src") == 0
+
+
+def test_b_cannot_create_chunk_against_a_document(store, manager, a, b):
+    result = _create_chunk(store, OWNER_B, b["source"], a["document"], None, "steal-doc")
+    assert result is None
+    assert _chunk_rows(manager, OWNER_B, "steal-doc") == 0
+
+
+def test_b_cannot_create_chunk_against_a_section(store, manager, a, b):
+    result = _create_chunk(store, OWNER_B, b["source"], b["document"],
+                           a["section"], "steal-sec")
+    assert result is None
+    assert _chunk_rows(manager, OWNER_B, "steal-sec") == 0
+
+
+def test_b_cannot_create_chunk_with_all_of_a_parents(store, manager, a, b):
+    result = _create_chunk(store, OWNER_B, a["source"], a["document"],
+                           a["section"], "steal-all")
+    assert result is None
+    assert _scalar(manager, "SELECT COUNT(*) FROM knowledge_chunks "
+                   "WHERE source_id = ? OR document_id = ?",
+                   (a["source"], a["document"])) == 1  # only A's own chunk
+
+
+def test_chunk_with_document_from_other_source_is_rejected(store, manager, a):
+    other = _extra_parents(store, OWNER_A, "other2")
+    result = _create_chunk(store, OWNER_A, other["source"], a["document"], None,
+                           "doc-src-mismatch")
+    assert result is None
+    assert _chunk_rows(manager, OWNER_A, "doc-src-mismatch") == 0
+
+
+def test_chunk_with_section_from_other_document_is_rejected(store, manager, a):
+    other = _extra_parents(store, OWNER_A, "other3")
+    result = _create_chunk(store, OWNER_A, a["source"], a["document"],
+                           other["section"], "sec-doc-mismatch")
+    assert result is None
+    assert _chunk_rows(manager, OWNER_A, "sec-doc-mismatch") == 0
+
+
+def test_chunk_with_section_from_other_source_is_rejected(store, manager, a):
+    """The section's document and source are both A's, but not the ones supplied."""
+    other = _extra_parents(store, OWNER_A, "other4")
+    result = _create_chunk(store, OWNER_A, a["source"], other["document"],
+                           a["section"], "sec-src-mismatch")
+    assert result is None
+    assert _chunk_rows(manager, OWNER_A, "sec-src-mismatch") == 0
+
+
+def test_chunk_with_missing_section_is_rejected(store, manager, a):
+    result = _create_chunk(store, OWNER_A, a["source"], a["document"], 999999,
+                           "ghost-sec")
+    assert result is None
+    assert _chunk_rows(manager, OWNER_A, "ghost-sec") == 0
+
+
+def test_same_owner_chunk_with_section_succeeds(store, manager, a):
+    chunk_id = _create_chunk(store, OWNER_A, a["source"], a["document"],
+                             a["section"], "valid-sec-chunk")
+    assert isinstance(chunk_id, int) and chunk_id > 0
+    assert _scalar(manager, "SELECT section_id FROM knowledge_chunks "
+                   "WHERE chunk_key = ? AND owner_user_id = ?",
+                   ("valid-sec-chunk", OWNER_A)) == a["section"]
+
+
+def test_same_owner_sectionless_chunk_succeeds(store, manager, a):
+    chunk_id = _create_chunk(store, OWNER_A, a["source"], a["document"], None,
+                             "valid-nosec-chunk")
+    assert isinstance(chunk_id, int) and chunk_id > 0
+    assert _scalar(manager, "SELECT section_id FROM knowledge_chunks "
+                   "WHERE chunk_key = ? AND owner_user_id = ?",
+                   ("valid-nosec-chunk", OWNER_A)) is None

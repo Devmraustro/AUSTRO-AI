@@ -158,18 +158,46 @@ with offline `LocalProvider` fallback) → attach citations.
   decompression for EPUB chapters (per-chapter and cumulative).
 - **Never fabricated pages** — page attribution only comes from the PDF
   extractor's real char→page map.
-- **Reference ownership.** Every knowledge method that takes a foreign ID
-  checks ownership before it writes. Collection membership checks the
-  collection and the source. Storage registration checks the source. Citations
-  check the retrieval event and that each (chunk, source) pair belongs to the
-  owner. Embedding batches check each (chunk, source) pair. Read and count
-  methods filter by `owner_user_id`. `count_for_source` (chunks and embeddings),
-  `add_citations`, `names_for_source`, `mark_verified` and `verified` now take
-  `owner_user_id`, and every caller is updated. `mark_verified` and
-  `remove_source` report success only when a row changed. Tests:
-  `tests/test_knowledge_ownership.py` (SQLite) and
-  `tests/test_knowledge_ownership_pg.py` (PostgreSQL 16). The same race limit
-  as LEARNING_ARCHITECTURE §11a applies, because these references have no hard FK.
+- **Reference ownership.** Every knowledge write that takes a parent ID checks
+  the parent before it inserts. All checks run inside the repository write lock,
+  on the same cursor, and a rejected write returns `None`/`False` with no row
+  written (the rollback runs on rejection and on database errors).
+  - **Document** (`KnowledgeDocumentRepository.create`): `source_id` must exist
+    and be owned by `owner_user_id`. A missing or foreign source is rejected.
+  - **Section** (`KnowledgeSectionRepository.create`): the document must be
+    owned by the owner, its stored `source_id` must equal the supplied
+    `source_id`, and that source must also be owned by the owner. One fixed
+    parameterized query checks all three.
+  - **Chunk** (`KnowledgeChunkRepository.create`): the same document/source
+    relationship check. If `section_id` is set, the section must be owned by the
+    owner and store the same `document_id` and `source_id`. A `section_id` of
+    `None` keeps the sectionless behaviour and is still checked against the
+    document and source. A rejected chunk is not inserted, and `None` is
+    returned. The idempotent duplicate case (same owner and `chunk_key`) also
+    returns `None`, so callers cannot tell the two apart from the return value.
+  - Collection membership checks the collection and the source. Storage
+    registration checks the source. Citations check the retrieval event and each
+    (chunk, source) pair. Embedding batches check each (chunk, source) pair.
+  - Read and count methods filter by `owner_user_id`. `count_for_source`
+    (chunks and embeddings), `add_citations`, `names_for_source`,
+    `mark_verified` and `verified` take `owner_user_id`.
+  - `mark_verified` and `remove_source` report success only when a row changed.
+
+  Ingestion passes the same owner, source and document IDs to every child, so
+  same-owner ingestion is unchanged. Known pre-existing behaviour: if a section
+  insert is rejected, ingestion records section `0`, and its chunks are stored
+  without a section.
+
+  Tests: `tests/test_knowledge_ownership.py` (SQLite) and
+  `tests/test_knowledge_ownership_pg.py` (PostgreSQL 16). They cover cross-owner
+  attempts, same-owner mismatches, missing parents, and valid creation, and they
+  query the table directly for each rejected case.
+
+  **Remaining limitation:** these references have no hard FK, because owner-
+  scoped FKs would need table rebuilds in SQLite. A parent deleted by another
+  process can race an insert that has already passed its check. This race is
+  not eliminated. Within one process the check and the insert are serialized
+  by the repository lock. See LEARNING_ARCHITECTURE §11a.
 
 ## 10. Limits & configuration
 

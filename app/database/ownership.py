@@ -11,8 +11,8 @@ Guarantee and limits: the check and the write run in one lock-held transaction
 in this process, so they cannot interleave with another write from this
 process. A concurrent delete of the parent by another process can still race
 with the insert (no hard FK exists for these owner-scoped references, because a
-SQLite FK rebuild would be required). This is disclosed in DISASTER_RECOVERY and
-SECURITY_ARCHITECTURE documentation.
+SQLite FK rebuild would be required). This is documented in
+LEARNING_ARCHITECTURE.md section 11a and KNOWLEDGE_ARCHITECTURE.md section 9.
 """
 
 from __future__ import annotations
@@ -72,3 +72,48 @@ def refs_owned(cursor, owner_user_id: int,
         if int(row[0]) != len(wanted):
             return False
     return True
+
+
+def parent_owned(cursor, owner_user_id: int, table: str, column: str,
+                 value: Any) -> bool:
+    """Single mandatory parent: False when missing (None) or not owned."""
+    if value is None:
+        return False
+    return refs_owned(cursor, owner_user_id, [(table, column, [value])])
+
+
+# Fixed SQL, no interpolation. Each check is a single parameterized query.
+
+_DOCUMENT_MATCHES_SOURCE_SQL = (
+    "SELECT COUNT(*) FROM knowledge_documents d "
+    "JOIN knowledge_sources s ON s.source_id = d.source_id "
+    "AND s.owner_user_id = d.owner_user_id "
+    "WHERE d.document_id = ? AND d.owner_user_id = ? AND d.source_id = ?"
+)
+
+_SECTION_MATCHES_SQL = (
+    "SELECT COUNT(*) FROM knowledge_sections "
+    "WHERE section_id = ? AND owner_user_id = ? AND document_id = ? AND source_id = ?"
+)
+
+
+def document_matches_source(cursor, owner_user_id: int, document_id: Any,
+                            source_id: Any) -> bool:
+    """True only if the document is owned by the owner, its stored source_id
+    equals ``source_id``, and that source is also owned by the same owner."""
+    if document_id is None or source_id is None:
+        return False
+    cursor.execute(_DOCUMENT_MATCHES_SOURCE_SQL,
+                   (document_id, owner_user_id, source_id))
+    return int(cursor.fetchone()[0]) == 1
+
+
+def section_matches(cursor, owner_user_id: int, section_id: Any,
+                    document_id: Any, source_id: Any) -> bool:
+    """True only if the section is owned by the owner and its stored document_id
+    and source_id both equal the supplied values."""
+    if section_id is None or document_id is None or source_id is None:
+        return False
+    cursor.execute(_SECTION_MATCHES_SQL,
+                   (section_id, owner_user_id, document_id, source_id))
+    return int(cursor.fetchone()[0]) == 1

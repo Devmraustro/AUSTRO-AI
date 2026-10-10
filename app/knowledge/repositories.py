@@ -16,7 +16,12 @@ from typing import Any, Dict, List, Optional
 
 from app.database.connection import DatabaseManager
 from app.database.dialect import DB_ERROR
-from app.database.ownership import refs_owned
+from app.database.ownership import (
+    document_matches_source,
+    parent_owned,
+    refs_owned,
+    section_matches,
+)
 from app.knowledge.models import (
     CANCELLED_STATUS,
     COMPLETED_STATUS,
@@ -249,6 +254,11 @@ class KnowledgeDocumentRepository(_KnowledgeBase):
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                if not parent_owned(cursor, owner_user_id, "knowledge_sources",
+                                    "source_id", source_id):
+                    logger.warning("document rejected: source missing or not owned by owner")
+                    self._rollback()
+                    return None
                 cursor.execute(
                     "INSERT INTO knowledge_documents "
                     "(source_id, owner_user_id, version, title, author, language, "
@@ -314,6 +324,11 @@ class KnowledgeSectionRepository(_KnowledgeBase):
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                if not document_matches_source(cursor, owner_user_id,
+                                               document_id, source_id):
+                    logger.warning("section rejected: document/source missing, foreign, or mismatched")
+                    self._rollback()
+                    return None
                 cursor.execute(
                     "INSERT INTO knowledge_sections "
                     "(document_id, owner_user_id, source_id, level, title, "
@@ -403,6 +418,16 @@ class KnowledgeChunkRepository(_KnowledgeBase):
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                if not document_matches_source(cursor, owner_user_id,
+                                               document_id, source_id):
+                    logger.warning("chunk rejected: document/source missing, foreign, or mismatched")
+                    self._rollback()
+                    return None
+                if section_id is not None and not section_matches(
+                        cursor, owner_user_id, section_id, document_id, source_id):
+                    logger.warning("chunk rejected: section missing, foreign, or mismatched")
+                    self._rollback()
+                    return None
                 cursor.execute(
                     "SELECT chunk_id FROM knowledge_chunks "
                     "WHERE owner_user_id = ? AND chunk_key = ?",
