@@ -216,6 +216,32 @@ SQLite file-copy backups remain valid for the local/dev engine, but they are
 
 ## 7. CI evidence (GitHub Actions `backup-integration`)
 
-_Filled in from the remote run for the final commit of this branch; see the final
-report for the run URL and HEAD SHA._
+Code under test: commit `0972a57` on `arena/d94e58c6-austro-ai` (documentation
+commits after it do not change any code path).
+
+| Run | Event | Result |
+|---|---|---|
+| [38006850038](https://github.com/Devmraustro/AUSTRO-AI/actions/runs/38006850038) | push | all 9 jobs success |
+| [38006853850](https://github.com/Devmraustro/AUSTRO-AI/actions/runs/38006853850) | pull_request | all 9 jobs success |
+
+Steps of job `Encrypted backup and disposable restore (PostgreSQL 16)` in run
+38006850038 (each step's conclusion is `success`):
+
+1. Ephemeral secrets generated on the runner (32-byte backup key, separate wrong key; values masked and never printed)
+2. Real backup image built from `Dockerfile.backup`; `cryptography` (AESGCM) and `psycopg2` imported in the image
+3. Disposable source database, restore target and application role seeded
+4. Encrypted backup: `pg_dump` 16 -> AES-256-GCM, published pair verified on the runner (no plaintext SQL markers, manifest declares `aes-256-gcm`, no key material)
+5. Wrong key refused with exit 1, target sentinel data intact
+6. Tampered archive (one flipped byte) refused with exit 1, target sentinel data intact
+7. Unsafe targets (application DB) and missing destructive confirmation refused with exit 2
+8. Restore into the disposable database with the correct key: exit 0, restored counts verified against the manifest
+9. Ephemeral keys and working files removed (`if: always()`)
+
+The job's raw log could not be downloaded in this session (the log service returned
+errors), so the table records step-level conclusions from the GitHub API.
+
+Local rehearsal before the push, against PostgreSQL 16.2, using the same scripts
+and the PATH-only tool lookup: backup published and verified (3 tables, 15 rows);
+wrong key exit 1 with "NOT modified"; correct-key restore exit 0, `tables=3
+total_rows=15 ALL ROW COUNTS MATCH`, `RESTORE DRILL: ALL CHECKS PASSED`.
 
