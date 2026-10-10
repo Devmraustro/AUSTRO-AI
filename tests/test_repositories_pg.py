@@ -391,7 +391,7 @@ def test_knowledge_source_document_chunk_ids_and_embeddings(pg_knowledge):
     assert store.embeddings.count_for_source(1, source_id, "local", "1") == 1
 
     event_id = store.events.log(
-        owner_user_id=1, query="time", top_k=5, result_count=1,
+        owner_user_id=1, top_k=5, result_count=1,
         latency_ms=1.5, generator="local",
     )
     assert isinstance(event_id, int) and event_id > 0

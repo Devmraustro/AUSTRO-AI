@@ -26,10 +26,11 @@ This document describes the privacy guarantees, data retention rules, and deleti
 - **LLM Responses:** AI-generated responses are NOT stored in the database (see telemetry below).
 - **API Keys/Secrets:** Bot token, Gemini key, or any secrets are never stored in database records.
 - **Conversation Text:** Full conversation history is not stored as a monolithic blob; only audited events are logged.
-- **Knowledge search queries (KNOWN GAP, not yet compliant):** the text a user types into a knowledge
-  search is stored in `knowledge_retrieval_events.query`. No retention purge or delete path exists yet,
-  and deleting a knowledge source does not remove these rows. Until this is fixed, treat that statement
-  as a limitation, not a guarantee.
+- **Knowledge search queries:** the text a user types into a knowledge search is NOT stored. Each
+  search writes a `knowledge_retrieval_events` row with the counts, latency, generator and cited chunks,
+  and `query` is written as an empty string (`KnowledgeEventRepository.log`). Verified by
+  `tests/test_retrieval_query_privacy.py` (SQLite) and `_pg.py` (PostgreSQL). Rows written by earlier
+  builds may still hold query text; `scrub_legacy_query_text()` blanks it and is run only deliberately.
 
 ## 2. Retention Rules
 

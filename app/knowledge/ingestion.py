@@ -49,6 +49,10 @@ class IngestionPipeline:
                  settings_: Optional[Settings] = None):
         self._store = store
         self._storage = storage
+        # (owner, source) pairs with a run in progress in THIS process. A second
+        # start for the same source would otherwise purge and rebuild the rows
+        # of the first run. Event-loop code: the set needs no extra lock.
+        self._active: set = set()
         self._extractor = extractor or TextExtractor()
         self._cleaner = cleaner or TextCleaner()
         self._settings = settings_ or __import__(
@@ -63,6 +67,19 @@ class IngestionPipeline:
 
     async def process_source(self, source_id: int, owner_user_id: int,
                              progress: Optional[ProgressFn] = None) -> IngestionResult:
+        key = (owner_user_id, source_id)
+        if key in self._active:
+            current = self._store.sources.get(owner_user_id, source_id) or {}
+            return IngestionResult(source=current, status=_PROCESSING,
+                                   error="المعالجة جارية بالفعل")
+        self._active.add(key)
+        try:
+            return await self._process_source(source_id, owner_user_id, progress)
+        finally:
+            self._active.discard(key)
+
+    async def _process_source(self, source_id: int, owner_user_id: int,
+                              progress: Optional[ProgressFn] = None) -> IngestionResult:
         source = self._store.sources.get(owner_user_id, source_id)
         if source is None:
             raise NotFoundError("الكتاب غير موجود")
@@ -71,6 +88,19 @@ class IngestionPipeline:
             return IngestionResult(
                 source=source, status=COMPLETED_STATUS, chunk_count=0
             )
+
+        # A retry of a FAILED source must start from a clean index. An earlier
+        # attempt may have left derived rows behind (its own purge can fail).
+        # They are not searchable (the source is not COMPLETED). Remove them
+        # first; if that fails, stop here with an explicit error rather than
+        # attempt a rebuild that would collide with the leftovers.
+        if source["status"] == FAILED_STATUS and not self._store.purge_partial_index(
+                owner_user_id, source_id):
+            safe = "تعذر تنظيف المحاولة السابقة، حاول مجدداً"
+            self._store.sources.set_state(owner_user_id, source_id, FAILED_STATUS,
+                                          source.get("ingestion_state") or "EXTRACT",
+                                          error=safe)
+            return IngestionResult(source=source, status=FAILED_STATUS, error=safe)
 
         result = IngestionResult(source=source, status=FAILED_STATUS)
         try:

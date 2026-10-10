@@ -64,7 +64,7 @@ def _world(store, owner: int, tag: str):
         owner_user_id=owner, source_id=source_id, document_id=document_id,
         section_id=section_id, chunk_key=f"{tag}-c1", content=f"{tag} secret text",
         content_hash=f"h-{tag}", token_count=2, char_count=10, page=None, order_index=0)
-    event_id = store.events.log(owner_user_id=owner, query=f"{tag} query", top_k=3,
+    event_id = store.events.log(owner_user_id=owner, top_k=3,
                                 result_count=1, latency_ms=1.0, generator="local")
     collection_id = store.collections.create(owner, f"{tag} collection")
     for value in (source_id, document_id, section_id, chunk_id, event_id, collection_id):
@@ -166,7 +166,7 @@ def test_citation_with_mismatched_source_is_rejected(store, manager, b):
 
 
 def test_citations_same_owner_succeed(store, manager, a):
-    event_id = store.events.log(owner_user_id=OWNER_A, query="again", top_k=3,
+    event_id = store.events.log(owner_user_id=OWNER_A, top_k=3,
                                 result_count=1, latency_ms=1.0, generator="local")
     written = store.events.add_citations(
         OWNER_A, event_id, [_citation(a["chunk"], a["source"])])

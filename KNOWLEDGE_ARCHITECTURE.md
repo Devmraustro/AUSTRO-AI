@@ -67,8 +67,9 @@ The facade is the single entry point for presentation + tests.
 - `knowledge_embeddings` — vectors (JSON) per chunk + model + version
   (`UNIQUE(chunk_row_id, model, version)`).
 - `knowledge_collections` / `knowledge_collection_sources` — named groupings.
-- `knowledge_retrieval_events` / `knowledge_citations` — audit log of every
-  search and the evidence it cited.
+- `knowledge_retrieval_events` / `knowledge_citations` — log of every search
+  (counts, latency, generator) and the evidence it cited. The query text is
+  NOT stored; `query` is written as `''`.
 - `knowledge_storage_files` — file records linking storage keys to sources.
 
 All rows carry `owner_user_id`; every query filters by it.
@@ -92,6 +93,17 @@ NORMALIZE → STRUCTURE → SECTION → CHUNK → METADATA → EMBED → INDEX �
 12. **READY** — only after `embeddings count == chunk count` for the source.
 
 Failures set `status=failed` + `error_message` (user-safe) and stay retryable.
+After a late failure the pipeline purges the source's derived rows
+(citations, embeddings, chunks, sections, documents) in one transaction. Those
+rows are never searchable, because retrieval reads only COMPLETED sources. If
+that purge itself fails, the rollback keeps the leftovers and the failure is
+logged at ERROR. A retry of a FAILED source purges again first. If that purge
+still fails, the retry stops with an explicit error and changes nothing. A
+second `process_source` call for a source already running in this process is
+refused with "المعالجة جارية بالفعل" and touches no rows. The guard is
+in-process only: several worker processes sharing one database are not covered.
+Tests: `tests/test_ingestion_purge_failure.py` (SQLite) and
+`tests/test_ingestion_purge_failure_pg.py` (PostgreSQL), `tests/test_ingestion_concurrency.py`.
 `SIGINT`/cancellation may set `cancelled`; nothing is ever half-committed as
 "completed".
 
@@ -193,11 +205,19 @@ with offline `LocalProvider` fallback) → attach citations.
   attempts, same-owner mismatches, missing parents, and valid creation, and they
   query the table directly for each rejected case.
 
-  **Remaining limitation:** these references have no hard FK, because owner-
-  scoped FKs would need table rebuilds in SQLite. A parent deleted by another
-  process can race an insert that has already passed its check. This race is
-  not eliminated. Within one process the check and the insert are serialized
-  by the repository lock. See LEARNING_ARCHITECTURE §11a.
+  **Remaining limitation:** the owner match is not a hard FK, because owner-
+  scoped FKs would need table rebuilds in SQLite; it is enforced by the
+  validators. The parent-id foreign keys (source, document, section, chunk)
+  are enforced by the database on both SQLite (`PRAGMA foreign_keys=ON`) and
+  PostgreSQL. So if a parent is deleted by another process after the check
+  but before the insert, the insert is rejected and the child is not written
+  (`tests/test_deletion_race_backstop.py`, `_pg.py`). See LEARNING_ARCHITECTURE §11a.
+
+**Source deletion order.** `delete_source` removes the stored original first.
+If that removal fails, the row is kept and the call returns `False`, so the
+content is not left on disk without a record. If the row delete then fails,
+the source is left without its file. Deleting again is safe, because a missing
+file is not an error. Tests: `tests/test_source_deletion_consistency.py`.
 
 ## 10. Limits & configuration
 
@@ -213,9 +233,9 @@ The storage root (`knowledge_storage/` by default) is auto-created.
 
 ## 11. Observability
 
-- `knowledge_retrieval_events` + `knowledge_citations` give a full audit trail:
-  who searched what, which chunks were surfaced, at what score, with which
-  generator.
+- `knowledge_retrieval_events` + `knowledge_citations` record when and how
+  often each owner searched, which chunks were surfaced, at what score, and
+  with which generator. They deliberately do not record what was searched.
 - Source/done/failure transitions are logged (via the shared
   `RedactingFormatter` — no tokens/keys leak).
 - `IngestionProgress` callbacks feed the Telegram "processing…" notifications.

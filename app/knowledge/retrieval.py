@@ -66,7 +66,7 @@ class RetrievalService:
         )
         if not candidates:
             result = RetrievalResult(query=query, generator=self._embeddings.model())
-            self._log_event(owner_user_id, query, top_k, result)
+            result.event_id = self._log_event(owner_user_id, top_k, result)
             result.latency_ms = (time.perf_counter() - started) * 1000
             return result
 
@@ -137,7 +137,7 @@ class RetrievalService:
             generator=self._embeddings.model(),
             candidates_scanned=len(candidates),
         )
-        result.event_id = self._log_event(owner_user_id, query, top_k, result)
+        result.event_id = self._log_event(owner_user_id, top_k, result)
         result.latency_ms = (time.perf_counter() - started) * 1000
         return result
 
@@ -171,11 +171,11 @@ class RetrievalService:
                 bonus += 0.10
         return bonus
 
-    def _log_event(self, owner_user_id: int, query: str, top_k: int,
+    def _log_event(self, owner_user_id: int, top_k: int,
                    result: RetrievalResult) -> Optional[int]:
+        # The query text is deliberately not stored (see KnowledgeEventRepository.log).
         event_id = self._store.events.log(
             owner_user_id=owner_user_id,
-            query=query,
             top_k=top_k,
             result_count=len(result.chunks),
             latency_ms=result.latency_ms,

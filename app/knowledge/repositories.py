@@ -582,8 +582,14 @@ class KnowledgeEmbeddingRepository(_KnowledgeBase):
 
 
 class KnowledgeEventRepository(_KnowledgeBase):
-    def log(self, *, owner_user_id: int, query: str, top_k: int,
+    def log(self, *, owner_user_id: int, top_k: int,
             result_count: int, latency_ms: float, generator: str) -> Optional[int]:
+        """Record one retrieval event WITHOUT the user's query text.
+
+        The raw query is never persisted: no feature, evaluation or debugging
+        path reads it. The column is kept (NOT NULL, no migration) and written
+        as an empty string so the row still counts searches and citations.
+        """
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
@@ -591,7 +597,7 @@ class KnowledgeEventRepository(_KnowledgeBase):
                     "INSERT INTO knowledge_retrieval_events "
                     "(owner_user_id, query, top_k, result_count, latency_ms, generator) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
-                    (owner_user_id, query, top_k, result_count, latency_ms, generator),
+                    (owner_user_id, "", top_k, result_count, latency_ms, generator),
                 )
                 self._connection().commit()
                 return cursor.lastrowid
@@ -599,6 +605,26 @@ class KnowledgeEventRepository(_KnowledgeBase):
             self._rollback()
             logger.error(f"Database error in knowledge log event: {e}")
             return None
+
+    def scrub_legacy_query_text(self) -> int:
+        """Blank raw query text stored by builds that predate query suppression.
+
+        Changes only the `query` column; rows, counts and citations are kept.
+        Not called automatically: run it deliberately, after backup.
+        Returns the number of rows changed, or -1 on a database error.
+        """
+        try:
+            with self._manager._lock:
+                cursor = self._connection().cursor()
+                cursor.execute(
+                    "UPDATE knowledge_retrieval_events SET query = '' WHERE query <> ''"
+                )
+                self._connection().commit()
+                return int(cursor.rowcount)
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error scrubbing legacy query text: {e}")
+            return -1
 
     def add_citations(self, owner_user_id: int, event_id: int,
                       citations: List[Dict[str, Any]]) -> int:

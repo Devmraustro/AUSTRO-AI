@@ -140,7 +140,12 @@ class KnowledgeService:
 
     def delete_source(self, owner_user_id: int, source_id: int) -> bool:
         source = self.permissions.require_source(owner_user_id, source_id)
-        self._storage.delete(source.get("storage_key"))
+        # Remove the file first, and keep the row if that fails: otherwise the
+        # uploaded content would stay on disk with no record pointing at it.
+        # If the row delete fails after the file is gone, the source is left
+        # without its original file; deleting again is safe (no file to remove).
+        if not self._storage.delete(source.get("storage_key")):
+            return False
         return self._store.sources.delete(owner_user_id, source_id)
 
     def counts(self, owner_user_id: int) -> Dict[str, int]:

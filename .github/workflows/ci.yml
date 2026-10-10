@@ -89,7 +89,7 @@ jobs:
           DB_ADMIN_PASSWORD: austro_ci
         run: |
           set -o pipefail
-          python -m pytest tests/test_learning_ownership_pg.py tests/test_knowledge_ownership_pg.py tests/test_memory_erasure_pg.py -q --tb=short 2>&1 | tee /tmp/pg_ownership_results.log
+          python -m pytest tests/test_learning_ownership_pg.py tests/test_knowledge_ownership_pg.py tests/test_memory_erasure_pg.py tests/test_retrieval_query_privacy_pg.py tests/test_ingestion_purge_failure_pg.py -q --tb=short 2>&1 | tee /tmp/pg_ownership_results.log
           if grep -q "skipped" /tmp/pg_ownership_results.log; then
             echo "ERROR: PostgreSQL ownership/erasure tests were skipped"
             exit 1
