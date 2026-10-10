@@ -96,8 +96,10 @@ austro_ai_backup_<UTCTIMESTAMP>.manifest.json
 ```
 The `.sql.gz` name is kept for compatibility. With a key configured, the file is
 the encrypted container above. Without one (only possible when
-`BACKUP_ENCRYPTION_ENABLED` is unset, i.e. a manual local run), it is plain gzip.
-The production worker never runs in that mode.
+`BACKUP_ENCRYPTION_ENABLED` is unset, i.e. a direct `python3 scripts/pg_backup.py`
+run), it is plain gzip. The production worker never runs in that mode. The
+deprecated `scripts/backup.sh` wrapper forces `BACKUP_ENCRYPTION_ENABLED=true`, so
+it refuses to run without a valid key instead of writing plaintext.
 
 Requirements: `DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD` and
 `PG_BIN` pointing at the PostgreSQL `bin` directory (not needed in the

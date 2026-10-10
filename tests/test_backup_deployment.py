@@ -119,3 +119,26 @@ def test_git_tracks_no_key_or_dump_files():
     bad = [f for f in out.stdout.splitlines()
            if f.endswith((".key", ".sql", ".sql.gz", ".dump")) or f.startswith("secrets/")]
     assert not bad, bad
+
+
+def test_deprecated_backup_wrapper_fails_closed_without_key(tmp_path):
+    """scripts/backup.sh must never write a plaintext archive.
+
+    With no encryption key and BACKUP_ENCRYPTION_ENABLED unset in the caller's
+    environment, the wrapper forces encryption on and refuses before any
+    database contact or archive write.
+    """
+    import os
+
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("BACKUP_ENCRYPTION_ENABLED", "BACKUP_ENCRYPTION_KEY_FILE")}
+    env.update({"DB_HOST": "127.0.0.1", "DB_PORT": "1"})
+    outdir = tmp_path / "backups"
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts" / "backup.sh"), str(outdir)],
+        env=env, capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode != 0
+    assert "BACKUP_ENCRYPTION_KEY_FILE is not configured" in (result.stdout + result.stderr)
+    archives = list(outdir.glob("*")) if outdir.exists() else []
+    assert archives == []

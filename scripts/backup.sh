@@ -7,4 +7,7 @@
 # are configured. Usage: scripts/backup.sh [outdir]
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# Force encryption on: this wrapper must never produce a plaintext archive, even
+# when the operator's environment leaves BACKUP_ENCRYPTION_ENABLED unset.
+export BACKUP_ENCRYPTION_ENABLED=true
 exec python3 scripts/pg_backup.py "${1:-${BACKUP_OUTDIR:-backups}}"

@@ -26,6 +26,10 @@ This document describes the privacy guarantees, data retention rules, and deleti
 - **LLM Responses:** AI-generated responses are NOT stored in the database (see telemetry below).
 - **API Keys/Secrets:** Bot token, Gemini key, or any secrets are never stored in database records.
 - **Conversation Text:** Full conversation history is not stored as a monolithic blob; only audited events are logged.
+- **Knowledge search queries (KNOWN GAP, not yet compliant):** the text a user types into a knowledge
+  search is stored in `knowledge_retrieval_events.query`. No retention purge or delete path exists yet,
+  and deleting a knowledge source does not remove these rows. Until this is fixed, treat that statement
+  as a limitation, not a guarantee.
 
 ## 2. Retention Rules
 
@@ -58,7 +62,12 @@ COACH_LOG_RETENTION_DAYS = 90
 ## 3. Deletion Rules
 
 ### 3.1 User-Initiated Deletion
-Users can delete their data via Telegram commands:
+**Implementation status (audit of PR #1):** the `/forget`, `/delete` and `/export` commands below are NOT
+registered in the Telegram bot, and no account-deletion or export code exists. Memory forget/clear/delete is
+reachable only through the coach menu. The account-wide cascade in the table is the intended design, not
+current behaviour. Knowledge-source deletion exists in the service layer but has no user-facing command.
+
+Users can delete their data via Telegram commands (intended, see status note above):
 
 | Command | What It Deletes | Cascade |
 |---------|----------------|---------|

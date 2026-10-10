@@ -183,6 +183,7 @@ def benchmark_knowledge_retrieval() -> BenchmarkResult:
                 order_index=i,
                 metadata={},
             )
+            assert chunk_id is not None, "chunk create rejected in perf fixture"
             chunk_ids.append(chunk_id)
         
         # Generate embeddings
@@ -204,7 +205,7 @@ def benchmark_knowledge_retrieval() -> BenchmarkResult:
                 dimensions=embedder.dimensions,
                 vector=vector,
             ))
-        knowledge.embeddings.save_many(embedding_records)
+        assert knowledge.embeddings.save_many(embedding_records) == len(embedding_records)
         
         # Run retrieval benchmarks
         cleaner = TextCleaner()
@@ -641,14 +642,15 @@ async def _run_concurrent_workload() -> BenchmarkResult:
             content_hash="hash", token_count=10, char_count=30,
             page="1", order_index=0, metadata={},
         )
+        assert chunk_id is not None, "chunk create rejected in concurrency fixture"
         embedder = LocalHashEmbedder(dimensions=128, version="1")
         vector = embedder.embed("Test content for retrieval")
-        knowledge.embeddings.save_many([EmbeddingRecord(
+        assert knowledge.embeddings.save_many([EmbeddingRecord(
             owner_user_id=owner_user_id, source_id=source_id,
             chunk_row_id=chunk_id, model=embedder.model,
             version=embedder.version, dimensions=embedder.dimensions,
             vector=vector,
-        )])
+        )]) == 1
         
         # Define concurrent tasks
         cleaner = TextCleaner()
