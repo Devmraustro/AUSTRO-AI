@@ -86,7 +86,7 @@ pytest
 
 Tests run offline: they set a dummy `BOT_TOKEN`, use a temporary SQLite database, and leave `GEMINI_API_KEY` unset so nothing hits the network.
 
-**752 passed, 1 skipped** on PostgreSQL 16.2 (the skip needs Docker). Without PostgreSQL, 658 pass and 95 PostgreSQL-only tests are skipped. Measured 2026-10-10 on branch `arena/d94e58c6-austro-ai`; the CI run is the authoritative record.
+**807 passed, 1 skipped** on PostgreSQL 16.2 (the skip needs Docker). Without PostgreSQL, 690 pass and 118 PostgreSQL-only tests are skipped. Measured 2026-10-10 on branch `arena/d94e58c6-austro-ai`; the CI run is the authoritative record.
 
 ### Evaluation & Regression (Phase F)
 
