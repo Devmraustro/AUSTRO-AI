@@ -40,6 +40,20 @@ ProgressFn = Callable[[str, str, str], Awaitable[None]]
 _PROCESSING = "processing"
 
 
+def scoped_chunk_key(source_id: int, position: int, content_key: str) -> str:
+    """Key stored in knowledge_chunks.chunk_key (UNIQUE per owner).
+
+    The bare content hash cannot be unique per owner: the same paragraph repeated
+    in one book, or shared by two books of the same user, made the second insert
+    collide and the source could never be indexed. Scoping by source and position
+    keeps the constraint while allowing those cases. Retrieval dedupes by content.
+    """
+    return hashlib.sha1(
+        f"{source_id}:{position}:{content_key}".encode("utf-8"),
+        usedforsecurity=False,
+    ).hexdigest()
+
+
 class IngestionPipeline:
     def __init__(self, store: KnowledgeStore, storage: StorageService,
                  extractor: Optional[TextExtractor] = None,
@@ -94,7 +108,9 @@ class IngestionPipeline:
         # They are not searchable (the source is not COMPLETED). Remove them
         # first; if that fails, stop here with an explicit error rather than
         # attempt a rebuild that would collide with the leftovers.
-        if source["status"] == FAILED_STATUS and not self._store.purge_partial_index(
+        # PROCESSING with no run in this process is a leftover of a crash or
+        # cancellation (see the in-process guard above). Treated like FAILED.
+        if source["status"] in (FAILED_STATUS, _PROCESSING) and not self._store.purge_partial_index(
                 owner_user_id, source_id):
             safe = "تعذر تنظيف المحاولة السابقة، حاول مجدداً"
             self._store.sources.set_state(owner_user_id, source_id, FAILED_STATUS,
@@ -105,6 +121,15 @@ class IngestionPipeline:
         result = IngestionResult(source=source, status=FAILED_STATUS)
         try:
             await self._run(source, progress, result)
+        except asyncio.CancelledError:
+            # Not an Exception, so the handler below never sees it. Record the
+            # run as FAILED and remove its partial rows, then let it propagate.
+            self._store.sources.set_state(
+                owner_user_id, source_id, FAILED_STATUS, result.state or "EXTRACT",
+                error="أُلغيت المعالجة، حاول مجدداً",
+            )
+            self._store.purge_partial_index(owner_user_id, source_id)
+            raise
         except Exception as exc:  # noqa: BLE001 - persist failures not crash
             safe = self._safe_error(exc)
             logger.exception(f"Knowledge ingestion failed for {source_id}: {safe}")
@@ -235,18 +260,20 @@ class IngestionPipeline:
         )
         if embedded_count != len(chunks):
             raise ValidationError("فهرسة غير مكتملة، حاول المعالجة مجدداً")
-        self._store.documents.complete(
-            owner, document_id, total_sections=len(sections_data)
-        )
+        if not self._store.documents.complete(
+                owner, document_id, total_sections=len(sections_data)):
+            raise ValidationError("تعذر إكمال سجل المستند، حاول مجدداً")
         self._store.sources.set_title(
             owner, source_id, title=metadata["title"],
             author=metadata.get("author"), language=language,
             pages=page_count, char_count=len(normalized_text),
             metadata=metadata,
         )
-        self._store.sources.set_state(
-            owner, source_id, COMPLETED_STATUS, READY_STATE
-        )
+        if not self._store.sources.set_state(
+                owner, source_id, COMPLETED_STATUS, READY_STATE):
+            # The status write is what makes the source searchable. If it did
+            # not persist, the run must not report success.
+            raise ValidationError("تعذر حفظ حالة الاكتمال، حاول مجدداً")
         await self._emit(
             progress, "READY", "جاهز", "✅ تمت فهرسة الكتاب بنجاح"
         )
@@ -305,7 +332,9 @@ class IngestionPipeline:
                 end_char=section["end_char"],
             )
             if section_id is None:
-                section_id = 0
+                # Fail closed: a missing section must not become section 0 or a
+                # sectionless chunk marked COMPLETED.
+                raise ValidationError("تعذر فهرسة الأقسام، حاول المعالجة مجدداً")
             section_refs[index] = section_id
         return {"document_id": document_id, "section_refs": section_refs}
 
@@ -318,12 +347,13 @@ class IngestionPipeline:
             section_id = section_refs.get(section_index) if section_index is not None else None
             if section_id == 0:
                 section_id = None
+            key = scoped_chunk_key(source_id, index, chunk["chunk_key"])
             row_id = self._store.chunks.create(
                 owner_user_id=owner,
                 source_id=source_id,
                 document_id=document_id,
                 section_id=section_id,
-                chunk_key=chunk["chunk_key"],
+                chunk_key=key,
                 content=chunk["content"],
                 content_hash=chunk["content_hash"],
                 token_count=chunk["token_count"],
@@ -337,7 +367,7 @@ class IngestionPipeline:
                 },
             )
             if row_id is None:
-                row_id = self._existing_chunk_id(owner, chunk["chunk_key"])
+                row_id = self._existing_chunk_id(owner, key)
             if row_id is None:
                 continue
             row_ids.append(row_id)

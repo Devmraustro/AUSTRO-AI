@@ -75,7 +75,10 @@ jobs:
           set -o pipefail
           python -m pytest tests/test_repositories_pg.py -q --tb=short 2>&1 | tee /tmp/pg_results.log
           grep -q "18 passed" /tmp/pg_results.log || { echo "ERROR: Expected 18 passed"; exit 1; }
-          grep -q "skipped" /tmp/pg_results.log && { echo "ERROR: Tests were skipped"; exit 1; } || true
+          if grep -q "skipped" /tmp/pg_results.log; then
+            echo "ERROR: Tests were skipped"
+            exit 1
+          fi
           echo "PostgreSQL integration tests: 18 passed, 0 skipped"
 
       - name: PostgreSQL ownership and erasure regression tests (no skips)

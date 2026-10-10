@@ -89,14 +89,14 @@ complete, nothing is changed and the user is told it failed. Details:
 3. **learning** (v1) - learning goals, objectives, curricula, lessons, sessions, assessments, misconceptions, progress, reviews, events
 
 ### 3.3 Admin-Initiated Deletion
-- Admins can trigger `/delete` on behalf of a user (with user consent verification).
+- Intended, not implemented: admins triggering `/delete` on behalf of a user (with user consent verification). No such command exists (see the status note in 3.1).
 - Admin-initiated deletion follows the same cascade order.
 - Deletion events are logged to `activity_log` with the admin user ID and target user ID.
 
 ### 3.4 Irreversibility
 - Once `/delete` is confirmed, data recovery is not possible through the normal interface.
 - Backup restoration may recover data if backups exist (see `SECURITY_ARCHITECTURE.md` backup procedures).
-- Users are warned before `/delete` confirmation.
+- Intended, not implemented: a warning before `/delete` confirmation. No `/delete` flow exists (see 3.1).
 
 ## 4. Data Derivation & Sharing
 

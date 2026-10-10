@@ -62,8 +62,12 @@ The facade is the single entry point for presentation + tests.
 - `knowledge_sections` — hierarchical structure sections (level, char ranges,
   parent ref).
 - `knowledge_chunks` — normalized paragraphs grouped into semantic chunks
-  (`chunk_key` sha1, content_hash sha256, section/page attribution,
-  `UNIQUE(owner_user_id, chunk_key)`).
+  (`chunk_key` sha1 of source id, position and cleaned content; content_hash
+  sha256; section/page attribution; `UNIQUE(owner_user_id, chunk_key)`). The key
+  is scoped by source and position so that a paragraph repeated in one book, or
+  shared by two books of one owner, does not collide. Rows written by earlier
+  builds keep their content-only keys. Retrieval dedupes by a hash of the cleaned
+  content, not by the stored key, so identical text is still shown once.
 - `knowledge_embeddings` — vectors (JSON) per chunk + model + version
   (`UNIQUE(chunk_row_id, model, version)`).
 - `knowledge_collections` / `knowledge_collection_sources` — named groupings.
@@ -125,7 +129,7 @@ Tests: `tests/test_ingestion_purge_failure.py` (SQLite) and
    collection members).
 2. Score = `0.55·keyword(+token overlap) + 0.35·semantic(cosine) + min(title
    bonus, 0.20)`. Query and content tokens come from the same cleaner.
-3. Drop scores below `knowledge_retrieval_min_score`; dedupe by chunk_key;
+3. Drop scores below `knowledge_retrieval_min_score`; dedupe by cleaned content;
    sort desc; cap at `top_k`.
 4. Log `knowledge_retrieval_events` + per-chunk `knowledge_citations`.
 
@@ -187,6 +191,8 @@ with offline `LocalProvider` fallback) → attach citations.
     document and source. A rejected chunk is not inserted, and `None` is
     returned. The idempotent duplicate case (same owner and `chunk_key`) also
     returns `None`, so callers cannot tell the two apart from the return value.
+    Ingestion avoids relying on this: keys are source-scoped, and a `None` from a
+    chunk insert is resolved only to a chunk of the same source.
   - Collection membership checks the collection and the source. Storage
     registration checks the source. Citations check the retrieval event and each
     (chunk, source) pair. Embedding batches check each (chunk, source) pair.
