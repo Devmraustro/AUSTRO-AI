@@ -42,16 +42,23 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         python3 \
         python3-venv \
-    && rm -rf /var/lib/apt/lists/* \
-    && python3 -m venv /opt/backup-venv \
-    && /opt/backup-venv/bin/pip install --no-cache-dir "psycopg2-binary>=2.9,<3"
+    && rm -rf /var/lib/apt/lists/*
+
+# Python dependencies. `cryptography` is REQUIRED: scripts/pg_backup.py performs
+# AES-256-GCM encryption and the restore drill decrypts. Its import is asserted
+# at build time below, so an image without it cannot be produced.
+COPY requirements-backup.txt /tmp/requirements-backup.txt
+RUN python3 -m venv /opt/backup-venv \
+    && /opt/backup-venv/bin/pip install --no-cache-dir -r /tmp/requirements-backup.txt \
+    && rm -f /tmp/requirements-backup.txt
 
 ENV PATH="/opt/backup-venv/bin:$PATH"
 
 # The client major version is a production-safety property, so fail the build
 # rather than ship an image that cannot dump the PostgreSQL 16 target.
 RUN pg_dump --version | grep -Eq "pg_dump \(PostgreSQL\) 16\." \
-    && python3 -c "import psycopg2; print('psycopg2', psycopg2.__version__)"
+    && python3 -c "import psycopg2; print('psycopg2', psycopg2.__version__)" \
+    && python3 -c "import cryptography; from cryptography.hazmat.primitives.ciphers.aead import AESGCM; print('cryptography', cryptography.__version__, 'AESGCM OK')"
 
 # Note: this base image declares VOLUME /var/lib/postgresql/data. The worker
 # never runs the server, so that path is unused; the only data that matters is
@@ -60,9 +67,13 @@ RUN pg_dump --version | grep -Eq "pg_dump \(PostgreSQL\) 16\." \
 WORKDIR /app
 COPY scripts/ ./scripts/
 
-RUN useradd --create-home --shell /bin/bash austro \
-    && mkdir -p /app/backups \
-    && chown -R austro:austro /app
+# Fixed UID/GID so the operator can make the encryption key file readable by
+# exactly this user (and nobody else) on the host.
+RUN groupadd --gid 10001 austro \
+    && useradd --uid 10001 --gid 10001 --create-home --shell /bin/bash austro \
+    && mkdir -p /app/backups /var/tmp/austro-backup-work \
+    && chown -R austro:austro /app /var/tmp/austro-backup-work \
+    && chmod 0700 /var/tmp/austro-backup-work
 
 USER austro
 

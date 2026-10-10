@@ -168,7 +168,6 @@ def main() -> int:
     # 7. structured logging to file + redaction
     def _logs():
         from app.config.settings import settings
-        import logging
         log_path = os.path.join(settings.logs_path, "smoke.log")
         open(log_path, "a", encoding="utf-8").write(
             "SMOKE structured line with BOT_TOKEN placeholder\n"
@@ -181,9 +180,9 @@ def main() -> int:
     def _restart():
         from app.database.connection import DatabaseManager
         a = DatabaseManager()
-        ca = a._get_connection()
+        a._get_connection()  # opens the connection; must not raise
         a._close_connection()
-        b = DatabaseManager()
+        DatabaseManager()
         return "fresh manager init after close OK (restart recovery)"
 
     step("restart recovery (re-init manager)", _restart)

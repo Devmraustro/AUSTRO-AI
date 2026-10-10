@@ -62,13 +62,18 @@ The facade is the single entry point for presentation + tests.
 - `knowledge_sections` — hierarchical structure sections (level, char ranges,
   parent ref).
 - `knowledge_chunks` — normalized paragraphs grouped into semantic chunks
-  (`chunk_key` sha1, content_hash sha256, section/page attribution,
-  `UNIQUE(owner_user_id, chunk_key)`).
+  (`chunk_key` sha1 of source id, position and cleaned content; content_hash
+  sha256; section/page attribution; `UNIQUE(owner_user_id, chunk_key)`). The key
+  is scoped by source and position so that a paragraph repeated in one book, or
+  shared by two books of one owner, does not collide. Rows written by earlier
+  builds keep their content-only keys. Retrieval dedupes by a hash of the cleaned
+  content, not by the stored key, so identical text is still shown once.
 - `knowledge_embeddings` — vectors (JSON) per chunk + model + version
   (`UNIQUE(chunk_row_id, model, version)`).
 - `knowledge_collections` / `knowledge_collection_sources` — named groupings.
-- `knowledge_retrieval_events` / `knowledge_citations` — audit log of every
-  search and the evidence it cited.
+- `knowledge_retrieval_events` / `knowledge_citations` — log of every search
+  (counts, latency, generator) and the evidence it cited. The query text is
+  NOT stored; `query` is written as `''`.
 - `knowledge_storage_files` — file records linking storage keys to sources.
 
 All rows carry `owner_user_id`; every query filters by it.
@@ -92,6 +97,17 @@ NORMALIZE → STRUCTURE → SECTION → CHUNK → METADATA → EMBED → INDEX �
 12. **READY** — only after `embeddings count == chunk count` for the source.
 
 Failures set `status=failed` + `error_message` (user-safe) and stay retryable.
+After a late failure the pipeline purges the source's derived rows
+(citations, embeddings, chunks, sections, documents) in one transaction. Those
+rows are never searchable, because retrieval reads only COMPLETED sources. If
+that purge itself fails, the rollback keeps the leftovers and the failure is
+logged at ERROR. A retry of a FAILED source purges again first. If that purge
+still fails, the retry stops with an explicit error and changes nothing. A
+second `process_source` call for a source already running in this process is
+refused with "المعالجة جارية بالفعل" and touches no rows. The guard is
+in-process only: several worker processes sharing one database are not covered.
+Tests: `tests/test_ingestion_purge_failure.py` (SQLite) and
+`tests/test_ingestion_purge_failure_pg.py` (PostgreSQL), `tests/test_ingestion_concurrency.py`.
 `SIGINT`/cancellation may set `cancelled`; nothing is ever half-committed as
 "completed".
 
@@ -113,7 +129,7 @@ Failures set `status=failed` + `error_message` (user-safe) and stay retryable.
    collection members).
 2. Score = `0.55·keyword(+token overlap) + 0.35·semantic(cosine) + min(title
    bonus, 0.20)`. Query and content tokens come from the same cleaner.
-3. Drop scores below `knowledge_retrieval_min_score`; dedupe by chunk_key;
+3. Drop scores below `knowledge_retrieval_min_score`; dedupe by cleaned content;
    sort desc; cap at `top_k`.
 4. Log `knowledge_retrieval_events` + per-chunk `knowledge_citations`.
 
@@ -158,6 +174,56 @@ with offline `LocalProvider` fallback) → attach citations.
   decompression for EPUB chapters (per-chapter and cumulative).
 - **Never fabricated pages** — page attribution only comes from the PDF
   extractor's real char→page map.
+- **Reference ownership.** Every knowledge write that takes a parent ID checks
+  the parent before it inserts. All checks run inside the repository write lock,
+  on the same cursor, and a rejected write returns `None`/`False` with no row
+  written (the rollback runs on rejection and on database errors).
+  - **Document** (`KnowledgeDocumentRepository.create`): `source_id` must exist
+    and be owned by `owner_user_id`. A missing or foreign source is rejected.
+  - **Section** (`KnowledgeSectionRepository.create`): the document must be
+    owned by the owner, its stored `source_id` must equal the supplied
+    `source_id`, and that source must also be owned by the owner. One fixed
+    parameterized query checks all three.
+  - **Chunk** (`KnowledgeChunkRepository.create`): the same document/source
+    relationship check. If `section_id` is set, the section must be owned by the
+    owner and store the same `document_id` and `source_id`. A `section_id` of
+    `None` keeps the sectionless behaviour and is still checked against the
+    document and source. A rejected chunk is not inserted, and `None` is
+    returned. The idempotent duplicate case (same owner and `chunk_key`) also
+    returns `None`, so callers cannot tell the two apart from the return value.
+    Ingestion avoids relying on this: keys are source-scoped, and a `None` from a
+    chunk insert is resolved only to a chunk of the same source.
+  - Collection membership checks the collection and the source. Storage
+    registration checks the source. Citations check the retrieval event and each
+    (chunk, source) pair. Embedding batches check each (chunk, source) pair.
+  - Read and count methods filter by `owner_user_id`. `count_for_source`
+    (chunks and embeddings), `add_citations`, `names_for_source`,
+    `mark_verified` and `verified` take `owner_user_id`.
+  - `mark_verified` and `remove_source` report success only when a row changed.
+
+  Ingestion passes the same owner, source and document IDs to every child, so
+  same-owner ingestion is unchanged. Known pre-existing behaviour: if a section
+  insert is rejected, ingestion records section `0`, and its chunks are stored
+  without a section.
+
+  Tests: `tests/test_knowledge_ownership.py` (SQLite) and
+  `tests/test_knowledge_ownership_pg.py` (PostgreSQL 16). They cover cross-owner
+  attempts, same-owner mismatches, missing parents, and valid creation, and they
+  query the table directly for each rejected case.
+
+  **Remaining limitation:** the owner match is not a hard FK, because owner-
+  scoped FKs would need table rebuilds in SQLite; it is enforced by the
+  validators. The parent-id foreign keys (source, document, section, chunk)
+  are enforced by the database on both SQLite (`PRAGMA foreign_keys=ON`) and
+  PostgreSQL. So if a parent is deleted by another process after the check
+  but before the insert, the insert is rejected and the child is not written
+  (`tests/test_deletion_race_backstop.py`, `_pg.py`). See LEARNING_ARCHITECTURE §11a.
+
+**Source deletion order.** `delete_source` (service layer only; no Telegram command calls it, so users cannot delete sources today) removes the stored original first.
+If that removal fails, the row is kept and the call returns `False`, so the
+content is not left on disk without a record. If the row delete then fails,
+the source is left without its file. Deleting again is safe, because a missing
+file is not an error. Tests: `tests/test_source_deletion_consistency.py`.
 
 ## 10. Limits & configuration
 
@@ -173,9 +239,9 @@ The storage root (`knowledge_storage/` by default) is auto-created.
 
 ## 11. Observability
 
-- `knowledge_retrieval_events` + `knowledge_citations` give a full audit trail:
-  who searched what, which chunks were surfaced, at what score, with which
-  generator.
+- `knowledge_retrieval_events` + `knowledge_citations` record when and how
+  often each owner searched, which chunks were surfaced, at what score, and
+  with which generator. They deliberately do not record what was searched.
 - Source/done/failure transitions are logged (via the shared
   `RedactingFormatter` — no tokens/keys leak).
 - `IngestionProgress` callbacks feed the Telegram "processing…" notifications.

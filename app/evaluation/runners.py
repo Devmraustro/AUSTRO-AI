@@ -455,7 +455,7 @@ def evaluate_memory_case(case: EvaluationCase, memory_store) -> EvaluationResult
         for user_id in [1, 2]:
             existing = memory_store.memories.list(owner_user_id=user_id)
             for mem in existing:
-                memory_store.memories.delete(mem.memory_id, user_id)
+                memory_store.memories.delete(user_id, mem.memory_id)
         
         # Add memories for user A
         for mem in case_input["user_a_memories"]:

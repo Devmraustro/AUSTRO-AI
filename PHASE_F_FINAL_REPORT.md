@@ -1,5 +1,11 @@
 # AUSTRO AI - Phase F: Evaluation, Security, and Production Hardening
 
+> **Correction (2026-10-10):** Items 17, 18 and 19 below previously claimed `/forget`, `/export` and
+> `/delete` commands, admin-only enforcement, GDPR compliance, and complete data export/deletion. Those
+> claims are not supported by the code. The current verified state is in `PRIVACY_RETENTION.md` §3.1 and
+> §7. Only memory forget/clear and memory-only JSON export are reachable from Telegram. Account
+> export and deletion, knowledge-source deletion by users, and admin commands are not implemented.
+
 ## Executive Summary
 
 Phase F has been successfully executed, covering evaluation frameworks, security hardening, observability, cost governance, and production readiness. All Phase A-E functionality is preserved, and Phase F adds comprehensive evaluation infrastructure, security threat models, and production hardening features.
@@ -26,8 +32,8 @@ Phase F has been successfully executed, covering evaluation frameworks, security
 | 15 | Database Hardening | Complete |
 | 16 | File/Knowledge Security | Complete |
 | 17 | Telegram Security | Complete |
-| 18 | Data Export/Deletion Verification | Complete |
-| 19 | Privacy/Retention | Complete |
+| 18 | Data Export/Deletion Verification | Partial (memory export only; account export/deletion not implemented) |
+| 19 | Privacy/Retention | Partial (documentation corrected; erasure and export gaps remain) |
 | 20 | AI Output Validation Audit | Complete |
 | 20 | AI Output Validation Audit | Complete |
 | 21 | Regression Harness (verify.py) | Complete |
@@ -182,30 +188,32 @@ Phase F has been successfully executed, covering evaluation frameworks, security
   - Callback query hash verification (origin authentication)
   - Conversation state isolation (per-user database filtering)
   - Command authorization (admin user ID checks)
-  - /forget, /export, /delete commands (user-scope only, audit logged)
+  - /forget, /export, /delete: NOT implemented or registered (this item previously claimed otherwise)
   - File upload handling (size limits, type validation, path traversal protection)
   - Message size handling (4096 Telegram limit, 4090 AUSTRO guard)
   - Flood/spam protection (per-user rate limits, anti-flood delay)
   - User identity handling (update.effective_user.id only, no client-supplied IDs)
-  - Admin-only actions (ADMIN_USER_IDS check pattern)
+  - Admin-only actions: NOT implemented (no ADMIN_USER_IDS setting or check exists in `app/`)
 
 ### Phase F Item 18: Data Export/Deletion Verification
-- **Status: COMPLETE**
-- Export: `/export` provides complete user data snapshot (goals, habits, memories, knowledge, learning progress)
-- Deletion: `/delete` cascades through knowledge → memory → learning per schema_migrations order
-- Activity log tracks all export/delete events with user_id and action
-- 44 tables in database; cascade order verified from schema_migrations
+- **Status: PARTIAL (corrected 2026-10-10)**
+- Memory export (JSON) is available from the coach menu. Memories only.
+- Account export (`/export`) and account deletion (`/delete`): NOT implemented or registered.
+  `export_learning` and `delete_learning` exist at engine level and are unit-tested, but no user path calls them.
+- The planned cascade (knowledge → memory → learning) is a design target. No command executes it.
+- Nothing in `app/` writes the `activity_log` table, so export/delete events are not logged.
+- "44 tables" and the cascade order describe the schema only, not a verified deletion feature.
 
 ### Phase F Item 19: Privacy/Retention
-- **Status: COMPLETE**
-- Created `PRIVACY_RETENTION.md` documenting:
+- **Status: PARTIAL (corrected 2026-10-10)**
+- Created `PRIVACY_RETENTION.md` documenting (its implementation-status notes are authoritative):
   - What AUSTRO stores (user-provided + derived data)
   - What AUSTRO does NOT store (raw prompts, LLM responses, secrets, conversation text)
   - Retention rules (90-day default for logs, indefinite for user data until deletion)
-  - Deletion rules (/forget, /delete with cascade order, admin-initiated)
+  - Deletion rules (planned: /forget, /delete with cascade order, admin-initiated; not implemented)
   - Data derivation (embeddings, progress models, mastery states are derived, not raw)
   - What is never shared globally (no global learning, no cross-user aggregation, no public benchmarks)
-  - GDPR rights compliance (access, rectification, erasure, data portability)
+  - GDPR rights: NOT verified as compliant. Erasure and full portability are not implemented (see PRIVACY_RETENTION.md §7.1)
   - Data protection principles (purpose limitation, minimization, accuracy, storage limitation, integrity, confidentiality, accountability)
 
 ### Phase F Item 20: AI Output Validation Audit
@@ -227,7 +235,7 @@ All Phase A-E features remain fully functional and tested:
 - **Phase B:** User management, goals, habits
 - **Phase C:** Knowledge sources, book-to-course, learning engine
 - **Phase D:** Memory engine with SM-0 scheduler
-- **Phase E:** Mastery state machine, flashcards, multi-source learning, coach integration, privacy/export/delete
+- **Phase E:** Mastery state machine, flashcards, multi-source learning, coach integration, privacy (engine-level export/delete methods only; not user-reachable)
 
 All 31 Phase E tests + 5 flashcard tests + 73 Phase C tests + 57 Phase D tests remain green.
 

@@ -191,6 +191,10 @@ evidence kind and current state.
 
 ## 11. Privacy & delete
 
+**Status:** engine-level only. `export_learning` and `delete_learning` are called only from tests
+(`tests/test_learning.py`). No Telegram command or handler exposes them, so users cannot export or
+delete learning data today. A `/forget` command is planned but not registered.
+
 - `export_learning(owner)` returns a JSON-safe snapshot containing:
   - All goals, objectives, curricula, and mastery state.
 - `delete_learning(owner)` permanently deletes all learning data for the
@@ -201,6 +205,25 @@ evidence kind and current state.
   learning queries return empty results.
 
 ---
+
+### 11a. Cross-owner references
+
+Every learning write that links a row to a parent (goal parent, objective goal
+and prerequisites, curriculum goal and module objectives, lesson curriculum,
+objective and source, session goal, objective, curriculum and lesson, mastery,
+reviews, assessments, misconceptions, events) validates that each referenced
+parent belongs to the same `owner_user_id` before writing. The check is one
+batched `COUNT(DISTINCT ...)` per parent table (`app/database/ownership.py`,
+`refs_owned`), run inside the write lock on the same cursor. A foreign, missing
+or malformed ID rejects the whole write: the method returns `None` or `False`,
+and nothing is written. Regression tests in `tests/test_learning_ownership.py`
+(SQLite) and `tests/test_learning_ownership_pg.py` (PostgreSQL 16) cover each
+relation, with same-owner success cases.
+
+Limit: these references have no hard FK, because owner-scoped FKs would need
+table rebuilds in SQLite. A concurrent delete of the parent by another process
+can therefore race with an insert that has already passed the check. Within one
+process, the check and the write are serialized by the repository lock.
 
 ## 12. Observability
 
@@ -248,7 +271,7 @@ Phase E test guarantees (in `tests/test_learning.py` + `tests/test_coaching.py`)
 - Coach today returns focus, blocker, smallest_action, reason keys ✓
 - Weekly review returns summary keys (period, planned, completed, etc.) ✓
 - Book-to-course creates curriculum from knowledge source ✓
-- Privacy export/delete works end-to-end ✓
+- Privacy export/delete: the engine methods `export_learning` and `delete_learning` are unit-tested ✓. They are NOT end-to-end: no Telegram command or handler calls them (not verified as user-reachable)
 - Golden eval (run_all) passes: mastery, schedule, kinds ✓
 - Learning handlers register as ConversationHandler with menu patterns ✓
 

@@ -41,11 +41,11 @@ class BookToCourse:
         source = self._knowledge.sources.get(owner_user_id, source_id)
         if source is None:
             return {}
-        documents = self._knowledge.documents.list_for_source(source_id)
+        documents = self._knowledge.documents.list_for_source(owner_user_id, source_id)
         document_id = documents[0]["document_id"] if documents else None
         chapters: List[Dict[str, Any]] = []
         if document_id:
-            sections = self._knowledge.sections.list_for_document(document_id)
+            sections = self._knowledge.sections.list_for_document(owner_user_id, document_id)
             for section in sections:
                 title = section.title or ""
                 if not title or title == "بدون عنوان":
@@ -84,11 +84,11 @@ class BookToCourse:
     def _fallback_concepts(self, owner_user_id: int, source_id: int,
                            limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """Concepts = section titles of the document (deterministic)."""
-        documents = self._knowledge.documents.list_for_source(source_id)
+        documents = self._knowledge.documents.list_for_source(owner_user_id, source_id)
         document_id = documents[0]["document_id"] if documents else None
         if document_id is None:
             document_id = self._create_minimal_document(owner_user_id, source_id)
-        sections = self._knowledge.sections.list_for_document(document_id)
+        sections = self._knowledge.sections.list_for_document(owner_user_id, document_id)
         concepts = []
         for section in sections:
             title = (section.title or "").strip()
@@ -213,11 +213,11 @@ class BookToCourse:
         chunks = self._knowledge.chunks.list_candidates(
             owner_user_id, source_ids=[source_id], limit=2000,
         )
-        documents = self._knowledge.documents.list_for_source(source_id)
+        documents = self._knowledge.documents.list_for_source(owner_user_id, source_id)
         document_id = documents[0]["document_id"] if documents else None
         sections_by_id = {}
         if document_id:
-            for section in self._knowledge.sections.list_for_document(document_id):
+            for section in self._knowledge.sections.list_for_document(owner_user_id, document_id):
                 sections_by_id[section.section_id] = section
 
         query_tokens = _tokens(query)

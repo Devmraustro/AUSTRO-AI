@@ -11,8 +11,8 @@ Stages, in order (each aborts with a non-zero exit code on failure):
 
   1. duplicate-run lock      O_EXCL lock file, stale lock reclaim
   2. row-count snapshot      per-table counts via psycopg2
-  3. pg_dump                 plain SQL; credentials via PGPASSFILE only
-  4. gzip + manifest         streaming compression, atomic publish
+  3. pg_dump                 plain SQL into a private 0700 work dir; PGPASSFILE only
+  4. gzip (+ AES-256-GCM)    streaming compression and encryption, atomic publish
   5. integrity verification  gzip round-trip + SHA-256 of content and archive
   6. retention pruning       reached ONLY after stage 5 succeeded
 
@@ -50,6 +50,7 @@ import io
 import json
 import os
 import subprocess
+import shutil
 import sys
 import tempfile
 import zlib
@@ -63,6 +64,9 @@ MANIFEST_SUFFIX = ".manifest.json"
 DAILY_KEEP = 7
 MONTHLY_KEEP = 30
 LOCK_NAME = ".backup.lock"
+# Plaintext SQL dumps live ONLY in a private work directory created with
+# mkdtemp (mode 0700). It is never inside the persistent backup directory.
+WORK_PREFIX = "austro-backup-work-"
 STALE_LOCK_SECONDS = 3600
 PGDUMP_TIMEOUT = 1800
 CHUNK = 1024 * 1024
@@ -93,19 +97,23 @@ def pg_bin_dir() -> str:
 
 
 def find_tool(name: str) -> Path:
+    """Locate a PostgreSQL client tool: `PG_BIN` first, then `PATH`.
+
+    The current working directory is deliberately never searched, so a binary
+    planted in it can never be executed with database credentials. The backup
+    image has no PG_BIN and relies on the PATH lookup.
+    """
     env = os.environ.get("PG_BIN", "")
-    candidates = []
     if env:
-        candidates.append(Path(env) / (name + ".exe"))
-        candidates.append(Path(env) / name)
-    candidates.append(Path(".") / name)
-    candidates.append(Path(name))  # on PATH
-    for c in candidates:
-        if c.exists():
-            return c
+        for candidate in (Path(env) / (name + ".exe"), Path(env) / name):
+            if candidate.is_file():
+                return candidate
+    found = shutil.which(name)
+    if found:
+        return Path(found)
     raise RuntimeError(
         f"Could not find {name}. Set PG_BIN to the PostgreSQL bin directory "
-        f"(e.g. C:\\...\\pgsql\\bin)."
+        f"or put {name} on PATH."
     )
 
 
@@ -134,6 +142,78 @@ def _discard(*paths: Path) -> None:
             pass
         except OSError:
             pass
+
+
+# --------------------------------------------------------------------------- #
+# plaintext hygiene: private work directory, stale purge, durable publish
+# --------------------------------------------------------------------------- #
+def work_root() -> Path:
+    """Directory that holds the transient plaintext dump (BACKUP_WORKDIR)."""
+    return Path(os.environ.get("BACKUP_WORKDIR") or tempfile.gettempdir())
+
+
+def make_work_dir() -> Path:
+    """Create a private (0700) scratch directory for the plaintext dump."""
+    root = work_root()
+    root.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=WORK_PREFIX, dir=str(root)))
+
+
+def purge_stale_plaintext(
+    outdir: Path,
+    *,
+    now: Optional[dt.datetime] = None,
+    stale_seconds: int = STALE_LOCK_SECONDS,
+) -> List[Path]:
+    """Remove plaintext left behind by killed runs. Call only while holding the lock.
+
+    * `.austro_ai_backup_*.sql.part` in the backup directory (legacy layout, or a
+      run killed between dump and gzip) is always removed: the lock guarantees no
+      live run owns it.
+    * Work directories in the scratch root older than `stale_seconds` are removed.
+      Fresh ones are left alone in case another run uses the same scratch root.
+    """
+    removed: List[Path] = []
+    outdir = Path(outdir)
+    if outdir.is_dir():
+        for path in outdir.glob(f".{BACKUP_PREFIX}*.sql.part"):
+            try:
+                path.unlink()
+                removed.append(path)
+            except OSError:
+                pass
+    root = work_root()
+    if root.is_dir():
+        current = (now or utcnow()).timestamp()
+        for path in root.glob(f"{WORK_PREFIX}*"):
+            try:
+                if path.is_dir() and current - path.stat().st_mtime >= stale_seconds:
+                    shutil.rmtree(path, ignore_errors=True)
+                    removed.append(path)
+            except OSError:
+                pass
+    return removed
+
+
+def _fsync_path(path: Path) -> None:
+    try:
+        with open(path, "rb") as handle:
+            os.fsync(handle.fileno())
+    except OSError:  # pragma: no cover - platform without fsync on this handle
+        pass
+
+
+def _fsync_dir(path: Path) -> None:  # pragma: no cover - POSIX-only durability
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 # --------------------------------------------------------------------------- #
@@ -338,9 +418,16 @@ def _load_encryption_key(required: bool = False) -> Optional[bytes]:
             raise RuntimeError(f"could not read encryption key file: {exc}") from exc
         log("warn", f"could not read encryption key file {key_file}: {exc}")
         return None
-    # Accept a raw 32-byte key, or a text file whose only extra byte is a
-    # trailing newline from a secret store / `echo` invocation.
-    for candidate in (raw, raw.strip()):
+    # Accept a raw 32-byte key, or the same key followed by ONE trailing line
+    # terminator from a secret store / `echo`. Only the terminator is removed:
+    # a random key may legitimately start or end with whitespace bytes, so
+    # `.strip()` would corrupt it.
+    candidates = [raw]
+    if raw.endswith(b"\r\n"):
+        candidates.append(raw[:-2])
+    elif raw.endswith(b"\n"):
+        candidates.append(raw[:-1])
+    for candidate in candidates:
         if len(candidate) == _AES_KEY_BYTES:
             return candidate
     message = (
@@ -494,12 +581,11 @@ def _iter_encrypted_sql(archive: Path, key: bytes):
             plain = decryptor.finalize()
         except Exception as exc:  # noqa: BLE001 - InvalidTag: wrong key or tampered
             raise ValueError(
-                f"archive decryption failed (wrong key or tampered archive): {exc}"
+                "archive decryption failed (wrong key or tampered archive)"
             ) from exc
         if inflate_error is not None:
             raise ValueError(
-                "archive decryption failed (wrong key or tampered archive): "
-                f"{inflate_error}"
+                "archive decryption failed (wrong key or tampered archive)"
             )
         if plain:
             try:
@@ -780,7 +866,8 @@ def run_backup(
 
     stamp = moment.strftime("%Y%m%d_%H%M%S")
     base = f"{BACKUP_PREFIX}{stamp}"
-    raw = outdir / f".{base}.sql.part"
+    raw: Optional[Path] = None
+    work_dir: Optional[Path] = None
     archive = outdir / f"{base}{ARCHIVE_SUFFIX}"
     archive_part = outdir / f".{base}{ARCHIVE_SUFFIX}.part"
     manifest_path = outdir / f"{base}{MANIFEST_SUFFIX}"
@@ -790,6 +877,20 @@ def run_backup(
     try:
         log("start", f"backup run for {dsn['PGHOST']}:{dsn['PGPORT']}/{dsn['PGDATABASE']}"
                       f" -> {outdir}")
+
+        purged = purge_stale_plaintext(outdir, now=moment, stale_seconds=stale_lock_seconds)
+        if purged:
+            log("start", f"removed {len(purged)} stale plaintext/work artifact(s) "
+                         "left by an interrupted run")
+
+        # Fail closed BEFORE any database contact or plaintext is written: when
+        # BACKUP_ENCRYPTION_ENABLED is set, a missing or invalid key aborts here.
+        enc_key = _load_encryption_key(required=encryption_required())
+        log("start", "encryption " + ("enabled (AES-256-GCM)" if enc_key else
+                                      "DISABLED (no key configured)"))
+
+        work_dir = make_work_dir()
+        raw = work_dir / "dump.sql"
 
         log("1/6", "row-count snapshot")
         tables, counts = snapshot_row_counts(dsn, connect)
@@ -816,9 +917,6 @@ def run_backup(
                     f"{' (' + dump_version + ')' if dump_version else ''}")
 
         log("3/6", "gzip + manifest")
-        # Fail closed: when BACKUP_ENCRYPTION_ENABLED is set, a missing or
-        # invalid key aborts the backup instead of silently writing plaintext.
-        enc_key = _load_encryption_key(required=encryption_required())
         content_sha, archive_sha, archive_bytes, content_bytes = compress_archive(
             raw, archive_part, key=enc_key
         )
@@ -833,8 +931,11 @@ def run_backup(
             encryption_enabled=enc_key is not None,
         )
         manifest_part.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        _fsync_path(archive_part)
+        _fsync_path(manifest_part)
         os.replace(archive_part, archive)
         os.replace(manifest_part, manifest_path)
+        _fsync_dir(outdir)
         _discard(raw)
         log("3/6", f"published {archive.name} "
                    f"({archive_bytes} bytes, sha256={archive_sha[:16]}...) "
@@ -865,7 +966,9 @@ def run_backup(
 
     except Exception as exc:  # noqa: BLE001 - never leave a half-written backup
         log("error", f"backup FAILED: {type(exc).__name__}: {exc}")
-        _discard(raw, archive_part, manifest_part)
+        if raw is not None:
+            _discard(raw)
+        _discard(archive_part, manifest_part)
         # A published-but-unverified archive must never be treated as a
         # recovery point, so the pair is removed together. Every earlier,
         # already-verified backup is left completely untouched. Once the new
@@ -875,6 +978,12 @@ def run_backup(
             _discard(archive, manifest_path)
         return 1
     finally:
+        if work_dir is not None:
+            # Plaintext never outlives the run: success, failure and exceptions.
+            shutil.rmtree(work_dir, ignore_errors=True)
+            if work_dir.exists():
+                log("error", "could not remove plaintext work directory; "
+                             "it will be purged by the next run")
         release_lock(lock)
 
 

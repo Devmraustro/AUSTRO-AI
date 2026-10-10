@@ -9,10 +9,11 @@ its citations so the system can be audited and evaluated.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from app.config.settings import Settings
 from app.knowledge.cleaner import TextCleaner
@@ -66,7 +67,7 @@ class RetrievalService:
         )
         if not candidates:
             result = RetrievalResult(query=query, generator=self._embeddings.model())
-            self._log_event(owner_user_id, query, top_k, result)
+            result.event_id = self._log_event(owner_user_id, top_k, result)
             result.latency_ms = (time.perf_counter() - started) * 1000
             return result
 
@@ -80,7 +81,7 @@ class RetrievalService:
         query_tokens = set(self._cleaner.tokens(query))
 
         ranked: List[RetrievedChunk] = []
-        seen: Dict[str, float] = {}
+        seen: Dict[str, Tuple[float, int]] = {}
         for candidate in candidates:
             content = candidate["content"] or ""
             content_tokens = set(self._cleaner.tokens(content))
@@ -102,21 +103,22 @@ class RetrievalService:
             if score < self._settings.knowledge_retrieval_min_score:
                 continue
 
-            duplicate = seen.get(candidate["chunk_key"])
-            if duplicate is not None:
-                if duplicate < score:
-                    seen[candidate["chunk_key"]] = score
-                    for idx, item in enumerate(ranked):
-                        if item.chunk_row_id == candidate["chunk_id"]:
-                            ranked.pop(idx)
-                            break
-                else:
+            dedupe_key = hashlib.sha1(
+                self._cleaner.transform(content).encode("utf-8"),
+                usedforsecurity=False,
+            ).hexdigest()
+            kept = seen.get(dedupe_key)
+            if kept is not None:
+                kept_score, kept_row_id = kept
+                if kept_score >= score:
                     continue
+                # Replace the lower-scored copy that was already kept.
+                ranked = [item for item in ranked if item.chunk_row_id != kept_row_id]
 
-            seen[candidate["chunk_key"]] = score
+            seen[dedupe_key] = (score, candidate["chunk_id"])
             section = None
             if candidate.get("section_id"):
-                section = self._store.sections.get(candidate["section_id"])
+                section = self._store.sections.get(owner_user_id, candidate["section_id"])
             ranked.append(RetrievedChunk(
                 chunk_row_id=candidate["chunk_id"],
                 source_id=candidate["source_id"],
@@ -137,7 +139,7 @@ class RetrievalService:
             generator=self._embeddings.model(),
             candidates_scanned=len(candidates),
         )
-        result.event_id = self._log_event(owner_user_id, query, top_k, result)
+        result.event_id = self._log_event(owner_user_id, top_k, result)
         result.latency_ms = (time.perf_counter() - started) * 1000
         return result
 
@@ -171,18 +173,18 @@ class RetrievalService:
                 bonus += 0.10
         return bonus
 
-    def _log_event(self, owner_user_id: int, query: str, top_k: int,
+    def _log_event(self, owner_user_id: int, top_k: int,
                    result: RetrievalResult) -> Optional[int]:
+        # The query text is deliberately not stored (see KnowledgeEventRepository.log).
         event_id = self._store.events.log(
             owner_user_id=owner_user_id,
-            query=query,
             top_k=top_k,
             result_count=len(result.chunks),
             latency_ms=result.latency_ms,
             generator=result.generator,
         )
         if event_id is not None and result.chunks:
-            self._store.events.add_citations(event_id, [
+            self._store.events.add_citations(owner_user_id, event_id, [
                 {
                     "chunk_row_id": chunk.chunk_row_id,
                     "source_id": chunk.source_id,

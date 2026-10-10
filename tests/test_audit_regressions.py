@@ -218,7 +218,10 @@ def test_every_db_error_handler_rolls_back():
             total += 1
             if "self._rollback()" not in "\n".join(lines[i + 1:i + 6]):
                 missing.append(f"{rel}:{i + 1}")
-    assert total >= 125, f"expected at least 125 handlers, found {total}"
+    # Floor = exact handler count after the memory erasure rewrite removed the
+    # dead resurrect/redact handlers (was 125). Every counted handler must still
+    # roll back (checked above); this floor only guards against an empty scan.
+    assert total >= 122, f"expected at least 122 handlers, found {total}"
     assert not missing, (
         "these DB_ERROR handlers do not roll back: " + ", ".join(missing)
     )
