@@ -8,10 +8,24 @@ Rules enforced by `scripts/pg_restore_drill.py`:
 
   1. A restore target must be named explicitly (`RESTORE_TARGET_DB`). There is
      no default: the application database is never a fallback.
-  2. The target must look like a disposable restore database (its name must
-     contain `restore`) and must differ from the application database
-     (`DB_NAME`), the backup source database and the PostgreSQL system
-     databases.
+  2. The target must look like a disposable restore database and must differ
+     from the application database (`DB_NAME`), the backup source database and
+     the PostgreSQL system databases. Concretely:
+       a. Production-like names are refused first, regardless of case or
+          separators. The name is lowercased and split on every non-alphanumeric
+          character (`_`, `-`, `.`, space and so on) into tokens. Refused when any
+          token is `prod`, `production`, `live`, `primary` or `master`, or starts
+          with `prod` (so `prodrestore` is refused). This is intentionally broad:
+          a legitimate name such as `products_restore` is also refused.
+       b. Live-database names are refused. Compared with all separators removed
+          and lowercased, the name must not equal the application DB, the source
+          DB, or the fixed live names `austroai` and `austro`. So `Austro-AI`
+          matches `austro_ai`.
+       c. The name must be a valid lowercase identifier (`a-z`, `0-9`, `_`; 3 to
+          63 characters, starting with a letter).
+       d. It must not be a PostgreSQL system database.
+       e. It must contain `restore`.
+     `austro_ai_restore_drill` passes every rule.
   3. Destructive authorization is explicit: `RESTORE_CONFIRM_DESTRUCTIVE` must
      equal `DROP-AND-RESTORE:<target>` exactly. A bare `yes` is not enough.
   4. Administrative credentials are explicit: `RESTORE_ADMIN_USER` and
@@ -38,6 +52,11 @@ CONFIRM_PREFIX = "DROP-AND-RESTORE:"
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{2,62}$")
 _SYSTEM_DATABASES = frozenset({"postgres", "template0", "template1"})
 _RESTORE_MARKER = "restore"
+# Fixed live-database names that are refused whatever the configuration says.
+_LIVE_DATABASE_NAMES = frozenset({"austroai", "austro"})
+# Whole-token markers of a production or live database.
+_PRODUCTION_TOKENS = frozenset({"prod", "production", "live", "primary", "master"})
+_TOKEN_SPLIT_RE = re.compile(r"[^a-z0-9]+")
 
 
 class RestoreRefused(RuntimeError):
@@ -53,6 +72,17 @@ def required_confirmation(target: str) -> str:
     return f"{CONFIRM_PREFIX}{target}"
 
 
+def _collapsed(name: str) -> str:
+    """Lowercase with every separator removed: `Austro-AI` -> `austroai`."""
+    return _TOKEN_SPLIT_RE.sub("", name.lower())
+
+
+def _looks_production(name: str) -> bool:
+    """True when the name carries a production or live marker (rule 2a)."""
+    tokens = [t for t in _TOKEN_SPLIT_RE.split(name.lower()) if t]
+    return any(t in _PRODUCTION_TOKENS or t.startswith("prod") for t in tokens)
+
+
 def validate_restore_target(
     target: Optional[str],
     *,
@@ -66,6 +96,11 @@ def validate_restore_target(
             "application database"
         )
     name = target.strip()
+    if _looks_production(name):
+        raise RestoreRefused(
+            f"restore target {name!r} looks like a production or live database "
+            "(production/prod/live/primary/master token); refusing"
+        )
     if app_db and name == app_db:
         raise RestoreRefused(
             f"restore target {name!r} is the application database (DB_NAME); refusing"
@@ -73,6 +108,15 @@ def validate_restore_target(
     if source_db and name == source_db:
         raise RestoreRefused(
             f"restore target {name!r} is the backup source database; refusing"
+        )
+    live_names = set(_LIVE_DATABASE_NAMES)
+    if app_db:
+        live_names.add(_collapsed(app_db))
+    if source_db:
+        live_names.add(_collapsed(source_db))
+    if _collapsed(name) in live_names:
+        raise RestoreRefused(
+            f"restore target {name!r} matches a live database name; refusing"
         )
     if not _NAME_RE.match(name):
         raise RestoreRefused(

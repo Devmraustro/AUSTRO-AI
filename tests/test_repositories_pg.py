@@ -373,14 +373,14 @@ def test_knowledge_source_document_chunk_ids_and_embeddings(pg_knowledge):
         order_index=0,
     )
     assert isinstance(chunk_id, int) and chunk_id > 0
-    assert store.chunks.count_for_source(source_id) == 1
+    assert store.chunks.count_for_source(1, source_id) == 1
 
     record = EmbeddingRecord(
         owner_user_id=1, source_id=source_id, chunk_row_id=chunk_id,
         model="local", version="1", dimensions=3, vector=[0.1, 0.2, 0.3],
     )
     assert store.embeddings.save_many([record]) == 1
-    assert store.embeddings.count_for_source(source_id, "local", "1") == 1
+    assert store.embeddings.count_for_source(1, source_id, "local", "1") == 1
 
     # OR REPLACE on (chunk_row_id, model, version) must update in place
     updated = EmbeddingRecord(
@@ -388,7 +388,7 @@ def test_knowledge_source_document_chunk_ids_and_embeddings(pg_knowledge):
         model="local", version="1", dimensions=3, vector=[0.9, 0.8, 0.7],
     )
     assert store.embeddings.save_many([updated]) == 1
-    assert store.embeddings.count_for_source(source_id, "local", "1") == 1
+    assert store.embeddings.count_for_source(1, source_id, "local", "1") == 1
 
     event_id = store.events.log(
         owner_user_id=1, query="time", top_k=5, result_count=1,
@@ -397,7 +397,7 @@ def test_knowledge_source_document_chunk_ids_and_embeddings(pg_knowledge):
     assert isinstance(event_id, int) and event_id > 0
     assert (
         store.events.add_citations(
-            event_id,
+            1, event_id,
             [{"chunk_row_id": chunk_id, "source_id": source_id, "title": "t",
               "section_title": "s", "page": None, "snippet": "x", "score": 0.5}],
         )
@@ -427,9 +427,9 @@ def test_knowledge_collections_ignore_and_storage_verified(pg_knowledge):
         owner_user_id=1, source_id=source_id, storage_key="k1",
         file_name="b.txt", file_format="txt", size_bytes=1, checksum="c1",
     ) is True
-    assert store.storage.verified(source_id) is False
-    assert store.storage.mark_verified(source_id) is True
-    assert store.storage.verified(source_id) is True
+    assert store.storage.verified(1, source_id) is False
+    assert store.storage.mark_verified(1, source_id) is True
+    assert store.storage.verified(1, source_id) is True
 
 
 async def test_knowledge_ingestion_end_to_end_on_postgres(pg_container):

@@ -199,6 +199,49 @@ def test_source_database_is_refused_as_target():
         validate_restore_target("src_restore", app_db=APP_DB, source_db="src_restore")
 
 
+@pytest.mark.parametrize("name", [
+    "production_restore", "prod_restore", "PROD_RESTORE", "Prod-Restore",
+    "prod.restore", "restore_prod", "restore-production", "live_restore",
+    "primary_restore", "master_restore", "prodrestore", "ProdRestore",
+    "austro_ai_production_restore", "Production-Restore",
+])
+def test_production_like_restore_targets_are_refused(name):
+    """Production markers are refused whatever the case or separator."""
+    with pytest.raises(RestoreRefused, match="production or live"):
+        validate_restore_target(name, app_db=APP_DB)
+
+
+@pytest.mark.parametrize("name", ["Austro-AI", "AUSTRO_AI", "austro.ai", "austroai",
+                                  "Austro-AI-DB", "austro"])
+def test_live_database_names_are_refused_in_any_spelling(name):
+    """Collapsing separators shows a live name even when it is spelled differently."""
+    with pytest.raises(RestoreRefused):
+        validate_restore_target(name, app_db=APP_DB)
+
+
+def test_source_database_name_in_other_spelling_is_refused():
+    with pytest.raises(RestoreRefused, match="live database name"):
+        validate_restore_target("SRC-Backup", app_db=APP_DB, source_db="src_backup")
+
+
+@pytest.mark.parametrize("name", ["austro_ai_restore_drill", "restore_drill_01",
+                                  "austro_ai_restore_20260110"])
+def test_disposable_restore_names_remain_valid(name):
+    assert validate_restore_target(name, app_db=APP_DB) == name
+
+
+def test_production_refusal_happens_before_database_or_archive_work(tmp_path):
+    archive, manifest = _make_archive(tmp_path)
+    rec = _Recorder()
+    events = []
+    rc = pg_restore_drill.run_restore_drill(
+        archive, manifest, _good_env(RESTORE_TARGET_DB="Prod-Restore",
+                                     RESTORE_CONFIRM_DESTRUCTIVE=required_confirmation("Prod-Restore")),
+        connect=rec.connect, psql_runner=_psql_ok(events))
+    assert rc == pg_restore_drill.EXIT_REFUSED
+    assert rec.events == [] and events == []
+
+
 @pytest.mark.parametrize("supplied", [None, "", "yes", "true", CONFIRM_PREFIX,
                                       required_confirmation("other_restore")])
 def test_destructive_confirmation_must_name_this_target(supplied):

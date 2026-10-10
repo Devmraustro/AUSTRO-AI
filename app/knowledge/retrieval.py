@@ -182,7 +182,7 @@ class RetrievalService:
             generator=result.generator,
         )
         if event_id is not None and result.chunks:
-            self._store.events.add_citations(event_id, [
+            self._store.events.add_citations(owner_user_id, event_id, [
                 {
                     "chunk_row_id": chunk.chunk_row_id,
                     "source_id": chunk.source_id,

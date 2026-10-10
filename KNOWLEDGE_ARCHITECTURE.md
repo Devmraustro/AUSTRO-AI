@@ -158,6 +158,18 @@ with offline `LocalProvider` fallback) → attach citations.
   decompression for EPUB chapters (per-chapter and cumulative).
 - **Never fabricated pages** — page attribution only comes from the PDF
   extractor's real char→page map.
+- **Reference ownership.** Every knowledge method that takes a foreign ID
+  checks ownership before it writes. Collection membership checks the
+  collection and the source. Storage registration checks the source. Citations
+  check the retrieval event and that each (chunk, source) pair belongs to the
+  owner. Embedding batches check each (chunk, source) pair. Read and count
+  methods filter by `owner_user_id`. `count_for_source` (chunks and embeddings),
+  `add_citations`, `names_for_source`, `mark_verified` and `verified` now take
+  `owner_user_id`, and every caller is updated. `mark_verified` and
+  `remove_source` report success only when a row changed. Tests:
+  `tests/test_knowledge_ownership.py` (SQLite) and
+  `tests/test_knowledge_ownership_pg.py` (PostgreSQL 16). The same race limit
+  as LEARNING_ARCHITECTURE §11a applies, because these references have no hard FK.
 
 ## 10. Limits & configuration
 

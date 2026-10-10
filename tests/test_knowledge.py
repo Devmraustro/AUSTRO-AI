@@ -212,7 +212,7 @@ async def test_ingest_txt_reaches_ready_with_consistent_embeddings(knowledge):
 
     chunks = knowledge._store.chunks.list_candidates(7, limit=500)
     embedding_rows = knowledge._store.embeddings.count_for_source(
-        upload["source_id"], "local-hash", "1"
+        7, upload["source_id"], "local-hash", "1"
     )
     assert embedding_rows == len(chunks) == result.chunk_count
 

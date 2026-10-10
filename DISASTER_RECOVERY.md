@@ -2,7 +2,7 @@
 
 Status: **encrypted-only backup worker and fail-closed restore drill
 implemented and unit-tested** (`tests/test_backup.py`: 59 tests,
-`tests/test_restore_safety.py`: 33 tests). The end-to-end proof (encrypted
+`tests/test_restore_safety.py`: 58 tests). The end-to-end proof (encrypted
 backup, wrong-key refusal, tampered-archive refusal, unsafe-target refusal,
 correct-key restore) runs in the GitHub Actions job `backup-integration` against
 an ephemeral PostgreSQL 16 service with a runner-generated 32-byte key. §7 records
@@ -151,8 +151,19 @@ release. The nightly job only takes a backup and verifies its own integrity.
 > refuses before opening any archive or database connection (exit 2):
 >
 > - `RESTORE_TARGET_DB` is set explicitly. There is **no default**, so a restore
->   never falls back to the application database. The name must contain
->   `restore` and must differ from `DB_NAME`.
+>   never falls back to the application database. The name must be a valid
+>   lowercase identifier (`a-z`, `0-9`, `_`; 3-63 characters) and must contain
+>   `restore`. It must differ from `DB_NAME`, from the backup source database,
+>   and from the PostgreSQL system databases.
+> - **Production-like names are refused** (rules in `scripts/restore_safety.py`).
+>   The name is lowercased and split on every non-alphanumeric character, so
+>   `production_restore`, `Prod-Restore`, `PROD.restore`, `restore_prod`,
+>   `live_restore`, `primary_restore`, `master_restore` and `prodrestore` are
+>   all refused. The rule is intentionally broad, so a legitimate name such as
+>   `products_restore` is also refused. Live-database names are compared with
+>   all separators removed, so `Austro-AI` is refused for `austro_ai`, and the
+>   fixed names `austroai` and `austro` are always refused.
+> - `austro_ai_restore_drill` and similar disposable names remain valid.
 > - `RESTORE_CONFIRM_DESTRUCTIVE=DROP-AND-RESTORE:<RESTORE_TARGET_DB>` matches
 >   the target exactly.
 > - `RESTORE_ADMIN_USER` and `RESTORE_ADMIN_PASSWORD` are set. The drill never

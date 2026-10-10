@@ -202,6 +202,25 @@ evidence kind and current state.
 
 ---
 
+### 11a. Cross-owner references
+
+Every learning write that links a row to a parent (goal parent, objective goal
+and prerequisites, curriculum goal and module objectives, lesson curriculum,
+objective and source, session goal, objective, curriculum and lesson, mastery,
+reviews, assessments, misconceptions, events) validates that each referenced
+parent belongs to the same `owner_user_id` before writing. The check is one
+batched `COUNT(DISTINCT ...)` per parent table (`app/database/ownership.py`,
+`refs_owned`), run inside the write lock on the same cursor. A foreign, missing
+or malformed ID rejects the whole write: the method returns `None` or `False`,
+and nothing is written. Regression tests in `tests/test_learning_ownership.py`
+(SQLite) and `tests/test_learning_ownership_pg.py` (PostgreSQL 16) cover each
+relation, with same-owner success cases.
+
+Limit: these references have no hard FK, because owner-scoped FKs would need
+table rebuilds in SQLite. A concurrent delete of the parent by another process
+can therefore race with an insert that has already passed the check. Within one
+process, the check and the write are serialized by the repository lock.
+
 ## 12. Observability
 
 - `progress_overview(owner)` exposes: `mastered`, `in_progress`,

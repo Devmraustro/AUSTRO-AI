@@ -199,7 +199,7 @@ class IngestionPipeline:
 
         # -- READY (verify searchable) ------------------------------------------
         embedded_count = self._store.embeddings.count_for_source(
-            source_id,
+            owner, source_id,
             model=self._embeddings.model(),
             version=self._embeddings.version(),
         )

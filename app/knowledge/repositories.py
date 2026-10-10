@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 
 from app.database.connection import DatabaseManager
 from app.database.dialect import DB_ERROR
+from app.database.ownership import refs_owned
 from app.knowledge.models import (
     CANCELLED_STATUS,
     COMPLETED_STATUS,
@@ -25,6 +26,24 @@ from app.knowledge.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _chunks_match_sources(cursor, owner_user_id: int, pairs) -> bool:
+    """True only if every (chunk_id, source_id) pair is a chunk owned by the owner
+    whose stored source_id equals the given one. One batched query."""
+    wanted = {(int(c), int(s)) for c, s in pairs}
+    if not wanted:
+        return True
+    ids = sorted({c for c, _ in wanted})
+    marks = ", ".join("?" for _ in ids)
+    # Only the IN-list placeholders vary; values are bound parameters.
+    cursor.execute(
+        "SELECT chunk_id, source_id FROM knowledge_chunks "
+        f"WHERE owner_user_id = ? AND chunk_id IN ({marks})",  # nosec B608
+        (owner_user_id, *ids),
+    )
+    found = {(int(r[0]), int(r[1])) for r in cursor.fetchall()}
+    return wanted <= found
 
 
 class _KnowledgeBase:
@@ -407,13 +426,14 @@ class KnowledgeChunkRepository(_KnowledgeBase):
             logger.error(f"Database error in knowledge create chunk: {e}")
             return None
 
-    def count_for_source(self, source_id: int) -> int:
+    def count_for_source(self, owner_user_id: int, source_id: int) -> int:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
                 cursor.execute(
-                    "SELECT COUNT(*) FROM knowledge_chunks WHERE source_id = ?",
-                    (source_id,),
+                    "SELECT COUNT(*) FROM knowledge_chunks "
+                    "WHERE source_id = ? AND owner_user_id = ?",
+                    (source_id, owner_user_id),
                 )
                 return int(cursor.fetchone()[0])
         except DB_ERROR as e:
@@ -462,6 +482,17 @@ class KnowledgeEmbeddingRepository(_KnowledgeBase):
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                # Each embedding must point at a chunk owned by the record's owner
+                # and stored under the record's source. Validate the whole batch
+                # first, so a single foreign chunk rejects every row in the batch.
+                pairs_by_owner: Dict[int, set] = {}
+                for record in records:
+                    pairs_by_owner.setdefault(int(record.owner_user_id), set()).add(
+                        (record.chunk_row_id, record.source_id))
+                for owner, pairs in pairs_by_owner.items():
+                    if not _chunks_match_sources(cursor, owner, pairs):
+                        logger.warning("embedding batch rejected: chunk not owned by owner")
+                        return 0
                 for record in records:
                     cursor.execute(
                         "INSERT OR REPLACE INTO knowledge_embeddings "
@@ -479,14 +510,15 @@ class KnowledgeEmbeddingRepository(_KnowledgeBase):
             logger.error(f"Database error in knowledge save embeddings: {e}")
             return saved
 
-    def count_for_source(self, source_id: int, model: str, version: str) -> int:
+    def count_for_source(self, owner_user_id: int, source_id: int,
+                         model: str, version: str) -> int:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
                 cursor.execute(
                     "SELECT COUNT(*) FROM knowledge_embeddings "
-                    "WHERE source_id = ? AND model = ? AND version = ?",
-                    (source_id, model, version),
+                    "WHERE source_id = ? AND model = ? AND version = ? AND owner_user_id = ?",
+                    (source_id, model, version, owner_user_id),
                 )
                 return int(cursor.fetchone()[0])
         except DB_ERROR as e:
@@ -543,10 +575,20 @@ class KnowledgeEventRepository(_KnowledgeBase):
             logger.error(f"Database error in knowledge log event: {e}")
             return None
 
-    def add_citations(self, event_id: int, citations: List[Dict[str, Any]]) -> int:
+    def add_citations(self, owner_user_id: int, event_id: int,
+                      citations: List[Dict[str, Any]]) -> int:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                if not refs_owned(cursor, owner_user_id, [
+                        ("knowledge_retrieval_events", "event_id", [event_id])]):
+                    logger.warning("citations rejected: retrieval event not owned by owner")
+                    return 0
+                if citations and not _chunks_match_sources(
+                        cursor, owner_user_id,
+                        [(c["chunk_row_id"], c["source_id"]) for c in citations]):
+                    logger.warning("citations rejected: chunk or source not owned by owner")
+                    return 0
                 for c in citations:
                     cursor.execute(
                         "INSERT INTO knowledge_citations "
@@ -631,12 +673,9 @@ class KnowledgeCollectionRepository(_KnowledgeBase):
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
-                cursor.execute(
-                    "SELECT source_id FROM knowledge_sources "
-                    "WHERE source_id = ? AND owner_user_id = ?",
-                    (source_id, owner_user_id),
-                )
-                if cursor.fetchone() is None:
+                if not refs_owned(cursor, owner_user_id, [
+                        ("knowledge_collections", "collection_id", [collection_id]),
+                        ("knowledge_sources", "source_id", [source_id])]):
                     return False
                 cursor.execute(
                     "INSERT OR IGNORE INTO knowledge_collection_sources "
@@ -660,7 +699,7 @@ class KnowledgeCollectionRepository(_KnowledgeBase):
                     (collection_id, source_id, owner_user_id),
                 )
                 self._connection().commit()
-                return True
+                return cursor.rowcount > 0
         except DB_ERROR as e:
             self._rollback()
             logger.error(f"Database error in knowledge remove_source: {e}")
@@ -684,15 +723,16 @@ class KnowledgeCollectionRepository(_KnowledgeBase):
             logger.error(f"Database error in knowledge source_ids_for: {e}")
             return []
 
-    def names_for_source(self, source_id: int) -> List[str]:
+    def names_for_source(self, owner_user_id: int, source_id: int) -> List[str]:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
                 cursor.execute(
                     "SELECT c.name FROM knowledge_collection_sources ccs "
                     "JOIN knowledge_collections c ON c.collection_id = ccs.collection_id "
-                    "WHERE ccs.source_id = ?",
-                    (source_id,),
+                    "AND c.owner_user_id = ccs.owner_user_id "
+                    "WHERE ccs.source_id = ? AND ccs.owner_user_id = ?",
+                    (source_id, owner_user_id),
                 )
                 return [row["name"] for row in cursor.fetchall()]
         except DB_ERROR as e:
@@ -708,6 +748,10 @@ class KnowledgeStorageRepository(_KnowledgeBase):
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                if not refs_owned(cursor, owner_user_id, [
+                        ("knowledge_sources", "source_id", [source_id])]):
+                    logger.warning("storage register rejected: source not owned by owner")
+                    return False
                 cursor.execute(
                     "INSERT INTO knowledge_storage_files "
                     "(owner_user_id, source_id, storage_key, file_name, file_format, "
@@ -722,28 +766,30 @@ class KnowledgeStorageRepository(_KnowledgeBase):
             logger.error(f"Database error in knowledge register file: {e}")
             return False
 
-    def mark_verified(self, source_id: int) -> bool:
+    def mark_verified(self, owner_user_id: int, source_id: int) -> bool:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
                 cursor.execute(
-                    "UPDATE knowledge_storage_files SET verified = TRUE WHERE source_id = ?",
-                    (source_id,),
+                    "UPDATE knowledge_storage_files SET verified = TRUE "
+                    "WHERE source_id = ? AND owner_user_id = ?",
+                    (source_id, owner_user_id),
                 )
                 self._connection().commit()
-                return True
+                return cursor.rowcount > 0
         except DB_ERROR as e:
             self._rollback()
             logger.error(f"Database error in knowledge mark verified: {e}")
             return False
 
-    def verified(self, source_id: int) -> bool:
+    def verified(self, owner_user_id: int, source_id: int) -> bool:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
                 cursor.execute(
-                    "SELECT verified FROM knowledge_storage_files WHERE source_id = ?",
-                    (source_id,),
+                    "SELECT verified FROM knowledge_storage_files "
+                    "WHERE source_id = ? AND owner_user_id = ?",
+                    (source_id, owner_user_id),
                 )
                 row = cursor.fetchone()
                 return bool(row and row["verified"])

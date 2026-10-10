@@ -78,6 +78,28 @@ jobs:
           grep -q "skipped" /tmp/pg_results.log && { echo "ERROR: Tests were skipped"; exit 1; } || true
           echo "PostgreSQL integration tests: 18 passed, 0 skipped"
 
+      - name: PostgreSQL ownership and erasure regression tests (no skips)
+        env:
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_USER: austro
+          DB_PASSWORD: austro_ci
+          DB_TEST_NAME: austro_ai_pgtest
+          DB_ADMIN_USER: austro
+          DB_ADMIN_PASSWORD: austro_ci
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_learning_ownership_pg.py tests/test_knowledge_ownership_pg.py tests/test_memory_erasure_pg.py -q --tb=short 2>&1 | tee /tmp/pg_ownership_results.log
+          if grep -q "skipped" /tmp/pg_ownership_results.log; then
+            echo "ERROR: PostgreSQL ownership/erasure tests were skipped"
+            exit 1
+          fi
+          if ! grep -Eq "[0-9]+ passed" /tmp/pg_ownership_results.log; then
+            echo "ERROR: no PostgreSQL ownership/erasure tests passed"
+            exit 1
+          fi
+          echo "PostgreSQL ownership and erasure tests: all passed, 0 skipped"
+
       - name: Run evaluation regression harness
         env:
           BOT_TOKEN: "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken"
