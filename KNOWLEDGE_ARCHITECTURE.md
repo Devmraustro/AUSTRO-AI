@@ -219,7 +219,7 @@ with offline `LocalProvider` fallback) → attach citations.
   but before the insert, the insert is rejected and the child is not written
   (`tests/test_deletion_race_backstop.py`, `_pg.py`). See LEARNING_ARCHITECTURE §11a.
 
-**Source deletion order.** `delete_source` removes the stored original first.
+**Source deletion order.** `delete_source` (service layer only; no Telegram command calls it, so users cannot delete sources today) removes the stored original first.
 If that removal fails, the row is kept and the call returns `False`, so the
 content is not left on disk without a record. If the row delete then fails,
 the source is left without its file. Deleting again is safe, because a missing

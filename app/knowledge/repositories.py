@@ -189,7 +189,9 @@ class KnowledgeSourceRepository(_KnowledgeBase):
                      source_id, owner_user_id),
                 )
                 self._connection().commit()
-                return True
+                # A WHERE that matches no row (missing source, or another
+                # owner's source) is not a successful state change.
+                return cursor.rowcount > 0
         except DB_ERROR as e:
             self._rollback()
             logger.error(f"Database error in knowledge set_state: {e}")
@@ -286,7 +288,9 @@ class KnowledgeDocumentRepository(_KnowledgeBase):
                     (total_sections, status, document_id, owner_user_id),
                 )
                 self._connection().commit()
-                return True
+                # Zero matched rows: the document is missing or not owned by
+                # this owner, so nothing was completed.
+                return cursor.rowcount > 0
         except DB_ERROR as e:
             self._rollback()
             logger.error(f"Database error in knowledge complete document: {e}")

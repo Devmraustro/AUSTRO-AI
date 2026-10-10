@@ -79,7 +79,7 @@ print('✓ Max retries: 2 (AI_MAX_RETRIES=2)')
 # 7. Verify privacy/data isolation
 python -c "
 print('✓ No global learning: user data never used for global model training')
-print('✓ GDPR-compliant: /export and /delete commands present')
+print('NOT IMPLEMENTED: /export and /delete commands are not registered; GDPR export/erasure is not provided')
 print('✓ Sensitive data redaction: present in write gate and logging')
 "
 

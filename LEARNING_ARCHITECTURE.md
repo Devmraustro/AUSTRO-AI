@@ -191,6 +191,10 @@ evidence kind and current state.
 
 ## 11. Privacy & delete
 
+**Status:** engine-level only. `export_learning` and `delete_learning` are called only from tests
+(`tests/test_learning.py`). No Telegram command or handler exposes them, so users cannot export or
+delete learning data today. A `/forget` command is planned but not registered.
+
 - `export_learning(owner)` returns a JSON-safe snapshot containing:
   - All goals, objectives, curricula, and mastery state.
 - `delete_learning(owner)` permanently deletes all learning data for the
@@ -267,7 +271,7 @@ Phase E test guarantees (in `tests/test_learning.py` + `tests/test_coaching.py`)
 - Coach today returns focus, blocker, smallest_action, reason keys ✓
 - Weekly review returns summary keys (period, planned, completed, etc.) ✓
 - Book-to-course creates curriculum from knowledge source ✓
-- Privacy export/delete works end-to-end ✓
+- Privacy export/delete: the engine methods `export_learning` and `delete_learning` are unit-tested ✓. They are NOT end-to-end: no Telegram command or handler calls them (not verified as user-reachable)
 - Golden eval (run_all) passes: mastery, schedule, kinds ✓
 - Learning handlers register as ConversationHandler with menu patterns ✓
 

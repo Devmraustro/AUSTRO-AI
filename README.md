@@ -75,7 +75,9 @@ Full configuration options are documented in `.env.example` including:
 
 ## Chat commands (in Telegram)
 
-`/start` · `/help` · `/plan` · `/goals` · `/habits` · `/progress` · `/review` · `/coach` · `/dashboard` · `/settings` · `/cancel`
+`/start` · `/help` · `/plan` · `/goals` · `/habits` · `/progress` · `/review` · `/coach` · `/dashboard` · `/settings` · `/cancel` · `/knowledge`
+
+Not implemented: `/forget`, `/export` and `/delete` are not registered. See `PRIVACY_RETENTION.md` §3.1 for what is and is not available.
 
 ## Tests
 
@@ -86,7 +88,7 @@ pytest
 
 Tests run offline: they set a dummy `BOT_TOKEN`, use a temporary SQLite database, and leave `GEMINI_API_KEY` unset so nothing hits the network.
 
-**818 passed, 1 skipped** on PostgreSQL 16.2 (the skip needs Docker). Without PostgreSQL, 701 pass and 118 PostgreSQL-only tests are skipped. Measured 2026-10-10 on branch `arena/d94e58c6-austro-ai`; the CI run is the authoritative record.
+**832 passed, 1 skipped** with PostgreSQL 16.2 reachable (the skip needs Docker). Without PostgreSQL, 709 pass and 124 PostgreSQL-only tests are skipped. Measured 2026-10-10 on the uncommitted working tree of branch `arena/d94e58c6-austro-ai`; the CI run is the authoritative record.
 
 ### Evaluation & Regression (Phase F)
 
