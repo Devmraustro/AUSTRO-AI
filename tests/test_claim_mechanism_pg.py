@@ -333,30 +333,77 @@ def test_fenced_writes_and_publication_on_postgres(pg_store):
 def test_cleanup_preserves_newer_worker_data_on_postgres(pg_store):
     source_id = _make_source(pg_store)
     assert _acquire(pg_store, source_id, "tok-1", ttl=30) is not None
-    stale_doc = pg_store.documents.create(
-        source_id=source_id,
-        owner_user_id=OWNER,
-        title="stale",
-        author=None,
-        language="en",
-        toc=[],
-        total_chars=10,
-        total_pages=1,
-        claim_token="tok-1",
-    )
+    def write_rows(token: str, version: int) -> dict:
+        """One ingestion epoch's rows across all four derived tables."""
+        from app.knowledge.models import EmbeddingRecord
+
+        document_id = pg_store.documents.create(
+            source_id=source_id,
+            owner_user_id=OWNER,
+            title=f"doc-{token}",
+            author=None,
+            language="en",
+            toc=[],
+            total_chars=10,
+            total_pages=1,
+            version=version,
+            claim_token=token,
+        )
+        assert isinstance(document_id, int)
+        section_id = pg_store.sections.create(
+            document_id=document_id,
+            owner_user_id=OWNER,
+            source_id=source_id,
+            level=0,
+            title=f"section-{token}",
+            order_index=0,
+            start_char=0,
+            end_char=1,
+            claim_token=token,
+        )
+        assert isinstance(section_id, int)
+        chunk_id = pg_store.chunks.create(
+            owner_user_id=OWNER,
+            source_id=source_id,
+            document_id=document_id,
+            section_id=section_id,
+            chunk_key=f"key-{token}-{uuid.uuid4()}",
+            content=f"content-{token}",
+            content_hash=f"hash-{token}",
+            token_count=1,
+            char_count=10,
+            page=None,
+            order_index=0,
+            claim_token=token,
+        )
+        assert isinstance(chunk_id, int)
+        saved = pg_store.embeddings.save_many(
+            [
+                EmbeddingRecord(
+                    owner_user_id=OWNER,
+                    source_id=source_id,
+                    chunk_row_id=chunk_id,
+                    model="m",
+                    version="1",
+                    dimensions=2,
+                    vector=[0.1, 0.2],
+                )
+            ],
+            claim_token=token,
+        )
+        assert saved == 1
+        return {
+            "document_id": document_id,
+            "section_id": section_id,
+            "chunk_id": chunk_id,
+        }
+
+    stale_rows = write_rows("tok-1", version=1)
+    stale_doc = stale_rows["document_id"]
     _expire(pg_store, source_id)
     assert _acquire(pg_store, source_id, "tok-2", ttl=30) is not None
-    fresh_doc = pg_store.documents.create(
-        source_id=source_id,
-        owner_user_id=OWNER,
-        title="fresh",
-        author=None,
-        language="en",
-        toc=[],
-        total_chars=10,
-        total_pages=1,
-        claim_token="tok-2",
-    )
+    fresh_rows = write_rows("tok-2", version=2)
+    fresh_doc = fresh_rows["document_id"]
 
     result = pg_store.claims.cleanup_attempt(
         source_id=source_id,
@@ -379,6 +426,66 @@ def test_cleanup_preserves_newer_worker_data_on_postgres(pg_store):
     assert remaining == [fresh_doc]
     assert stale_doc not in remaining
     assert _claim_row(pg_store, source_id)["claim_token"] == "tok-2"
+
+    # ---- extended coverage: all four derived tables, persisted state ----
+    from app.knowledge.models import FAILED_STATUS
+
+    # Expected per-table deletion counts: exactly the stale attempt's rows.
+    assert result["released"] is False
+    assert result["deleted"]["knowledge_sections"] == 1
+    assert result["deleted"]["knowledge_chunks"] == 1
+    assert result["deleted"]["knowledge_embeddings"] == 1
+
+    def count(statement: str, params) -> int:
+        cursor.execute(statement, params)
+        return cursor.fetchone()[0]
+
+    # 1. Only rows owned by the stale attempt were deleted (all four tables).
+    assert count(
+        "SELECT count(*) FROM knowledge_documents WHERE claim_token = %s", ("tok-1",)
+    ) == 0
+    assert count(
+        "SELECT count(*) FROM knowledge_sections WHERE claim_token = %s", ("tok-1",)
+    ) == 0
+    assert count(
+        "SELECT count(*) FROM knowledge_chunks WHERE claim_token = %s", ("tok-1",)
+    ) == 0
+    assert count(
+        "SELECT count(*) FROM knowledge_embeddings WHERE claim_token = %s", ("tok-1",)
+    ) == 0
+
+    # 2. The newer attempt's document, section, chunk, and embedding survive.
+    assert count(
+        "SELECT count(*) FROM knowledge_documents WHERE document_id = %s",
+        (fresh_rows["document_id"],),
+    ) == 1
+    assert count(
+        "SELECT count(*) FROM knowledge_sections WHERE section_id = %s",
+        (fresh_rows["section_id"],),
+    ) == 1
+    assert count(
+        "SELECT count(*) FROM knowledge_chunks WHERE chunk_id = %s",
+        (fresh_rows["chunk_id"],),
+    ) == 1
+    assert count(
+        "SELECT count(*) FROM knowledge_embeddings WHERE chunk_row_id = %s",
+        (fresh_rows["chunk_id"],),
+    ) == 1
+
+    # 3. The current claim still belongs to the newer attempt and is active.
+    claim = _claim_row(pg_store, source_id)
+    assert claim["claim_token"] == "tok-2"
+    assert claim["status"] == "active"
+
+    # 4. The source was not incorrectly marked failed by the stale cleanup.
+    cursor.execute(
+        "SELECT status, error_message FROM knowledge_sources WHERE source_id = %s",
+        (source_id,),
+    )
+    source_row = cursor.fetchone()
+    conn.commit()
+    assert source_row["status"] != FAILED_STATUS
+    assert source_row["error_message"] != "stale"
 
 
 # ============================ CONCURRENCY ============================
