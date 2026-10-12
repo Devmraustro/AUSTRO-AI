@@ -14,14 +14,17 @@ import sqlite3
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from app.core.errors import ClaimLostError
 from app.database.connection import DatabaseManager
-from app.database.dialect import DB_ERROR
+from app.database.dialect import DB_ERROR, now_epoch_sql
 from app.knowledge.models import (
     CANCELLED_STATUS,
     COMPLETED_STATUS,
     EmbeddingRecord,
+    FAILED_STATUS,
     KnowledgeCollection,
     KnowledgeSection,
+    READY_STATE,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,6 +63,24 @@ class _KnowledgeBase:
             return json.loads(value)
         except (json.JSONDecodeError, TypeError):
             return default if default is not None else {}
+
+    def _fence_claim(self, cursor: Any, source_id: int, claim_token: str) -> bool:
+        """Re-validate claim ownership inside the caller's transaction.
+
+        The no-op UPDATE doubles as the concurrency fence: it matches only
+        while ``claim_token`` is the active, unexpired lease (expiry is
+        evaluated against the DATABASE clock), and it takes the claim row's
+        write lock until the transaction ends, serializing fenced writes
+        against takeover attempts. ``cursor.rowcount == 1`` proves ownership
+        at mutation time.
+        """
+        cursor.execute(
+            "UPDATE knowledge_source_claims SET worker_id = worker_id "
+            "WHERE source_id = ? AND claim_token = ? AND status = 'active' "
+            f"AND lease_expires_at > {now_epoch_sql(self._manager.engine)}",  # nosec B608
+            (source_id, claim_token),
+        )
+        return cursor.rowcount == 1
 
 
 class KnowledgeSourceRepository(_KnowledgeBase):
@@ -143,10 +164,21 @@ class KnowledgeSourceRepository(_KnowledgeBase):
 
     def set_state(self, owner_user_id: int, source_id: int,
                   status: str, state: str, error: Optional[str] = None,
-                  increment_retry: bool = False) -> bool:
+                  increment_retry: bool = False,
+                  claim_token: Optional[str] = None) -> bool:
+        """Persist source status/state. With ``claim_token`` the write is
+        fenced: it succeeds only while that claim is still the active, unexpired
+        owner, and raises ``ClaimLostError`` otherwise (nothing is written)."""
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                if claim_token is not None and not self._fence_claim(
+                    cursor, source_id, claim_token
+                ):
+                    self._rollback()
+                    raise ClaimLostError(
+                        f"claim lost before set_state({source_id})"
+                    )
                 if increment_retry:
                     sql = (
                         "UPDATE knowledge_sources SET status = ?, ingestion_state = ?, "
@@ -178,10 +210,18 @@ class KnowledgeSourceRepository(_KnowledgeBase):
     def set_title(self, owner_user_id: int, source_id: int, title: str,
                   author: Optional[str] = None, language: Optional[str] = None,
                   pages: int = 0, char_count: int = 0,
-                  metadata: Optional[Dict[str, Any]] = None) -> bool:
+                  metadata: Optional[Dict[str, Any]] = None,
+                  claim_token: Optional[str] = None) -> bool:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                if claim_token is not None and not self._fence_claim(
+                    cursor, source_id, claim_token
+                ):
+                    self._rollback()
+                    raise ClaimLostError(
+                        f"claim lost before set_title({source_id})"
+                    )
                 cursor.execute(
                     "UPDATE knowledge_sources SET title = ?, author = ?, "
                     "language = ?, pages = ?, char_count = ?, metadata_json = ?, "
@@ -226,18 +266,28 @@ class KnowledgeDocumentRepository(_KnowledgeBase):
     def create(self, *, source_id: int, owner_user_id: int, title: str,
                author: Optional[str], language: Optional[str], toc: List[Dict[str, Any]],
                total_chars: int, total_pages: int, metadata: Optional[Dict[str, Any]] = None,
-               version: int = 1) -> Optional[int]:
+               version: int = 1,
+               claim_token: Optional[str] = None) -> Optional[int]:
+        """Insert a document row. With ``claim_token`` the insert is fenced and
+        the row is tagged with the claim epoch that produced it."""
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                if claim_token is not None and not self._fence_claim(
+                    cursor, source_id, claim_token
+                ):
+                    self._rollback()
+                    raise ClaimLostError(
+                        f"claim lost before document insert({source_id})"
+                    )
                 cursor.execute(
                     "INSERT INTO knowledge_documents "
                     "(source_id, owner_user_id, version, title, author, language, "
-                    "toc_json, total_chars, total_pages, metadata_json) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "toc_json, total_chars, total_pages, metadata_json, claim_token) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (source_id, owner_user_id, version, title, author, language,
                      self._j(toc), total_chars, total_pages,
-                     self._j(metadata or {})),
+                     self._j(metadata or {}), claim_token),
                 )
                 self._connection().commit()
                 return cursor.lastrowid
@@ -247,21 +297,49 @@ class KnowledgeDocumentRepository(_KnowledgeBase):
             return None
 
     def complete(self, owner_user_id: int, document_id: int,
-                 total_sections: int, status: str = COMPLETED_STATUS) -> bool:
+                 total_sections: int, status: str = COMPLETED_STATUS,
+                 claim_token: Optional[str] = None) -> bool:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
-                cursor.execute(
-                    "UPDATE knowledge_documents SET total_sections = ?, status = ? "
-                    "WHERE document_id = ? AND owner_user_id = ?",
-                    (total_sections, status, document_id, owner_user_id),
-                )
+                if claim_token is not None:
+                    if not self._fence_claim(
+                        cursor,
+                        int(self._source_id_for(cursor, document_id) or 0),
+                        claim_token,
+                    ):
+                        self._rollback()
+                        raise ClaimLostError(
+                            f"claim lost before document complete({document_id})"
+                        )
+                    cursor.execute(
+                        "UPDATE knowledge_documents SET total_sections = ?, "
+                        "status = ? WHERE document_id = ? AND owner_user_id = ? "
+                        "AND claim_token = ?",
+                        (total_sections, status, document_id, owner_user_id,
+                         claim_token),
+                    )
+                else:
+                    cursor.execute(
+                        "UPDATE knowledge_documents SET total_sections = ?, status = ? "
+                        "WHERE document_id = ? AND owner_user_id = ?",
+                        (total_sections, status, document_id, owner_user_id),
+                    )
                 self._connection().commit()
                 return True
         except DB_ERROR as e:
             self._rollback()
             logger.error(f"Database error in knowledge complete document: {e}")
             return False
+
+    @staticmethod
+    def _source_id_for(cursor: Any, document_id: int) -> Optional[int]:
+        cursor.execute(
+            "SELECT source_id FROM knowledge_documents WHERE document_id = ?",
+            (document_id,),
+        )
+        row = cursor.fetchone()
+        return int(row["source_id"]) if row is not None else None
 
     def list_for_source(self, source_id: int) -> List[Dict[str, Any]]:
         """Documents referencing a source, newest version first."""
@@ -291,17 +369,25 @@ class KnowledgeDocumentRepository(_KnowledgeBase):
 class KnowledgeSectionRepository(_KnowledgeBase):
     def create(self, *, document_id: int, owner_user_id: int, source_id: int,
                level: int, title: str, order_index: int,
-               start_char: Optional[int], end_char: Optional[int]) -> Optional[int]:
+               start_char: Optional[int], end_char: Optional[int],
+               claim_token: Optional[str] = None) -> Optional[int]:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                if claim_token is not None and not self._fence_claim(
+                    cursor, source_id, claim_token
+                ):
+                    self._rollback()
+                    raise ClaimLostError(
+                        f"claim lost before section insert({source_id})"
+                    )
                 cursor.execute(
                     "INSERT INTO knowledge_sections "
                     "(document_id, owner_user_id, source_id, level, title, "
-                    "order_index, start_char, end_char) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "order_index, start_char, end_char, claim_token) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (document_id, owner_user_id, source_id, level, title,
-                     order_index, start_char, end_char),
+                     order_index, start_char, end_char, claim_token),
                 )
                 self._connection().commit()
                 return cursor.lastrowid
@@ -373,14 +459,23 @@ class KnowledgeChunkRepository(_KnowledgeBase):
                section_id: Optional[int], chunk_key: str, content: str,
                content_hash: str, token_count: int, char_count: int,
                page: Optional[str], order_index: int,
-               metadata: Optional[Dict[str, Any]] = None) -> Optional[int]:
+               metadata: Optional[Dict[str, Any]] = None,
+               claim_token: Optional[str] = None) -> Optional[int]:
         """Insert a chunk. Returns None if an identical chunk already exists
-        for this owner (idempotent re-ingestion)."""
+        for this owner (idempotent re-ingestion). With ``claim_token`` the
+        insert is fenced and the row is tagged with the claim epoch."""
         if not char_count:
             char_count = len(content)
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                if claim_token is not None and not self._fence_claim(
+                    cursor, source_id, claim_token
+                ):
+                    self._rollback()
+                    raise ClaimLostError(
+                        f"claim lost before chunk insert({source_id})"
+                    )
                 cursor.execute(
                     "SELECT chunk_id FROM knowledge_chunks "
                     "WHERE owner_user_id = ? AND chunk_key = ?",
@@ -392,10 +487,11 @@ class KnowledgeChunkRepository(_KnowledgeBase):
                     "INSERT INTO knowledge_chunks "
                     "(owner_user_id, source_id, document_id, section_id, chunk_key, "
                     "content, content_hash, token_count, char_count, page, "
-                    "order_index, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "order_index, metadata_json, claim_token) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (owner_user_id, source_id, document_id, section_id, chunk_key,
                      content, content_hash, token_count, char_count, page,
-                     order_index, self._j(metadata or {})),
+                     order_index, self._j(metadata or {}), claim_token),
                 )
                 self._connection().commit()
                 return cursor.lastrowid
@@ -454,19 +550,31 @@ class KnowledgeChunkRepository(_KnowledgeBase):
 
 
 class KnowledgeEmbeddingRepository(_KnowledgeBase):
-    def save_many(self, records: List[EmbeddingRecord]) -> int:
+    def save_many(self, records: List[EmbeddingRecord],
+                  claim_token: Optional[str] = None) -> int:
+        """Persist embedding vectors. With ``claim_token`` the batch write is
+        fenced once and every row is tagged with the claim epoch."""
         saved = 0
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                if claim_token is not None:
+                    source_ids = {r.source_id for r in records}
+                    for source_id in source_ids:
+                        if not self._fence_claim(cursor, source_id, claim_token):
+                            self._rollback()
+                            raise ClaimLostError(
+                                f"claim lost before embedding insert({source_id})"
+                            )
                 for record in records:
                     cursor.execute(
                         "INSERT OR REPLACE INTO knowledge_embeddings "
                         "(owner_user_id, source_id, chunk_row_id, model, version, "
-                        "dimensions, vector_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        "dimensions, vector_json, claim_token) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                         (record.owner_user_id, record.source_id, record.chunk_row_id,
                          record.model, record.version, record.dimensions,
-                         json.dumps(record.vector)),
+                         json.dumps(record.vector), claim_token),
                     )
                     saved += 1
                 self._connection().commit()
@@ -750,6 +858,340 @@ class KnowledgeStorageRepository(_KnowledgeBase):
             return False
 
 
+class KnowledgeClaimRepository(_KnowledgeBase):
+    """DB-backed claim + lease per knowledge source (H1 concurrency hardening).
+
+    One row per source in ``knowledge_source_claims`` is the single source of
+    truth for "which worker may ingest this source right now". All lease
+    arithmetic uses the DATABASE clock (``dialect.now_epoch_sql``), never
+    worker-local time, and every mutating operation is a conditional statement
+    (or a transaction opened by one) so claim acquisition, takeover, renewal,
+    release, fenced writes, finalization and cleanup are atomic per engine.
+
+    Claim epochs are identified by a random ``claim_token`` plus a monotonic
+    ``attempt`` fencing number that increments on every takeover.
+    """
+
+    # Deletion order respects FK dependencies (embeddings -> chunks ->
+    # documents; sections -> documents).
+    _DERIVED_TABLES = (
+        "knowledge_embeddings",
+        "knowledge_chunks",
+        "knowledge_sections",
+        "knowledge_documents",
+    )
+
+    def acquire(self, *, source_id: int, owner_user_id: int, worker_id: str,
+                claim_token: str, ttl_seconds: float) -> Optional[Dict[str, Any]]:
+        """Atomically claim a source for one ingestion epoch.
+
+        Succeeds when the source has no claim row, the previous claim was
+        released, or the previous lease has EXPIRED (takeover: ``attempt`` is
+        incremented). Fails (returns None) while a competing worker holds a
+        valid, unexpired lease. INSERT-OR-IGNORE plus a conditional takeover
+        UPDATE make the whole decision atomic; concurrent acquirers are
+        serialized by the claim row.
+        """
+        ttl = max(0, int(round(ttl_seconds)))
+        now = now_epoch_sql(self._manager.engine)
+        try:
+            with self._manager._lock:
+                conn = self._connection()
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT OR IGNORE INTO knowledge_source_claims "
+                    "(source_id, owner_user_id, claim_token, worker_id, attempt, "
+                    "status, claimed_at, lease_expires_at) "
+                    f"VALUES (?, ?, ?, ?, 1, 'active', {now}, {now} + ?)",  # nosec B608
+                    (source_id, owner_user_id, claim_token, worker_id, ttl),
+                )
+                if cursor.rowcount == 1:
+                    conn.commit()
+                    return self._row_claim(
+                        self._get_claim_row(cursor, source_id), claim_token
+                    )
+                # A claim row exists: take over only if released or expired.
+                cursor.execute(
+                    "UPDATE knowledge_source_claims SET claim_token = ?, "
+                    "worker_id = ?, attempt = attempt + 1, status = 'active', "
+                    f"claimed_at = {now}, lease_expires_at = {now} + ?, "  # nosec B608
+                    "renewed_at = NULL, released_at = NULL "
+                    "WHERE source_id = ? AND owner_user_id = ? "
+                    f"AND (status = 'released' OR lease_expires_at <= {now})",  # nosec B608
+                    (claim_token, worker_id, ttl, source_id, owner_user_id),
+                )
+                if cursor.rowcount == 1:
+                    conn.commit()
+                    return self._row_claim(
+                        self._get_claim_row(cursor, source_id), claim_token
+                    )
+                conn.commit()
+                return None
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in knowledge claim acquire: {e}")
+            return None
+
+    def renew(self, *, source_id: int, claim_token: str,
+              ttl_seconds: float) -> bool:
+        """Token-validated lease renewal.
+
+        Refused after expiration (``lease_expires_at <= now``) and after an
+        ownership transfer (token mismatch): a worker that missed its window
+        must re-acquire through the takeover path instead of silently
+        extending a lease somebody else may already own.
+        """
+        ttl = max(0, int(round(ttl_seconds)))
+        now = now_epoch_sql(self._manager.engine)
+        try:
+            with self._manager._lock:
+                conn = self._connection()
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE knowledge_source_claims "
+                    f"SET lease_expires_at = {now} + ?, renewed_at = {now} "  # nosec B608
+                    "WHERE source_id = ? AND claim_token = ? "
+                    f"AND status = 'active' AND lease_expires_at > {now}",  # nosec B608
+                    (ttl, source_id, claim_token),
+                )
+                conn.commit()
+                return cursor.rowcount == 1
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in knowledge claim renew: {e}")
+            return False
+
+    def release(self, *, source_id: int, claim_token: str) -> bool:
+        """Token-validated release. A wrong token (ownership transferred) or an
+        already-released claim returns False and mutates nothing."""
+        now = now_epoch_sql(self._manager.engine)
+        try:
+            with self._manager._lock:
+                conn = self._connection()
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE knowledge_source_claims SET status = 'released', "
+                    f"released_at = {now}, lease_expires_at = {now} "  # nosec B608
+                    "WHERE source_id = ? AND claim_token = ? AND status = 'active'",
+                    (source_id, claim_token),
+                )
+                conn.commit()
+                return cursor.rowcount == 1
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in knowledge claim release: {e}")
+            return False
+
+    def get(self, source_id: int) -> Optional[Dict[str, Any]]:
+        try:
+            with self._manager._lock:
+                cursor = self._connection().cursor()
+                row = self._get_claim_row(cursor, source_id)
+                return dict(row) if row is not None else None
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in knowledge claim get: {e}")
+            return None
+
+    def owns(self, source_id: int, claim_token: str) -> bool:
+        """True only while ``claim_token`` holds an active, unexpired claim."""
+        now = now_epoch_sql(self._manager.engine)
+        try:
+            with self._manager._lock:
+                cursor = self._connection().cursor()
+                cursor.execute(
+                    "SELECT 1 FROM knowledge_source_claims "
+                    "WHERE source_id = ? AND claim_token = ? "
+                    f"AND status = 'active' AND lease_expires_at > {now}",  # nosec B608
+                    (source_id, claim_token),
+                )
+                return cursor.fetchone() is not None
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in knowledge claim owns: {e}")
+            return False
+
+    def publish(self, *, source_id: int, owner_user_id: int, claim_token: str,
+                document_id: int, total_sections: int, title: str,
+                author: Optional[str], language: Optional[str], pages: int,
+                char_count: int, metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """Atomic, ownership-validated final publication.
+
+        One transaction: fence (ownership + unexpired lease + claim-row lock),
+        complete the document, write the source's final metadata, mark the
+        source completed/READY, release the claim. Either everything persists
+        or nothing does; a lost claim raises ``ClaimLostError`` and rolls back.
+        """
+        now = now_epoch_sql(self._manager.engine)
+        try:
+            with self._manager._lock:
+                conn = self._connection()
+                cursor = conn.cursor()
+                if not self._fence_claim(cursor, source_id, claim_token):
+                    self._rollback()
+                    raise ClaimLostError(
+                        f"claim lost before publication({source_id})"
+                    )
+                cursor.execute(
+                    "UPDATE knowledge_documents SET total_sections = ?, "
+                    "status = ? WHERE document_id = ? AND owner_user_id = ? "
+                    "AND source_id = ? AND claim_token = ?",
+                    (total_sections, COMPLETED_STATUS, document_id,
+                     owner_user_id, source_id, claim_token),
+                )
+                if cursor.rowcount != 1:
+                    self._rollback()
+                    raise ClaimLostError(
+                        f"document {document_id} not owned by this attempt"
+                    )
+                cursor.execute(
+                    "UPDATE knowledge_sources SET title = ?, author = ?, "
+                    "language = ?, pages = ?, char_count = ?, metadata_json = ?, "
+                    "updated_at = ? WHERE source_id = ? AND owner_user_id = ?",
+                    (title, author, language, pages, char_count,
+                     self._j(metadata or {}), datetime.now().isoformat(),
+                     source_id, owner_user_id),
+                )
+                if cursor.rowcount != 1:
+                    self._rollback()
+                    raise ClaimLostError(
+                        f"source {source_id} vanished before publication"
+                    )
+                cursor.execute(
+                    "UPDATE knowledge_sources SET status = ?, "
+                    "ingestion_state = ?, error_message = NULL, updated_at = ? "
+                    "WHERE source_id = ? AND owner_user_id = ?",
+                    (COMPLETED_STATUS, READY_STATE, datetime.now().isoformat(),
+                     source_id, owner_user_id),
+                )
+                if cursor.rowcount != 1:
+                    self._rollback()
+                    raise ClaimLostError(
+                        f"source {source_id} vanished before publication"
+                    )
+                cursor.execute(
+                    "UPDATE knowledge_source_claims SET status = 'released', "
+                    f"released_at = {now}, lease_expires_at = {now} "  # nosec B608
+                    "WHERE source_id = ? AND claim_token = ?",
+                    (source_id, claim_token),
+                )
+                conn.commit()
+                return True
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in knowledge claim publish: {e}")
+            raise ClaimLostError(f"publication failed for source {source_id}")
+
+    def cleanup_attempt(self, *, source_id: int, owner_user_id: int,
+                        claim_token: str, error: Optional[str] = None,
+                        mark_failed: bool = True,
+                        increment_retry: bool = True) -> Dict[str, Any]:
+        """Teardown of exactly one ingestion attempt.
+
+        - Deletes ONLY rows tagged with this attempt's ``claim_token``: a stale
+          attempt can never delete a newer worker's data.
+        - Records the failure on the source only while this claim is still the
+          active owner (fenced); after ownership loss the source is left to the
+          new owner.
+        - Releases the claim (token-validated) when the failure was recorded.
+        """
+        result: Dict[str, Any] = {
+            "marked_failed": False,
+            "released": False,
+            "deleted": {table: 0 for table in self._DERIVED_TABLES},
+        }
+        try:
+            with self._manager._lock:
+                conn = self._connection()
+                cursor = conn.cursor()
+                if mark_failed and self._fence_claim(cursor, source_id, claim_token):
+                    if increment_retry:
+                        cursor.execute(
+                            "UPDATE knowledge_sources SET status = ?, "
+                            "ingestion_state = ?, error_message = ?, updated_at = ?, "
+                            "retry_count = retry_count + 1 "
+                            "WHERE source_id = ? AND owner_user_id = ?",
+                            (FAILED_STATUS, "INDEX", error,
+                             datetime.now().isoformat(), source_id, owner_user_id),
+                        )
+                    else:
+                        cursor.execute(
+                            "UPDATE knowledge_sources SET status = ?, "
+                            "ingestion_state = ?, error_message = ?, updated_at = ? "
+                            "WHERE source_id = ? AND owner_user_id = ?",
+                            (FAILED_STATUS, "INDEX", error,
+                             datetime.now().isoformat(), source_id, owner_user_id),
+                        )
+                    result["marked_failed"] = cursor.rowcount == 1
+                    now = now_epoch_sql(self._manager.engine)
+                    cursor.execute(
+                        "UPDATE knowledge_source_claims SET status = 'released', "
+                        f"released_at = {now}, lease_expires_at = {now} "  # nosec B608
+                        "WHERE source_id = ? AND claim_token = ?",
+                        (source_id, claim_token),
+                    )
+                    result["released"] = cursor.rowcount == 1
+                for table in self._DERIVED_TABLES:
+                    cursor.execute(
+                        f"DELETE FROM {table} "  # nosec B608
+                        "WHERE source_id = ? AND claim_token = ?",
+                        (source_id, claim_token),
+                    )
+                    result["deleted"][table] = cursor.rowcount
+                conn.commit()
+                return result
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in knowledge claim cleanup: {e}")
+            return result
+
+    def purge_unowned_rows(self, *, source_id: int,
+                           claim_token: str) -> Dict[str, int]:
+        """Delete derived rows left by DEAD attempts of this source.
+
+        Called only while holding a fresh, valid claim (right after acquire or
+        takeover), so every row whose tag is not ``claim_token`` belongs to an
+        expired/released epoch or predates claim tagging. Rows of a newer epoch
+        cannot exist while this claim is held, so cleanup here cannot destroy
+        another active worker's data either.
+        """
+        deleted: Dict[str, int] = {}
+        try:
+            with self._manager._lock:
+                conn = self._connection()
+                cursor = conn.cursor()
+                for table in self._DERIVED_TABLES:
+                    cursor.execute(
+                        f"DELETE FROM {table} "  # nosec B608
+                        "WHERE source_id = ? AND "
+                        "(claim_token IS NULL OR claim_token != ?)",
+                        (source_id, claim_token),
+                    )
+                    deleted[table] = cursor.rowcount
+                conn.commit()
+                return deleted
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in knowledge claim purge: {e}")
+            return deleted
+
+    # -- helpers ----------------------------------------------------------
+
+    @staticmethod
+    def _get_claim_row(cursor: Any, source_id: int):
+        cursor.execute(
+            "SELECT * FROM knowledge_source_claims WHERE source_id = ?",
+            (source_id,),
+        )
+        return cursor.fetchone()
+
+    @staticmethod
+    def _row_claim(row, claim_token: str) -> Dict[str, Any]:
+        data = dict(row) if row is not None else {}
+        data.setdefault("claim_token", claim_token)
+        return data
+
+
 # Aggregate facade so the knowledge service holds a single object.
 class KnowledgeStore:
     def __init__(self, manager: DatabaseManager):
@@ -761,6 +1203,7 @@ class KnowledgeStore:
         self.events = KnowledgeEventRepository(manager)
         self.collections = KnowledgeCollectionRepository(manager)
         self.storage = KnowledgeStorageRepository(manager)
+        self.claims = KnowledgeClaimRepository(manager)
         self._manager = manager
 
 

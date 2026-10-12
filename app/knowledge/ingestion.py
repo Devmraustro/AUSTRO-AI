@@ -13,12 +13,16 @@ chunks are embedded and indexed - i.e. actually searchable.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import logging
+import os
+import secrets
+import socket
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from app.config.settings import Settings
-from app.core.errors import NotFoundError, ValidationError
+from app.core.errors import ClaimLostError, NotFoundError, ValidationError
 from app.knowledge.chunker import PreparedParagraph, SemanticChunker, split_paragraphs
 from app.knowledge.cleaner import TextCleaner
 from app.knowledge.embeddings import EmbeddingService
@@ -28,6 +32,7 @@ from app.knowledge.models import (
     EmbeddingRecord,
     FAILED_STATUS,
     IngestionResult,
+    PROCESSING_STATUS,
     READY_STATE,
 )
 from app.knowledge.repositories import KnowledgeStore
@@ -63,6 +68,15 @@ class IngestionPipeline:
 
     async def process_source(self, source_id: int, owner_user_id: int,
                              progress: Optional[ProgressFn] = None) -> IngestionResult:
+        """Ingest one source under a database-backed claim/lease.
+
+        Lifecycle: acquire claim (atomic; rejected while a competing worker
+        holds a valid lease) -> purge rows of dead attempts -> run the pipeline
+        with fenced writes and a renewal loop -> atomic ownership-validated
+        publication. Every failure path tears down ONLY this attempt's rows
+        (tagged with its claim token), so cleanup can never destroy a newer
+        worker's data.
+        """
         source = self._store.sources.get(owner_user_id, source_id)
         if source is None:
             raise NotFoundError("الكتاب غير موجود")
@@ -72,26 +86,163 @@ class IngestionPipeline:
                 source=source, status=COMPLETED_STATUS, chunk_count=0
             )
 
+        ttl = float(self._settings.knowledge_claim_ttl_seconds)
+        claim_token = secrets.token_hex(16)
+        claim = await asyncio.to_thread(
+            self._store.claims.acquire,
+            source_id=source_id,
+            owner_user_id=owner_user_id,
+            worker_id=self._worker_id(),
+            claim_token=claim_token,
+            ttl_seconds=ttl,
+        )
+        if claim is None:
+            # A competing worker holds a valid, unexpired lease: reject.
+            return IngestionResult(
+                source=source,
+                status=PROCESSING_STATUS,
+                error="المعالجة جارية بالفعل",
+            )
+        await asyncio.to_thread(
+            self._store.claims.purge_unowned_rows,
+            source_id=source_id,
+            claim_token=claim_token,
+        )
+
         result = IngestionResult(source=source, status=FAILED_STATUS)
+        claim_lost = asyncio.Event()
+        renew_task = asyncio.create_task(
+            self._renewal_loop(source_id, claim_token, ttl, claim_lost)
+        )
         try:
-            await self._run(source, progress, result)
+            publish_payload = await self._run(
+                source, progress, result, claim_token, claim_lost
+            )
+            await asyncio.to_thread(
+                self._publish, source, publish_payload, claim_token
+            )
+            result.status = COMPLETED_STATUS
+            result.state = READY_STATE
+            result.chunk_count = publish_payload["chunk_count"]
+            await self._emit(
+                progress, "READY", "جاهز", "✅ تمت فهرسة الكتاب بنجاح"
+            )
+        except ClaimLostError:
+            # Ownership lost (expiry + takeover / failed renewal). Tear down
+            # ONLY our own rows; the source state belongs to the new owner.
+            logger.warning(
+                f"Knowledge ingestion claim lost for {source_id}; stopping safely"
+            )
+            await asyncio.to_thread(
+                self._cleanup_attempt, source_id, owner_user_id, claim_token,
+                None, False,
+            )
+            result.status = FAILED_STATUS
+            result.error = "انتهت صلاحية معالجة الملف أو تولاها عامل آخر"
+        except asyncio.CancelledError:
+            await asyncio.to_thread(
+                self._cleanup_attempt, source_id, owner_user_id, claim_token,
+                "cancelled", True,
+            )
+            raise
         except Exception as exc:  # noqa: BLE001 - persist failures not crash
             safe = self._safe_error(exc)
             logger.exception(f"Knowledge ingestion failed for {source_id}: {safe}")
-            self._store.sources.set_state(
-                owner_user_id, source_id, FAILED_STATUS, result.state or "EXTRACT",
-                error=safe, increment_retry=True,
+            await asyncio.to_thread(
+                self._cleanup_attempt, source_id, owner_user_id, claim_token,
+                safe, True,
             )
             result.status = FAILED_STATUS
             result.error = safe
+        finally:
+            renew_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await renew_task
+            # Best-effort release if a path above could not (no-op when the
+            # claim was already released or taken over; token-validated).
+            await asyncio.to_thread(
+                self._store.claims.release,
+                source_id=source_id,
+                claim_token=claim_token,
+            )
         return result
 
     # ------------------------------------------------------------------
-    async def _run(self, source: Dict[str, Any],
-                   progress: Optional[ProgressFn], result: IngestionResult) -> None:
+    def _worker_id(self) -> str:
+        configured = (self._settings.knowledge_claim_worker_id or "").strip()
+        if configured:
+            return configured
+        return f"{socket.gethostname()}:{os.getpid()}"
+
+    async def _renewal_loop(self, source_id: int, claim_token: str,
+                            ttl_seconds: float, claim_lost: asyncio.Event) -> None:
+        """Keep the lease alive while ingestion runs.
+
+        Renewal failure (expired lease, ownership transfer, database error)
+        sets ``claim_lost`` so the active operation stops at its next
+        checkpoint; the database fences every write regardless.
+        """
+        interval = float(self._settings.knowledge_claim_renew_interval_seconds)
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    renewed = await asyncio.to_thread(
+                        self._store.claims.renew,
+                        source_id=source_id,
+                        claim_token=claim_token,
+                        ttl_seconds=ttl_seconds,
+                    )
+                except Exception:  # noqa: BLE001 - treat renewal errors as loss
+                    renewed = False
+                if not renewed:
+                    claim_lost.set()
+                    return
+        except asyncio.CancelledError:
+            raise
+
+    def _require_claim(self, claim_lost: asyncio.Event, source_id: int) -> None:
+        """Fast-path ownership check between stages (the DB is the authority)."""
+        if claim_lost.is_set():
+            raise ClaimLostError(f"claim renewal failed for source {source_id}")
+
+    def _publish(self, source: Dict[str, Any], payload: Dict[str, Any],
+                 claim_token: str) -> None:
+        self._store.claims.publish(
+            source_id=source["source_id"],
+            owner_user_id=source["owner_user_id"],
+            claim_token=claim_token,
+            document_id=payload["document_id"],
+            total_sections=payload["total_sections"],
+            title=payload["title"],
+            author=payload.get("author"),
+            language=payload.get("language"),
+            pages=payload.get("pages", 0),
+            char_count=payload.get("char_count", 0),
+            metadata=payload.get("metadata"),
+        )
+
+    def _cleanup_attempt(self, source_id: int, owner_user_id: int,
+                         claim_token: str, error: Optional[str],
+                         mark_failed: bool) -> None:
+        self._store.claims.cleanup_attempt(
+            source_id=source_id,
+            owner_user_id=owner_user_id,
+            claim_token=claim_token,
+            error=error,
+            mark_failed=mark_failed,
+            increment_retry=True,
+        )
+
+    # ------------------------------------------------------------------
+    async def _run(self, source: Dict[str, Any], progress: Optional[ProgressFn],
+                   result: IngestionResult, claim_token: str,
+                   claim_lost: asyncio.Event) -> Dict[str, Any]:
         owner = source["owner_user_id"]
         source_id = source["source_id"]
-        self._store.sources.set_state(owner, source_id, _PROCESSING, "VALIDATE")
+        self._store.sources.set_state(
+            owner, source_id, _PROCESSING, "VALIDATE", claim_token=claim_token
+        )
 
         # -- VALIDATE: storage + size --------------------------------------
         await self._emit(progress, "VALIDATE", "التحقق من الملف", "جاري فحص الملف...")
@@ -158,6 +309,7 @@ class IngestionPipeline:
             raise ValidationError(
                 "تعذر تقسيم الكتاب إلى مقاطع صالحة أو العدد كبير جداً"
             )
+        self._require_claim(claim_lost, source_id)
 
         # -- METADATA ---------------------------------------------------------
         await self._emit(progress, "METADATA", "إثراء البيانات",
@@ -168,7 +320,7 @@ class IngestionPipeline:
         # -- DB WRITES (sections + document) ----------------------------------
         document_row = await asyncio.to_thread(
             self._index_sections, owner, source_id, title, language,
-            normalized_text, extracted, sections_data,
+            normalized_text, extracted, sections_data, claim_token,
         )
         document_id = document_row["document_id"]
         section_refs = document_row["section_refs"]
@@ -187,9 +339,10 @@ class IngestionPipeline:
 
         # -- INDEX --------------------------------------------------------------
         await self._emit(progress, "INDEX", "الفهرسة", "جاري فهرسة المقاطع...")
+        self._require_claim(claim_lost, source_id)
         chunk_ids = await asyncio.to_thread(
             self._index_chunks, owner, source_id, document_id,
-            section_refs, chunks, vectors,
+            section_refs, chunks, vectors, claim_token,
         )
         if len(chunk_ids) != len(chunks):
             raise ValidationError("تعذر فهرسة جميع المقاطع")
@@ -202,23 +355,23 @@ class IngestionPipeline:
         )
         if embedded_count != len(chunks):
             raise ValidationError("فهرسة غير مكتملة، حاول المعالجة مجدداً")
-        self._store.documents.complete(
-            owner, document_id, total_sections=len(sections_data)
-        )
-        self._store.sources.set_title(
-            owner, source_id, title=metadata["title"],
-            author=metadata.get("author"), language=language,
-            pages=page_count, char_count=len(normalized_text),
-            metadata=metadata,
-        )
-        self._store.sources.set_state(
-            owner, source_id, COMPLETED_STATUS, READY_STATE
-        )
-        await self._emit(
-            progress, "READY", "جاهز", "✅ تمت فهرسة الكتاب بنجاح"
-        )
-        result.status = COMPLETED_STATUS
-        result.chunk_count = len(chunks)
+        self._require_claim(claim_lost, source_id)
+
+        # Final publication happens atomically in process_source via
+        # KnowledgeClaimRepository.publish (ownership-validated, one
+        # transaction). Here we only assemble its payload.
+        result.state = "INDEX"
+        return {
+            "document_id": document_id,
+            "total_sections": len(sections_data),
+            "title": metadata["title"],
+            "author": metadata.get("author"),
+            "language": language,
+            "pages": page_count,
+            "char_count": len(normalized_text),
+            "metadata": metadata,
+            "chunk_count": len(chunks),
+        }
 
     # ------------------------------------------------------------------
     def _safe_error(self, exc: BaseException) -> str:
@@ -244,7 +397,8 @@ class IngestionPipeline:
 
     def _index_sections(self, owner: int, source_id: int, title: str,
                         language: str, normalized_text: str, extracted,
-                        sections_data: List[Dict[str, Any]]) -> Dict[str, Any]:
+                        sections_data: List[Dict[str, Any]],
+                        claim_token: str) -> Dict[str, Any]:
         document_id = self._store.documents.create(
             source_id=source_id,
             owner_user_id=owner,
@@ -256,6 +410,7 @@ class IngestionPipeline:
             total_pages=int(extracted.metadata.get("page_count", 0)),
             metadata={"paragraph_blocks": sections_data},
             version=1,
+            claim_token=claim_token,
         )
         if document_id is None:
             raise ValidationError("تعذر إنشاء سجل المستند")
@@ -270,6 +425,7 @@ class IngestionPipeline:
                 order_index=section["order_index"],
                 start_char=section["start_char"],
                 end_char=section["end_char"],
+                claim_token=claim_token,
             )
             if section_id is None:
                 section_id = 0
@@ -278,7 +434,7 @@ class IngestionPipeline:
 
     def _index_chunks(self, owner: int, source_id: int, document_id: int,
                       section_refs: Dict[int, int], chunks: List[Dict[str, Any]],
-                      vectors: List[List[float]]) -> List[int]:
+                      vectors: List[List[float]], claim_token: str) -> List[int]:
         row_ids: List[int] = []
         for index, chunk in enumerate(chunks):
             section_index = chunk.get("section_id")
@@ -302,6 +458,7 @@ class IngestionPipeline:
                     "section_title": chunk.get("section_title"),
                     "paragraph_count": chunk.get("paragraph_count", 0),
                 },
+                claim_token=claim_token,
             )
             if row_id is None:
                 row_id = self._existing_chunk_id(owner, chunk["chunk_key"])
@@ -317,7 +474,7 @@ class IngestionPipeline:
                 version=self._embeddings.version(),
                 dimensions=self._embeddings.dimensions(),
                 vector=vector,
-            )])
+            )], claim_token=claim_token)
         return row_ids
 
     def _existing_chunk_id(self, owner: int, chunk_key: str) -> Optional[int]:

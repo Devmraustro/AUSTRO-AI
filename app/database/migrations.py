@@ -244,6 +244,58 @@ KNOWLEDGE_V1 = Migration(
     ],
 )
 
+# Ingestion claim/lease + attempt fencing (H1 concurrency hardening).
+#
+# `knowledge_source_claims` holds at most one row per source: the current
+# cross-process ingestion claim. Every claim carries a random token and a
+# monotonically increasing `attempt` (fencing number) that increments on each
+# takeover, so "worker + token + attempt" identifies one ingestion epoch.
+#
+# The `claim_token` columns tag every derived ingestion row with the epoch that
+# produced it. Fenced writes refuse mutations without a valid claim, cleanup
+# deletes only rows tagged with the failing attempt's own token (it can never
+# delete a newer worker's data), and takeover purges rows from dead epochs.
+#
+# Lease timestamps are INTEGER Unix seconds computed by the DATABASE clock
+# (see dialect.now_epoch_sql), never by worker-local clocks.
+#
+# Statement-level repeatability: the CREATE statements are idempotent. The
+# ALTER TABLE additions run exactly once per database via the
+# schema_migrations version gate (each migration applies in one transaction,
+# so a failed apply rolls back completely and retries cleanly).
+KNOWLEDGE_V2 = Migration(
+    schema_name="knowledge",
+    version=2,
+    statements=[
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_source_claims (
+            source_id INTEGER PRIMARY KEY,
+            owner_user_id INTEGER NOT NULL,
+            claim_token TEXT NOT NULL,
+            worker_id TEXT NOT NULL DEFAULT '',
+            attempt INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'active',
+            claimed_at INTEGER NOT NULL,
+            lease_expires_at INTEGER NOT NULL,
+            renewed_at INTEGER,
+            released_at INTEGER,
+            FOREIGN KEY (source_id) REFERENCES knowledge_sources(source_id)
+                ON DELETE CASCADE
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_knowledge_source_claims_lease "
+        "ON knowledge_source_claims(status, lease_expires_at)",
+        "ALTER TABLE knowledge_documents ADD COLUMN claim_token TEXT",
+        "ALTER TABLE knowledge_sections ADD COLUMN claim_token TEXT",
+        "ALTER TABLE knowledge_chunks ADD COLUMN claim_token TEXT",
+        "ALTER TABLE knowledge_embeddings ADD COLUMN claim_token TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_claim "
+        "ON knowledge_chunks(source_id, claim_token)",
+        "CREATE INDEX IF NOT EXISTS idx_knowledge_documents_claim "
+        "ON knowledge_documents(source_id, claim_token)",
+    ],
+)
+
 # Personal memory engine schema (typed memories, versions, audit trail).
 MEMORY_V1 = Migration(
     schema_name="memory",
@@ -599,7 +651,7 @@ CORE_V1 = Migration(
     ],
 )
 
-MIGRATIONS: List[Migration] = [KNOWLEDGE_V1, MEMORY_V1, LEARNING_V1, CORE_V1]
+MIGRATIONS: List[Migration] = [KNOWLEDGE_V1, KNOWLEDGE_V2, MEMORY_V1, LEARNING_V1, CORE_V1]
 
 
 def apply_migrations(conn) -> None:  # sqlite3.Connection or psycopg2 connection
