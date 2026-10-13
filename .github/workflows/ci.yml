@@ -73,10 +73,39 @@ jobs:
           DB_ADMIN_PASSWORD: austro_ci
         run: |
           set -o pipefail
-          python -m pytest tests/test_repositories_pg.py -q --tb=short 2>&1 | tee /tmp/pg_results.log
-          grep -q "18 passed" /tmp/pg_results.log || { echo "ERROR: Expected 18 passed"; exit 1; }
-          grep -q "skipped" /tmp/pg_results.log && { echo "ERROR: Tests were skipped"; exit 1; } || true
-          echo "PostgreSQL integration tests: 18 passed, 0 skipped"
+          # Both modules share DB_TEST_NAME and reset the public schema at
+          # session start, so they MUST run sequentially, never concurrently.
+          python -m pytest tests/test_repositories_pg.py -q --tb=short -rs --junitxml=/tmp/pg_repos.xml
+          python -m pytest tests/test_claim_mechanism_pg.py -q --tb=short -rs --junitxml=/tmp/pg_claim.xml
+          python - <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          # Verify against machine-readable results instead of matching
+          # human-readable output. Each module must run its exact expected
+          # tests against the live PostgreSQL service with zero failures,
+          # zero errors, and - critically - zero skips (the modules skip
+          # themselves when PostgreSQL is unreachable or credentials are
+          # wrong, which must fail this gate rather than pass silently).
+          expected = {"/tmp/pg_repos.xml": 18, "/tmp/pg_claim.xml": 7}
+          problems = []
+          for path, want in expected.items():
+              root = ET.parse(path).getroot()
+              suite = root if root.tag == "testsuite" else root.find("testsuite")
+              tests = int(suite.get("tests", 0))
+              bad = int(suite.get("failures", 0)) + int(suite.get("errors", 0))
+              skipped = int(suite.get("skipped", 0))
+              print(f"{path}: tests={tests} failures+errors={bad} skipped={skipped} (expected {want} tests)")
+              if tests != want:
+                  problems.append(f"{path}: expected exactly {want} tests, found {tests}")
+              if bad:
+                  problems.append(f"{path}: {bad} failures/errors")
+              if skipped:
+                  problems.append(f"{path}: {skipped} skipped (PostgreSQL tests must execute, never skip)")
+          if problems:
+              sys.exit("ERROR: " + "; ".join(problems))
+          PY
+          echo "PostgreSQL integration tests: 25 passed (18 repository + 7 claim), 0 skipped"
 
       - name: Run evaluation regression harness
         env:
