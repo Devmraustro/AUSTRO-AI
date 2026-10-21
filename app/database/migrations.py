@@ -635,7 +635,7 @@ LEARNING_V1 = Migration(
 #
 # The DUP_E cleanup statements collapse any pre-existing duplicates, keeping the
 # most recent row per (user_id, date). They are a no-op on a healthy database.
-# Statements are idempotent so this migration is safe to re-run.
+# Statements are idempotent, but the migration is recorded only after index verification.
 CORE_V1 = Migration(
     schema_name="core",
     version=1,
@@ -662,26 +662,46 @@ _CORE_INDEXES = {
 
 
 def _core_index_unique_state(conn, index_name: str):
-    """Return True/False when a named index exists and is unique, else None."""
+    """Return True only for the expected unique index; False for a conflicting
+    same-name index; None when the name is unused.
+    """
+    expected = _CORE_INDEXES[index_name]
+    expected_table, expected_columns = expected
+    expected_columns = [part.strip().lower() for part in expected_columns.split(",")]
     cursor = conn.cursor()
     if _DB_ENGINE == "postgresql":
         cursor.execute(
-            "SELECT indexdef FROM pg_indexes "
+            "SELECT tablename, indexdef FROM pg_indexes "
             "WHERE schemaname = current_schema() AND indexname = %s",
             (index_name,),
         )
         row = cursor.fetchone()
         if row is None:
             return None
-        return "CREATE UNIQUE INDEX" in str(row[0]).upper()
+        table_name, indexdef = str(row[0]), str(row[1])
+        normalized = indexdef.lower().replace('"', "")
+        columns_match = f"({','.join(expected_columns)})" in normalized.replace(" ", "")
+        return (
+            table_name == expected_table
+            and "create unique index" in normalized
+            and columns_match
+        )
+
     cursor.execute(
-        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+        "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'index' AND name = ?",
         (index_name,),
     )
     row = cursor.fetchone()
     if row is None:
         return None
-    return "CREATE UNIQUE INDEX" in str(row[0] or "").upper()
+    table_name, create_sql = str(row[0]), str(row[1] or "")
+    cursor.execute(f"PRAGMA index_info('{index_name}')")
+    actual_columns = [str(item[2]).lower() for item in cursor.fetchall()]
+    return (
+        table_name == expected_table
+        and "create unique index" in create_sql.lower()
+        and actual_columns == expected_columns
+    )
 
 
 def _validate_core_v1_indexes(conn) -> None:
