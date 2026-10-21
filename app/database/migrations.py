@@ -640,16 +640,68 @@ CORE_V1 = Migration(
     schema_name="core",
     version=1,
     statements=[
-        "DELETE FROM daily_reviews WHERE review_id NOT IN ("
-        "SELECT MAX(review_id) FROM daily_reviews GROUP BY user_id, date)",
+        # SQL UNIQUE indexes treat NULL values as distinct on both supported
+        # engines. Preserve those rows; deduplicate only fully specified keys.
+        "DELETE FROM daily_reviews WHERE user_id IS NOT NULL AND date IS NOT NULL "
+        "AND review_id NOT IN (SELECT MAX(review_id) FROM daily_reviews "
+        "WHERE user_id IS NOT NULL AND date IS NOT NULL GROUP BY user_id, date)",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_daily_reviews_user_date "
         "ON daily_reviews (user_id, date)",
-        "DELETE FROM progress WHERE progress_id NOT IN ("
-        "SELECT MAX(progress_id) FROM progress GROUP BY user_id, date)",
+        "DELETE FROM progress WHERE user_id IS NOT NULL AND date IS NOT NULL "
+        "AND progress_id NOT IN (SELECT MAX(progress_id) FROM progress "
+        "WHERE user_id IS NOT NULL AND date IS NOT NULL GROUP BY user_id, date)",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_progress_user_date "
         "ON progress (user_id, date)",
     ],
 )
+
+_CORE_INDEXES = {
+    "uq_daily_reviews_user_date": ("daily_reviews", "user_id, date"),
+    "uq_progress_user_date": ("progress", "user_id, date"),
+}
+
+
+def _core_index_unique_state(conn, index_name: str):
+    """Return True/False when a named index exists and is unique, else None."""
+    cursor = conn.cursor()
+    if _DB_ENGINE == "postgresql":
+        cursor.execute(
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE schemaname = current_schema() AND indexname = %s",
+            (index_name,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return "CREATE UNIQUE INDEX" in str(row[0]).upper()
+    cursor.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+        (index_name,),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    return "CREATE UNIQUE INDEX" in str(row[0] or "").upper()
+
+
+def _validate_core_v1_indexes(conn) -> None:
+    """Fail before data cleanup if a target name is occupied by a non-unique index."""
+    for index_name in _CORE_INDEXES:
+        state = _core_index_unique_state(conn, index_name)
+        if state is False:
+            raise RuntimeError(
+                f"Migration core v1 cannot safely replace non-unique index {index_name}"
+            )
+
+
+def _verify_core_v1_indexes_unique(conn) -> None:
+    """Verify that both required uniqueness constraints exist after migration."""
+    for index_name in _CORE_INDEXES:
+        if _core_index_unique_state(conn, index_name) is not True:
+            raise RuntimeError(
+                f"Migration core v1 did not establish unique index {index_name}"
+            )
+
 
 MIGRATIONS: List[Migration] = [KNOWLEDGE_V1, KNOWLEDGE_V2, MEMORY_V1, LEARNING_V1, CORE_V1]
 
@@ -674,11 +726,15 @@ def apply_migrations(conn) -> None:  # sqlite3.Connection or psycopg2 connection
         if row is not None and len(row) > 0 and int(row[0]) >= migration.version:
             continue
         try:
+            if migration.schema_name == "core" and migration.version == 1:
+                _validate_core_v1_indexes(conn)
             statements = (
                 translate_statements(migration.statements) if postgres else migration.statements
             )
             for statement in statements:
                 cursor.execute(statement)
+            if migration.schema_name == "core" and migration.version == 1:
+                _verify_core_v1_indexes_unique(conn)
             if postgres:
                 cursor.execute(
                     upsert_schema_migrations(),
@@ -694,7 +750,9 @@ def apply_migrations(conn) -> None:  # sqlite3.Connection or psycopg2 connection
             logger.info(
                 f"Applied migration {migration.schema_name} v{migration.version}"
             )
-        except DB_ERROR as exc:  # pragma: no cover - defensive
+        except Exception as exc:
+            # Validation failures are RuntimeError, not DB_ERROR. Roll back for
+            # every failure so schema/data changes and version bookkeeping stay atomic.
             conn.rollback()
             logger.exception(
                 f"Migration {migration.schema_name} v{migration.version} failed: {exc}"
