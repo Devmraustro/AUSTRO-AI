@@ -71,6 +71,27 @@ def test_core_v1_rejects_same_name_non_unique_index_and_rolls_back(monkeypatch):
     conn.close()
 
 
+
+def test_core_v1_rejects_unique_index_with_wrong_table_or_columns(monkeypatch):
+    conn = _core_db()
+    conn.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY, user_id INTEGER, date TEXT)")
+    conn.execute(
+        "CREATE UNIQUE INDEX uq_daily_reviews_user_date ON unrelated(user_id, date)"
+    )
+    conn.commit()
+    monkeypatch.setattr(migrations, "_DB_ENGINE", "sqlite")
+    monkeypatch.setattr(migrations, "MIGRATIONS", [migrations.CORE_V1])
+
+    with pytest.raises(RuntimeError, match="non-unique index"):
+        migrations.apply_migrations(conn)
+
+    assert conn.execute("SELECT COUNT(*) FROM daily_reviews").fetchone() == (4,)
+    assert conn.execute(
+        "SELECT version FROM schema_migrations WHERE schema_name = 'core'"
+    ).fetchone() is None
+    conn.close()
+
+
 def test_core_v1_verification_failure_is_not_recorded(monkeypatch):
     conn = _core_db()
     monkeypatch.setattr(migrations, "_DB_ENGINE", "sqlite")
