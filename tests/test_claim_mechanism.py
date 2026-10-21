@@ -784,6 +784,18 @@ def test_purge_unowned_rows_only_spares_current_epoch(store):
         total_pages=1,
         claim_token="tok-1",
     )
+    # Legacy rows from before claim tagging must not be assumed stale.
+    legacy = store.documents.create(
+        source_id=source_id,
+        owner_user_id=OWNER,
+        title="legacy-untagged",
+        author=None,
+        language="ar",
+        toc=[],
+        total_chars=5,
+        total_pages=1,
+        claim_token=None,
+    )
     _expire(source_id)
     assert _acquire(store, source_id, "tok-2", ttl=30) is not None
     kept = store.documents.create(
@@ -808,7 +820,9 @@ def test_purge_unowned_rows_only_spares_current_epoch(store):
         "SELECT document_id FROM knowledge_documents WHERE source_id = ?",
         (source_id,),
     )
-    assert [row["document_id"] for row in rows] == [kept]
+    # Current epoch and legacy untagged rows survive; only the old tagged
+    # epoch is eligible for deletion.
+    assert [row["document_id"] for row in rows] == sorted([legacy, kept])
 
 
 # ---------------------------------------------------------------------------
