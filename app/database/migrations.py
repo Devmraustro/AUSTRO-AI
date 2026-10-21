@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import List
 
 from app.config.settings import settings
-from app.database.dialect import DB_ERROR, translate_statements, upsert_schema_migrations
+from app.database.dialect import translate_statements, upsert_schema_migrations
 
 logger = logging.getLogger(__name__)
 
