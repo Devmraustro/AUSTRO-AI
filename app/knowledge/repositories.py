@@ -929,8 +929,10 @@ class KnowledgeClaimRepository(_KnowledgeBase):
                 return None
         except DB_ERROR as e:
             self._rollback()
-            logger.error(f"Database error in knowledge claim acquire: {e}")
-            return None
+            logger.exception(f"Database error in knowledge claim acquire: {e}")
+            # None means a valid competing claim exists. Database failures must
+            # remain distinguishable and propagate to the ingestion boundary.
+            raise
 
     def renew(self, *, source_id: int, claim_token: str,
               ttl_seconds: float) -> bool:
@@ -1149,11 +1151,10 @@ class KnowledgeClaimRepository(_KnowledgeBase):
                            claim_token: str) -> Dict[str, int]:
         """Delete derived rows left by DEAD attempts of this source.
 
-        Called only while holding a fresh, valid claim (right after acquire or
-        takeover), so every row whose tag is not ``claim_token`` belongs to an
-        expired/released epoch or predates claim tagging. Rows of a newer epoch
-        cannot exist while this claim is held, so cleanup here cannot destroy
-        another active worker's data either.
+        Called while holding a fresh, valid claim. Only rows explicitly tagged
+        with a different claim token are eligible for purge. Legacy rows with
+        NULL claim_token are deliberately preserved: without a migration marker
+        there is no safe way to prove they belong to a dead attempt.
         """
         deleted: Dict[str, int] = {}
         try:
@@ -1163,8 +1164,8 @@ class KnowledgeClaimRepository(_KnowledgeBase):
                 for table in self._DERIVED_TABLES:
                     cursor.execute(
                         f"DELETE FROM {table} "  # nosec B608
-                        "WHERE source_id = ? AND "
-                        "(claim_token IS NULL OR claim_token != ?)",
+                        "WHERE source_id = ? AND claim_token IS NOT NULL "
+                        "AND claim_token != ?",
                         (source_id, claim_token),
                     )
                     deleted[table] = cursor.rowcount
