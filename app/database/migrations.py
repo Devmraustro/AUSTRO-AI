@@ -710,7 +710,7 @@ def _validate_core_v1_indexes(conn) -> None:
         state = _core_index_unique_state(conn, index_name)
         if state is False:
             raise RuntimeError(
-                f"Migration core v1 cannot safely replace non-unique index {index_name}"
+                f"Migration core v1 found a conflicting index definition for {index_name}"
             )
 
 
