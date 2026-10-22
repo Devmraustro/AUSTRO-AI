@@ -8,7 +8,6 @@ Deterministic, in-memory with optional Redis backend for production.
 from __future__ import annotations
 
 import time
-from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 from threading import Lock
@@ -80,14 +79,44 @@ class TokenBucket:
 
 
 class SlidingWindowRateLimiter:
-    """Sliding window rate limiter with burst support."""
-    
+    """Sliding window rate limiter with burst support.
+
+    Thread-safety contract (enforced by tests/test_rate_limiter_concurrency.py):
+
+    * `_locks` is a stable registry: a key's lock object is created once and is
+      NEVER removed. The previous version built both dicts as
+      ``defaultdict(...)`` and `_cleanup` deleted the lock together with the
+      bucket, so an in-flight request holding the old lock and a new request
+      that created a fresh lock for the same key could both evaluate the same
+      empty window and both be admitted - a rate-limit bypass under exactly the
+      concurrent load the limiter exists for.
+    * A bucket is only pruned (and only while holding that key's lock) once it
+      is empty, and the lock object is kept, so no thread can end up appending
+      to a list that is no longer the live bucket for its key.
+    """
+
+    #: Longest window any configured bucket uses; entries older than this cannot
+    #: influence a decision, so cleanup can drop them.
+    MAX_WINDOW_SECONDS = 3600.0
+
     def __init__(self):
-        self._buckets: Dict[str, list] = defaultdict(list)  # key -> list of timestamps
-        self._locks: Dict[str, Lock] = defaultdict(Lock)
+        self._buckets: Dict[str, list] = {}  # key -> list of timestamps
+        self._locks: Dict[str, Lock] = {}    # key -> stable per-key lock
+        self._structure_lock = Lock()        # guards the two dicts themselves
         self._cleanup_interval = 300  # 5 minutes
         self._last_cleanup = time.monotonic()
-    
+
+    def _lock_for(self, key: str) -> Lock:
+        """Return the key's stable lock, creating the bucket if needed."""
+        with self._structure_lock:
+            lock = self._locks.get(key)
+            if lock is None:
+                lock = Lock()
+                self._locks[key] = lock
+            if key not in self._buckets:
+                self._buckets[key] = []
+            return lock
+
     def check_rate_limit(
         self,
         key: str,
@@ -105,9 +134,15 @@ class SlidingWindowRateLimiter:
         if now - self._last_cleanup > self._cleanup_interval:
             self._cleanup(now)
         
-        lock = self._locks[key]
+        lock = self._lock_for(key)
         with lock:
-            timestamps = self._buckets[key]
+            timestamps = self._buckets.get(key)
+            if timestamps is None:
+                # Cleanup pruned the empty bucket between _lock_for and here.
+                # We hold the key's (stable) lock, so re-creating it is safe.
+                timestamps = []
+                with self._structure_lock:
+                    self._buckets[key] = timestamps
             window_start = now - window_seconds
             
             # Remove expired timestamps
@@ -137,17 +172,30 @@ class SlidingWindowRateLimiter:
                 )
     
     def _cleanup(self, now: float):
-        """Remove expired entries."""
-        window_seconds = 3600  # Max window
-        cutoff = now - window_seconds
-        for key in list(self._buckets.keys()):
-            timestamps = self._buckets[key]
-            while timestamps and timestamps[0] < cutoff:
-                timestamps.pop(0)
-            if not timestamps:
-                del self._buckets[key]
-                if key in self._locks:
-                    del self._locks[key]
+        """Drop timestamps that can no longer affect any decision.
+
+        Only the *bucket* is removed, and only while its own lock is held, so a
+        request that is mid-decision never appends to a detached list. Lock
+        objects are never deleted: that was the race that let two threads admit
+        the same window concurrently.
+        """
+        cutoff = now - self.MAX_WINDOW_SECONDS
+        with self._structure_lock:
+            keys = list(self._buckets.keys())
+        for key in keys:
+            lock = self._locks.get(key)
+            if lock is None:  # pragma: no cover - _lock_for always creates both
+                continue
+            with lock:
+                timestamps = self._buckets.get(key)
+                if timestamps is None:
+                    continue
+                while timestamps and timestamps[0] < cutoff:
+                    timestamps.pop(0)
+                if not timestamps:
+                    with self._structure_lock:
+                        if self._buckets.get(key) is timestamps:
+                            del self._buckets[key]
         self._last_cleanup = now
 
 
