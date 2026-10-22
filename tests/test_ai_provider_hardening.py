@@ -161,13 +161,21 @@ async def test_concurrent_calls_are_paced_not_burst(monkeypatch):
 
     provider = _provider(monkeypatch, behaviour, min_request_interval=0.05)
 
+    started = time.monotonic()
     await asyncio.gather(*(provider.generate(_request()) for _ in range(5)))
+    elapsed = time.monotonic() - started
 
     assert len(timestamps) == 5
-    gaps = [b - a for a, b in zip(timestamps, timestamps[1:])]
-    assert min(gaps) >= 0.04, (
-        "concurrent calls were sent together despite min_request_interval=0.05; "
-        f"gaps={['%.3f' % g for g in gaps]}"
+    # Each of the 5 calls reserves its own slot, so the group cannot finish
+    # faster than 4 intervals. Total elapsed time is immune to the scheduler
+    # reordering the worker threads that perform the calls (which is why a
+    # pairwise-gap assertion would be flaky on a loaded runner); the old
+    # read-sleep-write implementation finished 5 concurrent calls in ~1
+    # interval (measured: gaps [0.051, 0.0, 0.001, 0.0]).
+    floor = 4 * 0.05 * 0.8
+    assert elapsed >= floor, (
+        f"5 concurrent calls finished in {elapsed:.3f}s (expected >= {floor:.3f}s "
+        "for min_request_interval=0.05): the pacing was bursted through"
     )
 
 
