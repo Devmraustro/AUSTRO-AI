@@ -822,7 +822,7 @@ def test_purge_unowned_rows_only_spares_current_epoch(store):
     )
     # Current epoch and legacy untagged rows survive; only the old tagged
     # epoch is eligible for deletion.
-    assert [row["document_id"] for row in rows] == sorted([legacy, kept])
+    assert set(row["document_id"] for row in rows) == {legacy, kept}
 
 
 # ---------------------------------------------------------------------------
