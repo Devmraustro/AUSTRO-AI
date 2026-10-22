@@ -817,12 +817,12 @@ def test_purge_unowned_rows_only_spares_current_epoch(store):
     )
     assert deleted["knowledge_documents"] == 1
     rows = _sql(
-        "SELECT document_id FROM knowledge_documents WHERE source_id = ?",
+        "SELECT title FROM knowledge_documents WHERE source_id = ?",
         (source_id,),
     )
-    # Current epoch and legacy untagged rows survive; only the old tagged
-    # epoch is eligible for deletion.
-    assert set(row["document_id"] for row in rows) == {legacy, kept}
+    # Assert persisted row identity by title: the repository's create method
+    # does not promise a document ID for legacy/null-token rows.
+    assert {row["title"] for row in rows} == {"legacy-untagged", "current-epoch"}
 
 
 # ---------------------------------------------------------------------------
