@@ -114,6 +114,20 @@ def to_postgresql_params(statement: str) -> str:
     return _QMARK_RE.sub("%s", to_postgresql(statement))
 
 
+def now_epoch_sql(engine: str) -> str:
+    """SQL fragment evaluating to the DATABASE clock as integer epoch seconds.
+
+    Lease/claim semantics must compare against one clock only: the database's.
+    SQLite and PostgreSQL express "now" differently, and their SQL is not
+    interchangeable, so the fragment is selected explicitly per engine instead
+    of being smuggled through the textual translator. Both forms return whole
+    Unix seconds so the values stored in INTEGER columns compare directly.
+    """
+    if engine == "postgresql":
+        return "CAST(EXTRACT(EPOCH FROM now()) AS INTEGER)"
+    return "CAST(strftime('%s','now') AS INTEGER)"
+
+
 def upsert_schema_migrations(pk_column: str = "schema_name") -> str:
     """PostgreSQL upsert used to record an applied migration idempotently."""
     return (

@@ -45,6 +45,16 @@ class ConfigurationError(AUSTROError):
     """Bad or missing configuration at startup."""
 
 
+class ClaimLostError(AUSTROError):
+    """The worker no longer holds the ingestion claim/lease for a source.
+
+    Raised by fenced writes, renewal failure and finalization once the claim
+    has expired or been taken over by another worker. Callers must stop
+    writing immediately; every fenced database operation already refuses the
+    mutation, so no stale data can be persisted.
+    """
+
+
 # Safe, static user-facing messages. No exception internals are ever shown.
 _PUBLIC_MESSAGES = {
     ValidationError: "❌ البيانات المدخلة غير صحيحة.",
@@ -55,6 +65,7 @@ _PUBLIC_MESSAGES = {
     ExternalServiceError: "❌ حدث خطأ في خدمة خارجية. حاول لاحقاً.",
     RateLimitError: "⚠️ وصلت إلى الحد المسموح من الاستخدام اليومي. حاول لاحقاً.",
     ConfigurationError: "❌ خطأ في الإعدادات. تأكد من ملف .env ثم أعد التشغيل.",
+    ClaimLostError: "⚠️ توقفت معالجة الملف لأن معالجة أخرى تولت الأمر.",
 }
 
 _GENERIC_MESSAGE = "❌ عذراً، حدث خطأ. الرجاء المحاولة مرة أخرى."

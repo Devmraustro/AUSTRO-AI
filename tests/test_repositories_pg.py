@@ -210,7 +210,8 @@ def test_migrations_are_idempotent_on_postgres(pg_db):
     assert cur.fetchone()[0] >= 40
 
     cur.execute("SELECT version FROM schema_migrations WHERE schema_name = %s", ("knowledge",))
-    assert cur.fetchone()[0] == 1
+    # v2 adds the ingestion claim/lease schema (H1 concurrency hardening).
+    assert cur.fetchone()[0] == 2
 
 
 # ============================ CORE / LEGACY ============================

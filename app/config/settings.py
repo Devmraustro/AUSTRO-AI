@@ -191,6 +191,14 @@ class Settings:
     db_sslcert: str = ""
     db_sslkey: str = ""
 
+    # Ingestion claim/lease (H1 concurrency hardening). The TTL is how long a
+    # worker may own a source without renewing; the renewal interval must stay
+    # comfortably below the TTL. Both are configurable so tests can run with
+    # sub-second leases.
+    knowledge_claim_ttl_seconds: float = 60.0
+    knowledge_claim_renew_interval_seconds: float = 20.0
+    knowledge_claim_worker_id: str = ""
+
     @property
     def has_gemini_key(self) -> bool:
         return bool(self.gemini_api_key) and len(self.gemini_api_key) >= 10
@@ -275,6 +283,13 @@ def load_settings() -> Settings:
         knowledge_embedding_batch_size=int(
             os.getenv("KNOWLEDGE_EMBEDDING_BATCH_SIZE", "16")
         ),
+        knowledge_claim_ttl_seconds=float(
+            os.getenv("KNOWLEDGE_CLAIM_TTL_SECONDS", "60")
+        ),
+        knowledge_claim_renew_interval_seconds=float(
+            os.getenv("KNOWLEDGE_CLAIM_RENEW_INTERVAL_SECONDS", "20")
+        ),
+        knowledge_claim_worker_id=os.getenv("KNOWLEDGE_CLAIM_WORKER_ID", "").strip(),
         memory_max_retrieved=int(os.getenv("MEMORY_MAX_RETRIEVED", "12")),
         memory_context_budget_chars=int(
             os.getenv("MEMORY_CONTEXT_BUDGET_CHARS", "1800")

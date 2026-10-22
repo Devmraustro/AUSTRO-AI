@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import List
 
 from app.config.settings import settings
-from app.database.dialect import DB_ERROR, translate_statements, upsert_schema_migrations
+from app.database.dialect import translate_statements, upsert_schema_migrations
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +241,58 @@ KNOWLEDGE_V1 = Migration(
                 ON DELETE CASCADE
         )
         """,
+    ],
+)
+
+# Ingestion claim/lease + attempt fencing (H1 concurrency hardening).
+#
+# `knowledge_source_claims` holds at most one row per source: the current
+# cross-process ingestion claim. Every claim carries a random token and a
+# monotonically increasing `attempt` (fencing number) that increments on each
+# takeover, so "worker + token + attempt" identifies one ingestion epoch.
+#
+# The `claim_token` columns tag every derived ingestion row with the epoch that
+# produced it. Fenced writes refuse mutations without a valid claim, cleanup
+# deletes only rows tagged with the failing attempt's own token (it can never
+# delete a newer worker's data), and takeover purges rows from dead epochs.
+#
+# Lease timestamps are INTEGER Unix seconds computed by the DATABASE clock
+# (see dialect.now_epoch_sql), never by worker-local clocks.
+#
+# Statement-level repeatability: the CREATE statements are idempotent. The
+# ALTER TABLE additions run exactly once per database via the
+# schema_migrations version gate (each migration applies in one transaction,
+# so a failed apply rolls back completely and retries cleanly).
+KNOWLEDGE_V2 = Migration(
+    schema_name="knowledge",
+    version=2,
+    statements=[
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_source_claims (
+            source_id INTEGER PRIMARY KEY,
+            owner_user_id INTEGER NOT NULL,
+            claim_token TEXT NOT NULL,
+            worker_id TEXT NOT NULL DEFAULT '',
+            attempt INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'active',
+            claimed_at INTEGER NOT NULL,
+            lease_expires_at INTEGER NOT NULL,
+            renewed_at INTEGER,
+            released_at INTEGER,
+            FOREIGN KEY (source_id) REFERENCES knowledge_sources(source_id)
+                ON DELETE CASCADE
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_knowledge_source_claims_lease "
+        "ON knowledge_source_claims(status, lease_expires_at)",
+        "ALTER TABLE knowledge_documents ADD COLUMN claim_token TEXT",
+        "ALTER TABLE knowledge_sections ADD COLUMN claim_token TEXT",
+        "ALTER TABLE knowledge_chunks ADD COLUMN claim_token TEXT",
+        "ALTER TABLE knowledge_embeddings ADD COLUMN claim_token TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_claim "
+        "ON knowledge_chunks(source_id, claim_token)",
+        "CREATE INDEX IF NOT EXISTS idx_knowledge_documents_claim "
+        "ON knowledge_documents(source_id, claim_token)",
     ],
 )
 
@@ -583,23 +635,95 @@ LEARNING_V1 = Migration(
 #
 # The DUP_E cleanup statements collapse any pre-existing duplicates, keeping the
 # most recent row per (user_id, date). They are a no-op on a healthy database.
-# Statements are idempotent so this migration is safe to re-run.
+# Statements are idempotent, but the migration is recorded only after index verification.
 CORE_V1 = Migration(
     schema_name="core",
     version=1,
     statements=[
-        "DELETE FROM daily_reviews WHERE review_id NOT IN ("
-        "SELECT MAX(review_id) FROM daily_reviews GROUP BY user_id, date)",
+        # SQL UNIQUE indexes treat NULL values as distinct on both supported
+        # engines. Preserve those rows; deduplicate only fully specified keys.
+        "DELETE FROM daily_reviews WHERE user_id IS NOT NULL AND date IS NOT NULL "
+        "AND review_id NOT IN (SELECT MAX(review_id) FROM daily_reviews "
+        "WHERE user_id IS NOT NULL AND date IS NOT NULL GROUP BY user_id, date)",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_daily_reviews_user_date "
         "ON daily_reviews (user_id, date)",
-        "DELETE FROM progress WHERE progress_id NOT IN ("
-        "SELECT MAX(progress_id) FROM progress GROUP BY user_id, date)",
+        "DELETE FROM progress WHERE user_id IS NOT NULL AND date IS NOT NULL "
+        "AND progress_id NOT IN (SELECT MAX(progress_id) FROM progress "
+        "WHERE user_id IS NOT NULL AND date IS NOT NULL GROUP BY user_id, date)",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_progress_user_date "
         "ON progress (user_id, date)",
     ],
 )
 
-MIGRATIONS: List[Migration] = [KNOWLEDGE_V1, MEMORY_V1, LEARNING_V1, CORE_V1]
+_CORE_INDEXES = {
+    "uq_daily_reviews_user_date": ("daily_reviews", "user_id, date"),
+    "uq_progress_user_date": ("progress", "user_id, date"),
+}
+
+
+def _core_index_unique_state(conn, index_name: str):
+    """Return True only for the expected unique index; False for a conflicting
+    same-name index; None when the name is unused.
+    """
+    expected = _CORE_INDEXES[index_name]
+    expected_table, expected_columns = expected
+    expected_columns = [part.strip().lower() for part in expected_columns.split(",")]
+    cursor = conn.cursor()
+    if _DB_ENGINE == "postgresql":
+        cursor.execute(
+            "SELECT tablename, indexdef FROM pg_indexes "
+            "WHERE schemaname = current_schema() AND indexname = %s",
+            (index_name,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        table_name, indexdef = str(row[0]), str(row[1])
+        normalized = indexdef.lower().replace('"', "")
+        columns_match = f"({','.join(expected_columns)})" in normalized.replace(" ", "")
+        return (
+            table_name == expected_table
+            and "create unique index" in normalized
+            and columns_match
+        )
+
+    cursor.execute(
+        "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+        (index_name,),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    table_name, create_sql = str(row[0]), str(row[1] or "")
+    cursor.execute(f"PRAGMA index_info('{index_name}')")
+    actual_columns = [str(item[2]).lower() for item in cursor.fetchall()]
+    return (
+        table_name == expected_table
+        and "create unique index" in create_sql.lower()
+        and actual_columns == expected_columns
+    )
+
+
+def _validate_core_v1_indexes(conn) -> None:
+    """Fail before data cleanup if a target name is occupied by a non-unique index."""
+    for index_name in _CORE_INDEXES:
+        state = _core_index_unique_state(conn, index_name)
+        if state is False:
+            raise RuntimeError(
+                f"Migration core v1 found a conflicting index definition for {index_name}"
+            )
+
+
+def _verify_core_v1_indexes_unique(conn) -> None:
+    """Verify that both required uniqueness constraints exist after migration."""
+    for index_name in _CORE_INDEXES:
+        if _core_index_unique_state(conn, index_name) is not True:
+            raise RuntimeError(
+                f"Migration core v1 did not establish unique index {index_name}"
+            )
+
+
+MIGRATIONS: List[Migration] = [KNOWLEDGE_V1, KNOWLEDGE_V2, MEMORY_V1, LEARNING_V1, CORE_V1]
 
 
 def apply_migrations(conn) -> None:  # sqlite3.Connection or psycopg2 connection
@@ -622,11 +746,15 @@ def apply_migrations(conn) -> None:  # sqlite3.Connection or psycopg2 connection
         if row is not None and len(row) > 0 and int(row[0]) >= migration.version:
             continue
         try:
+            if migration.schema_name == "core" and migration.version == 1:
+                _validate_core_v1_indexes(conn)
             statements = (
                 translate_statements(migration.statements) if postgres else migration.statements
             )
             for statement in statements:
                 cursor.execute(statement)
+            if migration.schema_name == "core" and migration.version == 1:
+                _verify_core_v1_indexes_unique(conn)
             if postgres:
                 cursor.execute(
                     upsert_schema_migrations(),
@@ -642,7 +770,9 @@ def apply_migrations(conn) -> None:  # sqlite3.Connection or psycopg2 connection
             logger.info(
                 f"Applied migration {migration.schema_name} v{migration.version}"
             )
-        except DB_ERROR as exc:  # pragma: no cover - defensive
+        except Exception as exc:
+            # Validation failures are RuntimeError, not DB_ERROR. Roll back for
+            # every failure so schema/data changes and version bookkeeping stay atomic.
             conn.rollback()
             logger.exception(
                 f"Migration {migration.schema_name} v{migration.version} failed: {exc}"
