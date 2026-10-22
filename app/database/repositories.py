@@ -508,6 +508,29 @@ class ReminderRepository(_BaseRepository):
             logger.error(f"Database error in get_all_active_reminders: {e}")
             return []
 
+    def deactivate(self, reminder_id: int) -> bool:
+        """Retire a reminder so it is never delivered again.
+
+        Nothing in the application used to write ``is_active``. A one-off
+        reminder therefore stayed active forever and the hourly resync kept
+        re-creating a job for a time that had already passed, so a single
+        "remind me at 20:00" was re-sent every hour for the lifetime of the
+        deployment. This is the missing lifecycle transition.
+        """
+        try:
+            with self._manager._lock:
+                cursor = self._connection().cursor()
+                cursor.execute(
+                    "UPDATE reminders SET is_active = FALSE WHERE reminder_id = ?",
+                    (reminder_id,),
+                )
+                self._connection().commit()
+                return cursor.rowcount == 1
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in deactivate_reminder: {e}")
+            return False
+
 
 class ActivityRepository(_BaseRepository):
     def log(self, user_id: int, action: str, details: str = "") -> bool:
@@ -706,6 +729,10 @@ class Database:
 
     def get_all_active_reminders(self) -> List[Dict[str, Any]]:
         return self.reminders.list_all_active()
+
+    def deactivate_reminder(self, reminder_id: int) -> bool:
+        """Mark a (delivered) one-off reminder inactive."""
+        return self.reminders.deactivate(reminder_id)
 
     def log_activity(self, user_id: int, action: str, details: str = "") -> bool:
         return self.activity.log(user_id, action, details)

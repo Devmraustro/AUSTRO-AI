@@ -111,7 +111,12 @@ class ReminderScheduler:
                 when = datetime.fromisoformat(rem["scheduled_time"])
                 title = rem.get("title") or ""
                 reminder_text = rem.get("message") or title
-                data = {"user_id": rem["user_id"], "message": reminder_text}
+                data = {
+                    "user_id": rem["user_id"],
+                    "message": reminder_text,
+                    "reminder_id": reminder_id,
+                    "is_recurring": bool(rem.get("is_recurring")),
+                }
 
                 if rem.get("is_recurring"):
                     self.application.job_queue.run_daily(
@@ -269,19 +274,30 @@ class ReminderScheduler:
             return False
 
     async def _send_custom_reminder(self, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Send a custom reminder."""
-        job_data = context.job.data
+        """Send a custom reminder, then retire it if it was a one-off."""
+        job_data = context.job.data or {}
         user_id = job_data.get("user_id")
         message = job_data.get("message") or "تذكير من AUSTRO AI"
 
+        delivered = False
         try:
             await context.bot.send_message(
                 chat_id=user_id, text=message, parse_mode="Markdown"
             )
+            delivered = True
         except TelegramError:
+            # Markdown in user-supplied text can be invalid; retry as plain text.
             try:
                 await context.bot.send_message(chat_id=user_id, text=message)
+                delivered = True
             except Exception as e:  # noqa: BLE001
                 logger.error(f"Failed to send custom reminder to {user_id}: {e}")
         except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to send custom reminder to {user_id}: {e}")
+
+        reminder_id = job_data.get("reminder_id")
+        if delivered and reminder_id is not None and not job_data.get("is_recurring"):
+            # A one-off reminder must leave the active set, otherwise the hourly
+            # `_check_reminders` -> `resync()` re-creates a job for a time that
+            # has already passed and the same reminder is delivered every hour.
+            self._db.deactivate_reminder(int(reminder_id))
