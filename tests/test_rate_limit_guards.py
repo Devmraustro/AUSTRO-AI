@@ -741,7 +741,17 @@ async def test_expensive_limit_is_isolated_per_user():
 
 @pytest.mark.asyncio
 async def test_cancel_command_works_when_fully_throttled():
-    """/cancel must always escape a conversation, even at zero budget."""
+    """/cancel must always answer, even at zero budget.
+
+    The previous assertion was `result is ConversationHandler.END`. That value
+    was never used: PTB ignores the return value of a handler that is not part
+    of a ConversationHandler, so returning END from the top-level /cancel
+    handler ended nothing. The state reset comes from the conversation's own
+    `fallback_cancel` (see tests/test_cancel_conversation.py, which proves the
+    /cancel handler is registered after the conversations so that fallback
+    actually runs). Here the real contract is asserted instead: at zero budget
+    the handler still answers and charges nothing.
+    """
     lim = _tight()
     for bucket in ("command", "ai_request", "upload", "ingestion", "expensive"):
         _exhaust(lim, bucket)
@@ -763,7 +773,9 @@ async def test_cancel_command_works_when_fully_throttled():
     finally:
         H.get_rate_limit_middleware, H.get_services = orig_mw, orig_svc
 
-    assert result is H.ConversationHandler.END
+    # A top-level handler's return value is ignored by PTB, so the contract is
+    # "answered, and no guard rejected it".
+    assert result is None
     upd.message.reply_text.assert_awaited_once()
 
 

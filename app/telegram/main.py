@@ -17,7 +17,6 @@ from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
-    ConversationHandler,
     JobQueue,
     MessageHandler,
     filters,
@@ -46,8 +45,7 @@ from app.telegram.handlers import (
     get_reminder_handlers,
     get_study_handlers,
     knowledge_document,
-    knowledge_question,
-    memory_text,
+    text_router,
 )
 
 # Pin console + file logging once, with redaction.
@@ -316,9 +314,15 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Cancel current conversation"""
+    """Answer /cancel when NO conversation is active.
+
+    While a conversation is active, its own `fallback_cancel` runs first (this
+    handler is registered after every ConversationHandler) and that is what
+    actually clears the state. Returning `ConversationHandler.END` here had no
+    effect - PTB ignores the return value of a handler that is not part of a
+    conversation - and it advertised a state reset that never happened.
+    """
     await update.message.reply_text("❌ تم إلغاء العملية.")
-    return ConversationHandler.END
 
 
 async def knowledge_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -412,7 +416,6 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("coach", coach_command))
     application.add_handler(CommandHandler("dashboard", dashboard_command))
     application.add_handler(CommandHandler("settings", settings_command))
-    application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("knowledge", knowledge_command))
 
     # Add conversation handlers
@@ -431,15 +434,24 @@ def build_application() -> Application:
     for handler in get_menu_handlers():
         application.add_handler(handler)
 
-    # Add message handlers for the knowledge engine (documents + ask mode).
+    # Documents feed the knowledge engine.
     application.add_handler(MessageHandler(filters.Document.ALL, knowledge_document))
+    # Exactly ONE plain-text handler may exist: PTB hands an update to the first
+    # matching handler only, so a second global TEXT handler is unreachable.
+    # `text_router` dispatches by the flow that is waiting for the text.
     application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, knowledge_question)
+        MessageHandler(filters.TEXT & ~filters.COMMAND, text_router)
     )
-    # Add the memory engine's text-mode handler (search / edit / forget).
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, memory_text)
-    )
+
+    # /cancel is registered LAST, on purpose. PTB dispatches to the first
+    # matching handler in the group, so a global `CommandHandler("cancel")`
+    # placed before the conversations wins every /cancel and the
+    # ConversationHandler fallbacks (`fallback_cancel`, which returns END and
+    # clears the state) are never reached - /cancel answered "cancelled" while
+    # the conversation stayed active and the next message was still consumed as
+    # an answer. Registered after them, an active conversation's fallback runs
+    # first and this handler covers /cancel outside any conversation.
+    application.add_handler(CommandHandler("cancel", cancel_command))
 
     # Add error handler
     application.add_error_handler(error_handler)
