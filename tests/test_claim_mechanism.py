@@ -785,7 +785,7 @@ def test_purge_unowned_rows_only_spares_current_epoch(store):
         claim_token="tok-1",
     )
     # Legacy rows from before claim tagging must not be assumed stale.
-    legacy = store.documents.create(
+    store.documents.create(
         source_id=source_id,
         owner_user_id=OWNER,
         title="legacy-untagged",
