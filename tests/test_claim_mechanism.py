@@ -794,6 +794,7 @@ def test_purge_unowned_rows_only_spares_current_epoch(store):
         toc=[],
         total_chars=5,
         total_pages=1,
+        version=2,
         claim_token=None,
     )
     _expire(source_id)
@@ -807,7 +808,7 @@ def test_purge_unowned_rows_only_spares_current_epoch(store):
         toc=[],
         total_chars=10,
         total_pages=1,
-        version=2,
+        version=3,
         claim_token="tok-2",
     )
     assert kept is not None
