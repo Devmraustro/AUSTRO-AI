@@ -59,7 +59,7 @@ def test_core_v1_rejects_same_name_non_unique_index_and_rolls_back(monkeypatch):
     monkeypatch.setattr(migrations, "_DB_ENGINE", "sqlite")
     monkeypatch.setattr(migrations, "MIGRATIONS", [migrations.CORE_V1])
 
-    with pytest.raises(RuntimeError, match="non-unique index"):
+    with pytest.raises(RuntimeError, match="conflicting index definition"):
         migrations.apply_migrations(conn)
 
     # Data cleanup must not have run before detecting the conflicting index.
@@ -82,7 +82,7 @@ def test_core_v1_rejects_unique_index_with_wrong_table_or_columns(monkeypatch):
     monkeypatch.setattr(migrations, "_DB_ENGINE", "sqlite")
     monkeypatch.setattr(migrations, "MIGRATIONS", [migrations.CORE_V1])
 
-    with pytest.raises(RuntimeError, match="non-unique index"):
+    with pytest.raises(RuntimeError, match="conflicting index definition"):
         migrations.apply_migrations(conn)
 
     assert conn.execute("SELECT COUNT(*) FROM daily_reviews").fetchone() == (4,)
