@@ -20,6 +20,13 @@ from app.core.errors import ConfigurationError
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
+# Single source for the default Gemini model. gemini-2.5-flash was retired
+# 2026-10-20 (Google model lifecycle docs list gemini-3.8-flash, GA
+# 2026-09-02, as its replacement), and the live API returns HTTP 404 for it
+# to new users. An explicit GEMINI_MODEL always wins; this is only the
+# fallback when nothing is configured.
+DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -36,7 +43,7 @@ class Settings:
     backups_path: str
 
     gemini_api_key: str
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_model: str = DEFAULT_GEMINI_MODEL
     gemini_api_url: str = "https://generativelanguage.googleapis.com/v1beta/models"
     use_local_fallback: bool = True
 
@@ -193,7 +200,7 @@ def load_settings() -> Settings:
         logs_path=str(logs_dir),
         backups_path=str(backups_dir),
         gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
-        gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+        gemini_model=os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
         gemini_api_url=os.getenv(
             "GEMINI_API_URL",
             "https://generativelanguage.googleapis.com/v1beta/models",

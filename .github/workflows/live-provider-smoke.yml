@@ -6,11 +6,12 @@ on:
       gemini_model:
         description: "Gemini model to test (one minimal generation request is sent)"
         required: true
-        default: "gemini-2.5-flash"
+        default: "gemini-3.8-flash"
         type: string
 
 # Credential/connectivity check only. Never starts the bot, modifies data, or prints secrets.
-permissions: {}
+permissions:
+  contents: read
 
 concurrency:
   group: live-provider-smoke
@@ -22,134 +23,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 4
     steps:
+      - uses: actions/checkout@v4
+
+      # The check logic lives in scripts/live_provider_smoke.py so it is
+      # unit-tested with mocked HTTP (tests/test_live_provider_smoke.py);
+      # this workflow only supplies secrets and the selected model.
       - name: Check Telegram getMe and Gemini generateContent
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ inputs.gemini_model }}
-        run: |
-          python - <<'PY'
-          import json
-          import os
-          import re
-          import sys
-          import time
-          import urllib.error
-          import urllib.request
-          from urllib.parse import quote
-
-          failures = []
-
-          def safe_google_error(body, api_key):
-              """Return a small, redacted diagnostic; never print headers or request data."""
-              try:
-                  payload = json.loads(body.decode("utf-8", errors="replace"))
-                  error = payload.get("error", {})
-                  status = str(error.get("status", "UNKNOWN"))
-                  message = str(error.get("message", "No provider message"))
-                  message = message.replace(api_key, "[REDACTED]") if api_key else message
-                  message = re.sub(r"AIza[0-9A-Za-z_-]{10,}", "[REDACTED]", message)
-                  message = re.sub(r"https?://\S+", "[URL]", message)
-                  message = re.sub(r"[\r\n\t]+", " ", message)
-                  message = message[:180]
-                  return f"status={status}; message={message}"
-              except Exception:
-                  return "provider error details unavailable"
-
-          # Telegram Bot API: validation only; no message is sent.
-          token = os.environ.get("BOT_TOKEN", "").strip()
-          if not token:
-              print("Telegram getMe: FAIL (repository secret BOT_TOKEN is missing or empty)")
-              failures.append("BOT_TOKEN")
-          else:
-              request = urllib.request.Request(
-                  f"https://api.telegram.org/bot{token}/getMe",
-                  headers={"Accept": "application/json"},
-                  method="GET",
-              )
-              try:
-                  with urllib.request.urlopen(request, timeout=15) as response:
-                      data = json.loads(response.read())
-                  if data.get("ok") is True and isinstance(data.get("result"), dict) and data["result"].get("is_bot") is True:
-                      print("Telegram getMe: PASS (valid bot token; identity details suppressed)")
-                  else:
-                      print("Telegram getMe: FAIL (unexpected API response; body suppressed)")
-                      failures.append("Telegram API")
-              except urllib.error.HTTPError as exc:
-                  print(f"Telegram getMe: FAIL (HTTP {exc.code}; response body suppressed)")
-                  failures.append("Telegram API")
-              except Exception as exc:
-                  print(f"Telegram getMe: FAIL (network/client error: {type(exc).__name__}; details suppressed)")
-                  failures.append("Telegram API")
-
-          # Gemini: one minimal generation request, with bounded retries for transient failures.
-          api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-          model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
-          if not api_key:
-              print("Gemini generateContent: FAIL (repository secret GEMINI_API_KEY is missing or empty)")
-              failures.append("GEMINI_API_KEY")
-          elif not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", model):
-              print("Gemini generateContent: FAIL (invalid model identifier)")
-              failures.append("Gemini model")
-          else:
-              model_path = quote(model, safe="._-")
-              url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_path}:generateContent"
-              body = json.dumps({
-                  "contents": [{"role": "user", "parts": [{"text": "Reply with exactly OK."}]}],
-                  "generationConfig": {"temperature": 0, "maxOutputTokens": 8},
-              }).encode("utf-8")
-              transient_http = {429, 500, 502, 503, 504}
-              succeeded = False
-              last_failure = None
-
-              for attempt in range(1, 4):
-                  request = urllib.request.Request(
-                      url,
-                      data=body,
-                      headers={
-                          "Content-Type": "application/json",
-                          "Accept": "application/json",
-                          "x-goog-api-key": api_key,
-                      },
-                      method="POST",
-                  )
-                  try:
-                      with urllib.request.urlopen(request, timeout=30) as response:
-                          data = json.loads(response.read())
-                      candidates = data.get("candidates")
-                      if isinstance(candidates, list) and candidates:
-                          print(f"Gemini generateContent: PASS (model={model}; output suppressed; attempt={attempt})")
-                          succeeded = True
-                          break
-                      last_failure = "no candidate returned"
-                      break
-                  except urllib.error.HTTPError as exc:
-                      if exc.code in transient_http and attempt < 3:
-                          print(f"Gemini generateContent: transient HTTP {exc.code}; retry {attempt + 1}/3 after backoff")
-                          time.sleep(2 ** attempt)
-                          continue
-                      diagnostic = safe_google_error(exc.read(4096), api_key)
-                      last_failure = f"HTTP {exc.code}; {diagnostic}"
-                      break
-                  except (TimeoutError, urllib.error.URLError) as exc:
-                      reason = getattr(exc, "reason", exc)
-                      if attempt < 3:
-                          print(f"Gemini generateContent: transient {type(reason).__name__}; retry {attempt + 1}/3 after backoff")
-                          time.sleep(2 ** attempt)
-                          continue
-                      last_failure = f"network/client error: {type(reason).__name__}"
-                      break
-                  except Exception as exc:
-                      last_failure = f"client error: {type(exc).__name__}"
-                      break
-
-              if not succeeded:
-                  print(f"Gemini generateContent: FAIL ({last_failure or 'unknown failure'})")
-                  failures.append("Gemini API")
-
-          if failures:
-              print("LIVE PROVIDER SMOKE: FAIL (" + ", ".join(failures) + ")")
-              sys.exit(1)
-
-          print("LIVE PROVIDER SMOKE: PASS (both providers reachable; no Telegram message sent)")
-          PY
+        run: python scripts/live_provider_smoke.py
