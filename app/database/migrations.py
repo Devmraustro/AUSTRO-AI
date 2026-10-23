@@ -770,6 +770,23 @@ def _verify_core_v2_indexes_unique(conn) -> None:
             )
 
 
+def _reminders_table_exists(conn) -> bool:
+    """Return whether the core reminders table exists on the configured engine."""
+    cursor = conn.cursor()
+    if _DB_ENGINE == "postgresql":
+        cursor.execute(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema = current_schema() AND table_name = %s",
+            ("reminders",),
+        )
+        return cursor.fetchone() is not None
+    cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        ("reminders",),
+    )
+    return cursor.fetchone() is not None
+
+
 def _ensure_core_v3_columns(conn) -> None:
     """Ensure the retry counter exists, preserving existing reminder rows."""
     cursor = conn.cursor()
@@ -826,6 +843,18 @@ def apply_migrations(conn) -> None:  # sqlite3.Connection or psycopg2 connection
         cursor.execute(select_sql, (migration.schema_name,))
         row = cursor.fetchone()
         if row is not None and len(row) > 0 and int(row[0]) >= migration.version:
+            continue
+        # Some focused migration callers intentionally open a partial legacy
+        # database (for example, a knowledge-only store) without core tables.
+        # Do not mark v3 as applied until reminders exists: the regular database
+        # initializer creates core tables before calling migrations, so a later
+        # full initialization can safely apply this migration.
+        if (
+            migration.schema_name == "core"
+            and migration.version == 3
+            and not _reminders_table_exists(conn)
+        ):
+            logger.info("Deferring migration core v3 until the reminders table exists")
             continue
         try:
             if migration.schema_name == "core" and migration.version == 1:

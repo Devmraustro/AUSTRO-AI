@@ -184,3 +184,39 @@ def test_core_v3_recovers_when_column_exists_but_version_is_not_recorded(monkeyp
         "SELECT version FROM schema_migrations WHERE schema_name = 'core'"
     ).fetchone() == (3,)
     conn.close()
+
+
+def test_core_v3_is_deferred_until_reminders_table_exists(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE schema_migrations ("
+        "schema_name TEXT PRIMARY KEY, version INTEGER NOT NULL, "
+        "applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+    )
+    conn.execute("INSERT INTO schema_migrations(schema_name, version) VALUES ('core', 2)")
+    conn.commit()
+    monkeypatch.setattr(migrations, "_DB_ENGINE", "sqlite")
+    monkeypatch.setattr(migrations, "MIGRATIONS", [migrations.CORE_V3])
+
+    # A partial/knowledge-only database must not fail or falsely record v3.
+    migrations.apply_migrations(conn)
+    assert conn.execute(
+        "SELECT version FROM schema_migrations WHERE schema_name = 'core'"
+    ).fetchone() == (2,)
+
+    # Once normal initialization creates the core table, the deferred migration
+    # is applied and existing reminder rows remain available.
+    conn.execute(
+        "CREATE TABLE reminders ("
+        "reminder_id INTEGER PRIMARY KEY, is_active BOOLEAN DEFAULT 1)"
+    )
+    conn.execute("INSERT INTO reminders(reminder_id, is_active) VALUES (7, 1)")
+    conn.commit()
+    migrations.apply_migrations(conn)
+    assert conn.execute(
+        "SELECT version FROM schema_migrations WHERE schema_name = 'core'"
+    ).fetchone() == (3,)
+    assert conn.execute(
+        "SELECT is_active, delivery_attempts FROM reminders WHERE reminder_id = 7"
+    ).fetchone() == (1, 0)
+    conn.close()
