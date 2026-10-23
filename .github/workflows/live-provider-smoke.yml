@@ -6,7 +6,7 @@ on:
       gemini_model:
         description: "Gemini model to test (one minimal generation request is sent)"
         required: true
-        default: "gemini-2.5-flash"
+        default: "gemini-3.8-flash"
         type: string
 
 # Credential/connectivity check only. Never starts the bot, modifies data, or prints secrets.
@@ -84,7 +84,7 @@ jobs:
 
           # Gemini: one minimal generation request, with bounded retries for transient failures.
           api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-          model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
+          model = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash").strip()
           if not api_key:
               print("Gemini generateContent: FAIL (repository secret GEMINI_API_KEY is missing or empty)")
               failures.append("GEMINI_API_KEY")
