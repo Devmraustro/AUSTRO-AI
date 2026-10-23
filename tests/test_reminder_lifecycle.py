@@ -302,6 +302,49 @@ async def test_one_off_reminder_is_retired_after_max_failed_attempts():
     )
 
 
+def test_failed_delivery_counting_is_concurrency_safe():
+    """Concurrent failure records increment once each and stop at the cap."""
+    import threading
+
+    db.create_user(26, "u", "U")
+    reminder_id = db.create_reminder(
+        26, "custom", "t", "مهم", "2026-10-01T08:00:00", False
+    )
+    results = []
+
+    def worker():
+        results.append(db.record_reminder_delivery_failure(
+            reminder_id, MAX_ONE_OFF_DELIVERY_ATTEMPTS))
+
+    threads = [threading.Thread(target=worker) for _ in range(10)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    counted = sorted(r for r in results if r is not None)
+    assert counted == [1, 2, 3, 4, 5]  # exactly the persisted budget, no more
+    row = _reminder_row(reminder_id)
+    assert int(row["delivery_attempts"]) == MAX_ONE_OFF_DELIVERY_ATTEMPTS
+    assert int(row["is_active"]) == 0
+    # Further failures on a retired reminder are no-ops, not resurrections.
+    assert db.record_reminder_delivery_failure(
+        reminder_id, MAX_ONE_OFF_DELIVERY_ATTEMPTS) is None
+
+
+def test_failed_delivery_budget_survives_restart():
+    """A fresh Database over the same file keeps the persisted count."""
+    db.create_user(27, "u", "U")
+    reminder_id = db.create_reminder(
+        27, "custom", "t", "مهم", "2026-10-01T08:00:00", False
+    )
+    assert db.record_reminder_delivery_failure(reminder_id, 5) == 1
+    assert db.record_reminder_delivery_failure(reminder_id, 5) == 2
+    db._close_connection()
+    db.init_database()  # simulated restart: migrations rerun, data persists
+    assert db.record_reminder_delivery_failure(reminder_id, 5) == 3
+
+
 # ---------------------------------------------------------------------------
 # REMINDER-3: honest time handling
 # ---------------------------------------------------------------------------

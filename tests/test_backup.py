@@ -654,6 +654,36 @@ def test_key_file_tolerates_single_trailing_newline(tmp_path, monkeypatch):
     assert pg_backup._load_encryption_key() == key
 
 
+@pytest.mark.parametrize("edge", [b"\x09", b"\x0a", b"\x0d", b"\x20"])
+def test_key_file_newline_tolerance_preserves_whitespace_key_bytes(
+        tmp_path, monkeypatch, edge):
+    """Regression: strip() ate whitespace bytes belonging to the key itself.
+
+    A key whose first/last byte is whitespace, stored with a trailing
+    newline, must round-trip exactly. The old implementation rejected ~4%
+    of random keys, which made this suite flaky across CI matrix jobs.
+    """
+    monkeypatch.delenv("BACKUP_ENCRYPTION_ENABLED", raising=False)
+    key = edge + bytes(range(1, 31)) + edge
+    assert len(key) == 32
+    for suffix in (b"\n", b"\r\n"):
+        path = _key_file(tmp_path, key + suffix)
+        monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", str(path))
+        assert pg_backup._load_encryption_key() == key
+
+
+def test_key_file_rejects_more_than_one_trailing_newline(tmp_path, monkeypatch):
+    """Only a single trailing newline is tolerated; padding is not a key."""
+    monkeypatch.delenv("BACKUP_ENCRYPTION_ENABLED", raising=False)
+    key = bytes(range(32))
+    path = _key_file(tmp_path, key + b"\n\n")
+    monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", str(path))
+
+    assert pg_backup._load_encryption_key() is None
+    with pytest.raises(RuntimeError):
+        pg_backup._load_encryption_key(required=True)
+
+
 def test_verify_archive_rejects_encrypted_archive_without_key(tmp_path, monkeypatch):
     """Verification must fail closed rather than skip an encrypted archive."""
     monkeypatch.setenv("BACKUP_ENCRYPTION_ENABLED", "true")
