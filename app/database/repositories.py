@@ -546,6 +546,37 @@ class ReminderRepository(_BaseRepository):
             logger.error(f"Database error in get_all_active_reminders: {e}")
             return []
 
+    def record_failed_delivery(self, reminder_id: int, max_attempts: int) -> Optional[int]:
+        """Atomically count a failed one-off delivery and retire at the limit."""
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+        try:
+            with self._manager._lock:
+                cursor = self._connection().cursor()
+                cursor.execute(
+                    "UPDATE reminders SET "
+                    "delivery_attempts = COALESCE(delivery_attempts, 0) + 1, "
+                    "is_active = CASE "
+                    "WHEN COALESCE(delivery_attempts, 0) + 1 >= ? THEN FALSE "
+                    "ELSE is_active END "
+                    "WHERE reminder_id = ? AND is_active = TRUE",
+                    (max_attempts, reminder_id),
+                )
+                if cursor.rowcount != 1:
+                    self._connection().commit()
+                    return None
+                cursor.execute(
+                    "SELECT delivery_attempts FROM reminders WHERE reminder_id = ?",
+                    (reminder_id,),
+                )
+                row = cursor.fetchone()
+                self._connection().commit()
+                return int(row[0]) if row is not None else None
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error recording reminder delivery failure: {e}")
+            return None
+
     def deactivate(self, reminder_id: int) -> bool:
         """Retire a reminder so it is never delivered again.
 
@@ -771,6 +802,11 @@ class Database:
     def deactivate_reminder(self, reminder_id: int) -> bool:
         """Mark a (delivered) one-off reminder inactive."""
         return self.reminders.deactivate(reminder_id)
+
+    def record_reminder_delivery_failure(self, reminder_id: int,
+                                        max_attempts: int) -> Optional[int]:
+        """Count one failed one-off delivery; retire it at the configured limit."""
+        return self.reminders.record_failed_delivery(reminder_id, max_attempts)
 
     def log_activity(self, user_id: int, action: str, details: str = "") -> bool:
         return self.activity.log(user_id, action, details)

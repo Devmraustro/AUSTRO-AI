@@ -684,6 +684,9 @@ CORE_V2 = Migration(
     ],
 )
 
+# Core v3: bounded retry accounting for one-off reminder delivery.
+CORE_V3 = Migration(schema_name="core", version=3, statements=[])
+
 _CORE_V2_INDEXES = {
     "uq_habit_logs_habit_date": ("habit_logs", "habit_id, date"),
 }
@@ -767,7 +770,42 @@ def _verify_core_v2_indexes_unique(conn) -> None:
             )
 
 
-MIGRATIONS: List[Migration] = [KNOWLEDGE_V1, KNOWLEDGE_V2, MEMORY_V1, LEARNING_V1, CORE_V1, CORE_V2]
+def _ensure_core_v3_columns(conn) -> None:
+    """Ensure the retry counter exists, preserving existing reminder rows."""
+    cursor = conn.cursor()
+    if _DB_ENGINE == "postgresql":
+        cursor.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = %s",
+            ("reminders",),
+        )
+        columns = {str(row[0]) for row in cursor.fetchall()}
+    else:
+        cursor.execute("PRAGMA table_info(reminders)")
+        columns = {str(row[1]) for row in cursor.fetchall()}
+    if not columns:
+        raise RuntimeError("Migration core v3 requires the existing reminders table")
+    if "delivery_attempts" not in columns:
+        cursor.execute(
+            "ALTER TABLE reminders ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0"
+        )
+    # Recover if the column was manually added before migration bookkeeping.
+    cursor.execute("UPDATE reminders SET delivery_attempts = 0 WHERE delivery_attempts IS NULL")
+    if _DB_ENGINE == "postgresql":
+        cursor.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = %s",
+            ("reminders",),
+        )
+        columns = {str(row[0]) for row in cursor.fetchall()}
+    else:
+        cursor.execute("PRAGMA table_info(reminders)")
+        columns = {str(row[1]) for row in cursor.fetchall()}
+    if "delivery_attempts" not in columns:
+        raise RuntimeError("Migration core v3 failed to add reminders.delivery_attempts")
+
+
+MIGRATIONS: List[Migration] = [KNOWLEDGE_V1, KNOWLEDGE_V2, MEMORY_V1, LEARNING_V1, CORE_V1, CORE_V2, CORE_V3]
 
 
 def apply_migrations(conn) -> None:  # sqlite3.Connection or psycopg2 connection
@@ -794,6 +832,8 @@ def apply_migrations(conn) -> None:  # sqlite3.Connection or psycopg2 connection
                 _validate_core_v1_indexes(conn)
             if migration.schema_name == "core" and migration.version == 2:
                 _validate_core_v2_indexes(conn)
+            if migration.schema_name == "core" and migration.version == 3:
+                _ensure_core_v3_columns(conn)
             statements = (
                 translate_statements(migration.statements) if postgres else migration.statements
             )

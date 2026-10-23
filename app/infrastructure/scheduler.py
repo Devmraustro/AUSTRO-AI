@@ -24,6 +24,9 @@ REMINDER_TIMES_FORMAT = {key: time.fromisoformat(value) for key, value in REMIND
 
 logger = logging.getLogger(__name__)
 
+# One-off reminders are retried during hourly reconciliation, but never forever.
+MAX_ONE_OFF_DELIVERY_ATTEMPTS = 5
+
 
 class ReminderScheduler:
     """Async reminder scheduler integrated with PTB job queue."""
@@ -296,8 +299,29 @@ class ReminderScheduler:
             logger.error(f"Failed to send custom reminder to {user_id}: {e}")
 
         reminder_id = job_data.get("reminder_id")
-        if delivered and reminder_id is not None and not job_data.get("is_recurring"):
-            # A one-off reminder must leave the active set, otherwise the hourly
-            # `_check_reminders` -> `resync()` re-creates a job for a time that
-            # has already passed and the same reminder is delivered every hour.
-            self._db.deactivate_reminder(int(reminder_id))
+        is_recurring = bool(job_data.get("is_recurring"))
+        if reminder_id is not None and not is_recurring:
+            if delivered:
+                # A one-off reminder must leave the active set after success.
+                self._db.deactivate_reminder(int(reminder_id))
+            else:
+                # Persist the count so restarts cannot reset the retry budget.
+                attempts = self._db.record_reminder_delivery_failure(
+                    int(reminder_id), MAX_ONE_OFF_DELIVERY_ATTEMPTS
+                )
+                if attempts is None:
+                    logger.error(
+                        "Could not persist failed delivery attempt for reminder %s",
+                        reminder_id,
+                    )
+                elif attempts >= MAX_ONE_OFF_DELIVERY_ATTEMPTS:
+                    logger.error(
+                        "Deactivated one-off reminder %s after %s failed delivery attempts",
+                        reminder_id, attempts,
+                    )
+                else:
+                    logger.warning(
+                        "One-off reminder %s delivery failed (%s/%s); "
+                        "will be retried by scheduler reconciliation",
+                        reminder_id, attempts, MAX_ONE_OFF_DELIVERY_ATTEMPTS,
+                    )

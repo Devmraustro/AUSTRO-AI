@@ -33,7 +33,7 @@ import pytest
 
 from app.application.reminders import ReminderService, parse_time_string
 from app.core.errors import ValidationError
-from app.infrastructure.scheduler import ReminderScheduler
+from app.infrastructure.scheduler import MAX_ONE_OFF_DELIVERY_ATTEMPTS, ReminderScheduler
 from app.telegram import handlers as H
 from database import db
 
@@ -263,7 +263,43 @@ async def test_failed_delivery_keeps_the_one_off_reminder_pending():
 
     await job.kwargs["callback"](context)
 
-    assert int(_reminder_row(reminder_id)["is_active"]) == 1
+    row = _reminder_row(reminder_id)
+    assert int(row["is_active"]) == 1
+    assert int(row["delivery_attempts"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_one_off_reminder_is_retired_after_max_failed_attempts():
+    db.create_user(24, "u", "U")
+    reminder_id = db.create_reminder(
+        24, "custom", "t", "مهم", "2026-10-01T08:00:00", False
+    )
+    scheduler = ReminderScheduler(FakeApp())
+    scheduler.running = True
+
+    for attempt in range(1, MAX_ONE_OFF_DELIVERY_ATTEMPTS + 1):
+        scheduler.application.job_queue.jobs_list.clear()
+        await scheduler.resync()
+        job = next(
+            j for j in scheduler.application.job_queue.jobs_list
+            if j.name == f"custom_reminder_{reminder_id}"
+        )
+        failing = Mock()
+        failing.send_message = AsyncMock(side_effect=RuntimeError("telegram down"))
+        context = _FakeContext(data=job.kwargs["data"])
+        context.bot = failing
+        await job.kwargs["callback"](context)
+
+        row = _reminder_row(reminder_id)
+        assert int(row["delivery_attempts"]) == attempt
+        assert int(row["is_active"]) == int(attempt < MAX_ONE_OFF_DELIVERY_ATTEMPTS)
+
+    scheduler.application.job_queue.jobs_list.clear()
+    await scheduler.resync()
+    assert not any(
+        job.name == f"custom_reminder_{reminder_id}"
+        for job in scheduler.application.job_queue.jobs_list
+    )
 
 
 # ---------------------------------------------------------------------------
