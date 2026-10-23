@@ -1,0 +1,115 @@
+name: Live Provider Smoke (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      gemini_model:
+        description: "Gemini model to test (one minimal generation request is sent)"
+        required: true
+        default: "gemini-2.5-flash"
+        type: string
+
+# This workflow only checks provider credentials and connectivity.
+# It never starts the bot, modifies data, or prints secrets.
+permissions: {}
+
+concurrency:
+  group: live-provider-smoke
+  cancel-in-progress: false
+
+jobs:
+  provider-smoke:
+    name: Telegram and Gemini API smoke tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check Telegram getMe and Gemini generateContent
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ inputs.gemini_model }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.request
+          from urllib.parse import quote
+
+          failures = []
+
+          # Telegram Bot API: credential validation only; no message is sent.
+          token = os.environ.get("BOT_TOKEN", "").strip()
+          if not token:
+              print("Telegram getMe: FAIL (repository secret BOT_TOKEN is missing or empty)")
+              failures.append("BOT_TOKEN")
+          else:
+              request = urllib.request.Request(
+                  f"https://api.telegram.org/bot{token}/getMe",
+                  headers={"Accept": "application/json"},
+                  method="GET",
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=15) as response:
+                      data = json.loads(response.read())
+                  if data.get("ok") is True and isinstance(data.get("result"), dict) and data["result"].get("is_bot") is True:
+                      print("Telegram getMe: PASS (valid bot token; identity details suppressed)")
+                  else:
+                      print("Telegram getMe: FAIL (unexpected API response; body suppressed)")
+                      failures.append("Telegram API")
+              except urllib.error.HTTPError as exc:
+                  print(f"Telegram getMe: FAIL (HTTP {exc.code}; response body suppressed)")
+                  failures.append("Telegram API")
+              except Exception as exc:
+                  print(f"Telegram getMe: FAIL (network/client error: {type(exc).__name__}; details suppressed)")
+                  failures.append("Telegram API")
+
+          # Gemini: one minimal, low-output generateContent request.
+          api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+          model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
+          if not api_key:
+              print("Gemini generateContent: FAIL (repository secret GEMINI_API_KEY is missing or empty)")
+              failures.append("GEMINI_API_KEY")
+          elif not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", model):
+              print("Gemini generateContent: FAIL (invalid model identifier)")
+              failures.append("Gemini model")
+          else:
+              model_path = quote(model, safe="._-")
+              request = urllib.request.Request(
+                  f"https://generativelanguage.googleapis.com/v1beta/models/{model_path}:generateContent",
+                  data=json.dumps({
+                      "contents": [{"role": "user", "parts": [{"text": "Reply with exactly OK."}]}],
+                      "generationConfig": {"temperature": 0, "maxOutputTokens": 8},
+                  }).encode("utf-8"),
+                  headers={
+                      "Content-Type": "application/json",
+                      "Accept": "application/json",
+                      "x-goog-api-key": api_key,
+                  },
+                  method="POST",
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      data = json.loads(response.read())
+                  candidates = data.get("candidates")
+                  if isinstance(candidates, list) and candidates:
+                      print(f"Gemini generateContent: PASS (model={model}; output suppressed; one minimal request)")
+                  else:
+                      print("Gemini generateContent: FAIL (no candidate returned; response body suppressed)")
+                      failures.append("Gemini API")
+              except urllib.error.HTTPError as exc:
+                  # Never print the response body or request headers; they may contain sensitive diagnostics.
+                  print(f"Gemini generateContent: FAIL (HTTP {exc.code}; response body suppressed)")
+                  failures.append("Gemini API")
+              except Exception as exc:
+                  print(f"Gemini generateContent: FAIL (network/client error: {type(exc).__name__}; details suppressed)")
+                  failures.append("Gemini API")
+
+          if failures:
+              print("LIVE PROVIDER SMOKE: FAIL (" + ", ".join(failures) + ")")
+              sys.exit(1)
+
+          print("LIVE PROVIDER SMOKE: PASS (both providers reachable; no Telegram message sent)")
+          PY
