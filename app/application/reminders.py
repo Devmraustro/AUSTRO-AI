@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from app.core.errors import ValidationError
 from app.database.repositories import Database
 
+_INVALID_TIME_MESSAGE = "❌ وقت غير صالح. استخدم الصيغة HH:MM مثل 08:30"
+
 
 def parse_time_string(time_str: str) -> Optional[Tuple[int, int]]:
     """Parse an HH:MM input; returns (hour, minute) or None when invalid."""
@@ -33,19 +35,23 @@ class ReminderService:
                               message: Optional[str], time_str: str) -> bool:
         """Create a recurring daily custom reminder from an HH:MM string.
 
-        Invalid time strings fall back to "now" (same behaviour as before);
-        they never crash the conversation.
+        An unparseable time is rejected with a validation error. It used to
+        fall back to "now", which stored a reminder at an arbitrary time and
+        still told the user "your reminder is saved" - a silent wrong result
+        for a typo the user could have corrected. The seconds/microseconds of
+        "now" are also dropped: a daily job only has hour/minute/second
+        resolution and a reminder created at 08:00:37 would fire at :37.
         """
-        if not time_str or not time_str.strip():
-            raise ValidationError("❌ الرجاء إدخال وقت صحيح بصيغة HH:MM")
+        cleaned = (time_str or "").strip()
+        if not cleaned:
+            raise ValidationError(_INVALID_TIME_MESSAGE)
+        parsed = parse_time_string(cleaned)
+        if parsed is None:
+            raise ValidationError(_INVALID_TIME_MESSAGE)
 
-        now = datetime.now()
-        parsed = parse_time_string(time_str)
-        scheduled_time = (
-            now.replace(hour=parsed[0], minute=parsed[1]).isoformat()
-            if parsed
-            else now.isoformat()
-        )
+        scheduled_time = datetime.now().replace(
+            hour=parsed[0], minute=parsed[1], second=0, microsecond=0
+        ).isoformat()
         reminder_id = self._db.reminders.create(
             user_id=user_id,
             reminder_type="custom",

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 
 import requests
@@ -54,6 +55,9 @@ class GeminiProvider(AIProvider):
         self._available: bool = False
         self.request_count: int = 0
         self.last_request_time: float = 0.0
+        # Guards the pacing decision and the quota counter. Never held across an
+        # await: the slot is reserved, then the caller sleeps outside the lock.
+        self._state_lock = threading.Lock()
         if not settings_.has_gemini_key:
             logger.warning(f"Gemini API key not set. {fallback_status(settings_)}")
         else:
@@ -117,11 +121,34 @@ class GeminiProvider(AIProvider):
             return False
 
     async def _rate_limit(self) -> None:
-        """Async rate limiting to avoid hitting API limits."""
-        elapsed = time.monotonic() - self.last_request_time
-        if elapsed < self._settings.min_request_interval:
-            await asyncio.sleep(self._settings.min_request_interval - elapsed)
-        self.last_request_time = time.monotonic()
+        """Reserve a send slot at least `min_request_interval` after the last one.
+
+        The previous implementation read `last_request_time`, slept, and then
+        wrote it back. Two coroutines that observed the same last send both slept
+        the same amount and then fired together, so concurrent users could exceed
+        the provider's requests-per-minute limit - precisely the situation the
+        pacing exists for. The slot is now reserved atomically *before* sleeping,
+        so waiters queue behind each other instead of bursting.
+        """
+        interval = self._settings.min_request_interval
+        if interval <= 0:
+            with self._state_lock:
+                self.last_request_time = time.monotonic()
+            return
+        while True:
+            with self._state_lock:
+                now = time.monotonic()
+                elapsed = now - self.last_request_time
+                if elapsed >= interval:
+                    self.last_request_time = now
+                    return
+                delay = interval - elapsed
+            await asyncio.sleep(delay)
+
+    def _count_request(self) -> None:
+        """Account for one provider call (thread-safe quota counter)."""
+        with self._state_lock:
+            self.request_count += 1
 
     def _build_payload(self, request: AIRequest) -> dict:
         contents = []
@@ -164,7 +191,7 @@ class GeminiProvider(AIProvider):
                 json=payload,
                 timeout=self._settings.ai_request_timeout,
             )
-            self.request_count += 1
+            self._count_request()
 
             if response.status_code == 200:
                 data = response.json()
@@ -196,7 +223,13 @@ class GeminiProvider(AIProvider):
             raise AIProviderError(f"API Error: {response.status_code}")
 
         except requests.exceptions.Timeout as exc:
-            self._available = False
+            # A timeout is transient, so the provider stays "available". The
+            # gateway checks `is_available` before every retry; flipping it here
+            # silently cancelled the bounded retries and left the bot answering
+            # from local fallback until someone tapped "reconnect" in settings.
+            logger.warning(
+                f"Gemini request timed out after {self._settings.ai_request_timeout}s"
+            )
             raise AIProviderError("Request timeout") from exc
         except requests.exceptions.RequestException as exc:
             raise AIProviderError(f"Request failed: {exc}") from exc
