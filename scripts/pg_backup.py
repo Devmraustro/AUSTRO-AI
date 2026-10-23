@@ -338,9 +338,15 @@ def _load_encryption_key(required: bool = False) -> Optional[bytes]:
             raise RuntimeError(f"could not read encryption key file: {exc}") from exc
         log("warn", f"could not read encryption key file {key_file}: {exc}")
         return None
-    # Accept a raw 32-byte key, or a text file whose only extra byte is a
-    # trailing newline from a secret store / `echo` invocation.
-    for candidate in (raw, raw.strip()):
+    # Accept a raw 32-byte key, or a text file with exactly one conventional
+    # trailing line ending. Never use strip(): every byte in a binary AES key,
+    # including leading/trailing whitespace-valued bytes, is significant.
+    candidates = [raw]
+    if raw.endswith(b"\r\n"):
+        candidates.append(raw[:-2])
+    elif raw.endswith(b"\n"):
+        candidates.append(raw[:-1])
+    for candidate in candidates:
         if len(candidate) == _AES_KEY_BYTES:
             return candidate
     message = (
