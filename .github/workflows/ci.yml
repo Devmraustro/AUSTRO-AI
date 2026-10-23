@@ -233,6 +233,17 @@ jobs:
           docker compose -f docker-compose.staging.yml -p austro-staging \
             --env-file .env.staging build backup
 
+      # The staging backup service mounts its encryption key as a Compose
+      # secret; without the file present, `compose run` fails before the
+      # container starts. Generate a synthetic runner-local key (never a
+      # real credential, never committed) so the version check can run.
+      - name: Create a synthetic staging backup encryption key for CI
+        run: |
+          mkdir -p secrets
+          head -c 32 /dev/urandom > secrets/staging_backup_encryption_key
+          chmod 0400 secrets/staging_backup_encryption_key
+          echo "synthetic CI staging backup key created (32 random bytes, runner-local only)"
+
       - name: The backup image ships a matching pg_dump
         run: |
           set -o pipefail
