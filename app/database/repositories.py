@@ -330,10 +330,48 @@ class HabitRepository(_BaseRepository):
 
     def log(self, habit_id: int, user_id: int, date: str,
             completed: bool, note: str = "") -> bool:
-        """Log habit completion and update streaks."""
+        """Log habit completion and update streaks (idempotent per day).
+
+        One row per (habit_id, date) is enforced by uq_habit_logs_habit_date
+        (migration core v2). Re-submitting the same day with the same outcome
+        is a retry: it succeeds without touching streaks a second time.
+        Re-submitting with the opposite outcome corrects that day's row and
+        adjusts the streak exactly once for the change.
+        """
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                cursor.execute(
+                    "SELECT log_id, completed FROM habit_logs "
+                    "WHERE habit_id = ? AND date = ?",
+                    (habit_id, date),
+                )
+                existing = cursor.fetchone()
+                if existing is not None:
+                    if bool(existing[1]) == bool(completed):
+                        self._connection().commit()
+                        return True
+                    cursor.execute(
+                        "UPDATE habit_logs SET completed = ?, note = ? WHERE log_id = ?",
+                        (completed, note, existing[0]),
+                    )
+                    if completed:
+                        cursor.execute(
+                            "UPDATE habits SET current_streak = current_streak + 1, "
+                            "total_completions = total_completions + 1, "
+                            "longest_streak = MAX(longest_streak, current_streak + 1) "
+                            "WHERE habit_id = ?",
+                            (habit_id,),
+                        )
+                    else:
+                        cursor.execute(
+                            "UPDATE habits SET current_streak = 0, "
+                            "total_completions = MAX(total_completions - 1, 0) "
+                            "WHERE habit_id = ?",
+                            (habit_id,),
+                        )
+                    self._connection().commit()
+                    return True
                 cursor.execute(
                     "INSERT INTO habit_logs (habit_id, user_id, date, completed, note) "
                     "VALUES (?, ?, ?, ?, ?)",
