@@ -27,6 +27,14 @@ from app.memory.models import (
 logger = logging.getLogger(__name__)
 
 
+ERASED_PLACEHOLDER = "(forgotten - content redacted)"
+
+
+class EraseFailed(RuntimeError):
+    """An erasure could not be completed. The transaction was rolled back, so no
+    memory row or history row was changed and the caller must not report success."""
+
+
 class _MemoryBase:
     def __init__(self, manager: DatabaseManager):
         self._manager = manager
@@ -403,6 +411,14 @@ class MemoriesRepository(_MemoryBase):
             return False
 
     def set_status(self, owner_user_id: int, memory_id: int, status: str) -> bool:
+        """Change lifecycle status for non-erasing transitions only.
+
+        Moving a memory to 'forgotten' is an erasure and must go through
+        `erase()`, which scrubs content. A bare status flip would leave the
+        plaintext claim in the row, so it is refused here.
+        """
+        if status == "forgotten":
+            raise ValueError("use MemoriesRepository.erase() to forget a memory")
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
@@ -418,71 +434,117 @@ class MemoriesRepository(_MemoryBase):
             logger.error(f"Database error in memory set_status: {e}")
             return False
 
-    def forget(self, owner_user_id: int, memory_id: int) -> bool:
-        return self.set_status(owner_user_id, memory_id, "forgotten")
+    def erase(self, owner_user_id: int, *, memory_id: Optional[int] = None,
+              memory_type: Optional[str] = None, hard: bool = False,
+              audit: Optional[Dict[str, Any]] = None) -> int:
+        """Forget (scrub) or hard-delete memories and their history atomically.
 
-    def resurrect(self, owner_user_id: int, memory_id: int,
-                  consent_state: str = "automatic") -> bool:
-        """Reactivate a soft-deleted (forgotten) memory row for the same owner.
+        Scope is ALWAYS bound to `owner_user_id` in SQL. `memory_id` narrows to
+        one row; `memory_type` narrows to one memory type (typed clear). With
+        neither, every memory of the owner is in scope.
 
-        Used when the exact same statement is re-learned after a clear/forget,
-        since the reused hash key must not violate the UNIQUE constraint.
+        Soft (`hard=False`): the row stays as a content-free tombstone with
+        status 'forgotten'. Claim, subject, source note, metadata and event date
+        are overwritten, and the dedup hash is replaced by a unique tombstone key
+        so the old fact can neither be matched nor resurrected. Version history
+        in scope keeps its version numbers but loses its claim text.
+
+        Hard (`hard=True`): version history is deleted, audit rows are detached
+        from the memory (memory_id set to NULL), and the memory row is deleted.
+
+        `audit` (optional) is written in the SAME transaction, only when at least
+        one row was affected. It must be content-free: action, source, actor.
+
+        Returns the number of memory rows in scope. Every statement runs in one
+        transaction: on any database error it is rolled back and EraseFailed is
+        raised, so a partial erasure is never reported as success.
         """
-        try:
-            with self._manager._lock:
-                cursor = self._connection().cursor()
-                cursor.execute(
-                    "UPDATE memories SET status = 'active', consent_state = ?, "
-                    "updated_at = ?, last_used_at = ? "
-                    "WHERE memory_id = ? AND owner_user_id = ?",
-                    (consent_state, self._now(), self._now(), memory_id,
-                     owner_user_id),
-                )
-                self._connection().commit()
-                return cursor.rowcount > 0
-        except DB_ERROR as e:
-            self._rollback()
-            logger.error(f"Database error in memory resurrect: {e}")
-            return False
+        # Every statement is a fixed literal. The scope is bound as parameters:
+        # a NULL memory_id or memory_type means "no restriction" (`? IS NULL`).
+        owner = owner_user_id
+        scope = (owner, memory_id, memory_id, memory_type, memory_type)
+        hist = (owner, owner, memory_id, memory_id, memory_type, memory_type)
+        now = self._now()
 
-    def delete(self, owner_user_id: int, memory_id: int) -> bool:
-        try:
-            with self._manager._lock:
-                cursor = self._connection().cursor()
+        with self._manager._lock:
+            conn = self._connection()
+            try:
+                cursor = conn.cursor()
                 cursor.execute(
-                    "DELETE FROM memories WHERE memory_id = ? AND owner_user_id = ?",
-                    (memory_id, owner_user_id),
-                )
-                self._connection().commit()
-                return cursor.rowcount > 0
-        except DB_ERROR as e:
-            self._rollback()
-            logger.error(f"Database error in memory delete: {e}")
-            return False
+                    "SELECT COUNT(*) FROM memories WHERE owner_user_id = ? "
+                    "AND (? IS NULL OR memory_id = ?) AND (? IS NULL OR memory_type = ?)",
+                    scope)
+                affected = int(cursor.fetchone()[0])
+                if affected == 0:
+                    conn.rollback()
+                    return 0
 
-    def clear(self, owner_user_id: int, memory_type: Optional[str] = None) -> int:
-        """Mark all (optionally typed) memories forgotten; returns count."""
-        try:
-            with self._manager._lock:
-                cursor = self._connection().cursor()
-                if memory_type:
+                if hard:
                     cursor.execute(
-                        "UPDATE memories SET status = 'forgotten' WHERE "
-                        "owner_user_id = ? AND memory_type = ?",
-                        (owner_user_id, memory_type),
-                    )
+                        "DELETE FROM memory_versions WHERE owner_user_id = ? "
+                        "AND memory_id IN (SELECT memory_id FROM memories "
+                        "WHERE owner_user_id = ? AND (? IS NULL OR memory_id = ?) "
+                        "AND (? IS NULL OR memory_type = ?))",
+                        hist)
+                    cursor.execute(
+                        "UPDATE memory_events SET memory_id = NULL WHERE owner_user_id = ? "
+                        "AND memory_id IN (SELECT memory_id FROM memories "
+                        "WHERE owner_user_id = ? AND (? IS NULL OR memory_id = ?) "
+                        "AND (? IS NULL OR memory_type = ?))",
+                        hist)
+                    cursor.execute(
+                        "UPDATE memory_access_log SET memory_id = NULL WHERE owner_user_id = ? "
+                        "AND memory_id IN (SELECT memory_id FROM memories "
+                        "WHERE owner_user_id = ? AND (? IS NULL OR memory_id = ?) "
+                        "AND (? IS NULL OR memory_type = ?))",
+                        hist)
+                    cursor.execute(
+                        "DELETE FROM memories WHERE owner_user_id = ? "
+                        "AND (? IS NULL OR memory_id = ?) AND (? IS NULL OR memory_type = ?)",
+                        scope)
                 else:
                     cursor.execute(
-                        "UPDATE memories SET status = 'forgotten' WHERE "
-                        "owner_user_id = ?",
-                        (owner_user_id,),
+                        "UPDATE memory_versions SET claim = ? WHERE owner_user_id = ? "
+                        "AND memory_id IN (SELECT memory_id FROM memories "
+                        "WHERE owner_user_id = ? AND (? IS NULL OR memory_id = ?) "
+                        "AND (? IS NULL OR memory_type = ?)) AND claim != ?",
+                        (ERASED_PLACEHOLDER, *hist, ERASED_PLACEHOLDER))
+                    cursor.execute(
+                        "UPDATE memories SET status = 'forgotten', claim = ?, "
+                        "subject = '', source_note = '', metadata_json = NULL, "
+                        "event_date = NULL, hash_key = 'erased-' || CAST(memory_id AS TEXT), "
+                        "updated_at = ?, last_used_at = NULL WHERE owner_user_id = ? "
+                        "AND (? IS NULL OR memory_id = ?) AND (? IS NULL OR memory_type = ?)",
+                        (ERASED_PLACEHOLDER, now, *scope))
+
+                if audit:
+                    cursor.execute(
+                        "INSERT INTO memory_events (owner_user_id, memory_id, action, "
+                        "source, reason, actor, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (owner, audit.get("memory_id"), audit["action"],
+                         audit.get("source", ""), "", audit.get("actor"), now),
                     )
-                self._connection().commit()
-                return cursor.rowcount
-        except DB_ERROR as e:
-            self._rollback()
-            logger.error(f"Database error in memory clear: {e}")
-            return 0
+                conn.commit()
+                return affected
+            except Exception as e:  # noqa: BLE001 - every failure must roll back
+                try:
+                    conn.rollback()
+                except Exception:  # noqa: BLE001 - keep the original error
+                    pass
+                logger.error(f"Database error in memory erase: {type(e).__name__}")
+                raise EraseFailed(f"memory erase rolled back: {type(e).__name__}") from e
+
+    def forget(self, owner_user_id: int, memory_id: int) -> bool:
+        """Soft-erase one memory (content scrubbed, tombstone kept)."""
+        return self.erase(owner_user_id, memory_id=memory_id) > 0
+
+    def delete(self, owner_user_id: int, memory_id: int) -> bool:
+        """Hard-delete one memory and its dependent history."""
+        return self.erase(owner_user_id, memory_id=memory_id, hard=True) > 0
+
+    def clear(self, owner_user_id: int, memory_type: Optional[str] = None) -> int:
+        """Soft-erase every memory of the owner (or of one type). Returns the count."""
+        return self.erase(owner_user_id, memory_type=memory_type)
 
     def export(self, owner_user_id: int) -> List[Dict[str, Any]]:
         """Full snapshot of active memories for JSON export."""
@@ -557,39 +619,6 @@ class MemoryVersionsRepository(_MemoryBase):
             self._rollback()
             logger.error(f"Database error in memory versions list: {e}")
         return rows
-
-    def redact(self, owner_user_id: int, memory_id: Optional[int] = None) -> int:
-        """Redact claim content in memory_versions when a memory is forgotten/deleted.
-
-        If memory_id is provided, only that memory's versions are redacted.
-        If memory_id is None, all memory versions for the given owner_user_id are redacted.
-        Returns the number of rows redacted.
-        """
-        try:
-            with self._manager._lock:
-                cursor = self._connection().cursor()
-                if memory_id is not None:
-                    cursor.execute(
-                        "UPDATE memory_versions SET claim = ? "
-                        "WHERE memory_id = ? AND owner_user_id = ? AND claim != ?",
-                        ("(forgotten - content redacted)", memory_id, owner_user_id,
-                         "(forgotten - content redacted)"),
-                    )
-                    self._connection().commit()
-                    return cursor.rowcount
-                else:
-                    cursor.execute(
-                        "UPDATE memory_versions SET claim = ? "
-                        "WHERE owner_user_id = ? AND claim != ?",
-                        ("(forgotten - content redacted)", owner_user_id,
-                         "(forgotten - content redacted)"),
-                    )
-                    self._connection().commit()
-                    return cursor.rowcount
-        except DB_ERROR as e:
-            self._rollback()
-            logger.error(f"Database error in memory versions redact: {e}")
-            return 0
 
 
 class MemoryEventsRepository(_MemoryBase):

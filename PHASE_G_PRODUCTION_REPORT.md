@@ -81,7 +81,8 @@ Re-ran cleanly after the restore drill (no regression).
 
 No real `BOT_TOKEN` is available in this environment; live polling cannot run.
 The full scenario matrix (onboarding, goals, habits, plans, study, knowledge
-upload + RAG, memory, coaching, reminders, export/delete, error/rate-limit UX)
+upload + RAG, memory, coaching, reminders, memory export/forget via the coach menu, error/rate-limit UX;
+`/export` and `/delete` are not implemented, see `PRIVACY_RETENTION.md`)
 is defined and must be executed per `TELEGRAM_E2E_PROCEDURE.md`. Unit coverage of
 handlers exists (`tests/test_handlers.py`, no network).
 

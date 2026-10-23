@@ -23,7 +23,7 @@ Legend: ✅ VERIFIED · ⛔ BLOCKED · ⚠️ PARTIAL / EXTERNAL REQUIRED
 | 1.7 | Application data-access layer works on PG | ✅ VERIFIED | `tests/test_repositories_pg.py` — 18/18 pass (real PG); `scripts/smoke_test.py` — 8/8 on PG; dialect/compat layer port (`app/database/dialect.py`, repos) |
 | 1.8 | Backup job (pg_dump + gzip + sha256) | ✅ VERIFIED | `scripts/pg_backup.py` — dump exit 0, manifest sha256 round-trip OK |
 | 1.9 | Restore drill (drop/recreate + app reconnect) | ✅ VERIFIED | `scripts/pg_restore_drill.py` — 6/6 steps, 44 tables / 420 rows match, exit 0 |
-| 1.10 | Disaster-recovery plan documented | ✅ VERIFIED | `DISASTER_RECOVERY.md` (drill-verified) |
+| 1.10 | Disaster-recovery plan documented | ✅ VERIFIED (plan + CI drill) | `DISASTER_RECOVERY.md`; encrypted backup and restore proven in CI job `backup-integration` (§7). Production host run still open. |
 | 1.11 | Deployment stack architecture B | ✅ VERIFIED | `docker-compose.yml` YAML-parsed (app only, PG profile-gated, no embedded DB volume); Dockerfile + entrypoint aligned; docker CLI unavailable on this box (parse-only) |
 | 1.12 | Readiness healthcheck | ✅ VERIFIED | `scripts/healthcheck.py` — exit 0 HEALTHY (SQLite and PG) |
 

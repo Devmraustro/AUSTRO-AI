@@ -45,6 +45,20 @@ ProgressFn = Callable[[str, str, str], Awaitable[None]]
 _PROCESSING = "processing"
 
 
+def scoped_chunk_key(source_id: int, position: int, content_key: str) -> str:
+    """Key stored in knowledge_chunks.chunk_key (UNIQUE per owner).
+
+    The bare content hash cannot be unique per owner: the same paragraph repeated
+    in one book, or shared by two books of the same user, made the second insert
+    collide and the source could never be indexed. Scoping by source and position
+    keeps the constraint while allowing those cases. Retrieval dedupes by content.
+    """
+    return hashlib.sha1(
+        f"{source_id}:{position}:{content_key}".encode("utf-8"),
+        usedforsecurity=False,
+    ).hexdigest()
+
+
 class IngestionPipeline:
     def __init__(self, store: KnowledgeStore, storage: StorageService,
                  extractor: Optional[TextExtractor] = None,
@@ -54,6 +68,10 @@ class IngestionPipeline:
                  settings_: Optional[Settings] = None):
         self._store = store
         self._storage = storage
+        # (owner, source) pairs with a run in progress in THIS process. A second
+        # start for the same source would otherwise purge and rebuild the rows
+        # of the first run. Event-loop code: the set needs no extra lock.
+        self._active: set = set()
         self._extractor = extractor or TextExtractor()
         self._cleaner = cleaner or TextCleaner()
         self._settings = settings_ or __import__(
@@ -152,6 +170,9 @@ class IngestionPipeline:
                 self._cleanup_attempt, source_id, owner_user_id, claim_token,
                 safe, True,
             )
+            # A late failure (index/embed/verify) may have left derived rows behind.
+            # Remove them so a retry starts clean and nothing orphaned remains.
+            self._store.purge_partial_index(owner_user_id, source_id)
             result.status = FAILED_STATUS
             result.error = safe
         finally:
@@ -349,7 +370,7 @@ class IngestionPipeline:
 
         # -- READY (verify searchable) ------------------------------------------
         embedded_count = self._store.embeddings.count_for_source(
-            source_id,
+            owner, source_id,
             model=self._embeddings.model(),
             version=self._embeddings.version(),
         )
@@ -428,7 +449,9 @@ class IngestionPipeline:
                 claim_token=claim_token,
             )
             if section_id is None:
-                section_id = 0
+                # Fail closed: a missing section must not become section 0 or a
+                # sectionless chunk marked COMPLETED.
+                raise ValidationError("تعذر فهرسة الأقسام، حاول المعالجة مجدداً")
             section_refs[index] = section_id
         return {"document_id": document_id, "section_refs": section_refs}
 
@@ -441,12 +464,13 @@ class IngestionPipeline:
             section_id = section_refs.get(section_index) if section_index is not None else None
             if section_id == 0:
                 section_id = None
+            key = scoped_chunk_key(source_id, index, chunk["chunk_key"])
             row_id = self._store.chunks.create(
                 owner_user_id=owner,
                 source_id=source_id,
                 document_id=document_id,
                 section_id=section_id,
-                chunk_key=chunk["chunk_key"],
+                chunk_key=key,
                 content=chunk["content"],
                 content_hash=chunk["content_hash"],
                 token_count=chunk["token_count"],
@@ -461,7 +485,7 @@ class IngestionPipeline:
                 claim_token=claim_token,
             )
             if row_id is None:
-                row_id = self._existing_chunk_id(owner, chunk["chunk_key"])
+                row_id = self._existing_chunk_id(owner, key)
             if row_id is None:
                 continue
             row_ids.append(row_id)

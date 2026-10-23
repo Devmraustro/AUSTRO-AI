@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 
 from app.database.connection import DatabaseManager
 from app.database.dialect import DB_ERROR
+from app.database.ownership import refs_owned as _refs_owned
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,12 @@ class EducationalGoalsRepository(_LearningBase):
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                REFS = [
+                    ("learning_goals", "goal_id", [parent_goal_id]),
+                ]
+                if not _refs_owned(cursor, owner_user_id, REFS):
+                    logger.warning("learning goal rejected: parent goal not owned by owner")
+                    return None
                 cursor.execute(
                     "INSERT INTO learning_goals "
                     "(owner_user_id, kind, title, description, parent_goal_id, "
@@ -152,6 +159,13 @@ class LearningObjectivesRepository(_LearningBase):
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                REFS = [
+                    ("learning_goals", "goal_id", [goal_id]),
+                    ("learning_objectives", "objective_id", prerequisites or []),
+                ]
+                if not _refs_owned(cursor, owner_user_id, REFS):
+                    logger.warning("objective rejected: goal or prerequisite not owned by owner")
+                    return None
                 cursor.execute(
                     "INSERT INTO learning_objectives "
                     "(owner_user_id, goal_id, title, description, difficulty, "
@@ -242,6 +256,12 @@ class LearningObjectivesRepository(_LearningBase):
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                REFS = [
+                    ("learning_objectives", "objective_id", prerequisites or []),
+                ]
+                if not _refs_owned(cursor, owner_user_id, REFS):
+                    logger.warning("objective prerequisites rejected: not owned by owner")
+                    return False
                 cursor.execute(
                     "UPDATE learning_objectives SET prerequisites_json = ?, "
                     "updated_at = ? WHERE objective_id = ? AND owner_user_id = ?",
@@ -262,6 +282,12 @@ class CurriculaRepository(_LearningBase):
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                REFS = [
+                    ("learning_goals", "goal_id", [goal_id]),
+                ]
+                if not _refs_owned(cursor, owner_user_id, REFS):
+                    logger.warning("curriculum rejected: goal not owned by owner")
+                    return None
                 cursor.execute(
                     "INSERT INTO learning_curricula "
                     "(owner_user_id, goal_id, title, mode, modules_json) "
@@ -323,6 +349,12 @@ class CurriculaRepository(_LearningBase):
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                REFS = [
+                    ("learning_objectives", "objective_id", [o for m in (modules or []) for o in (m.get("objective_ids") or [])]),
+                ]
+                if not _refs_owned(cursor, owner_user_id, REFS):
+                    logger.warning("curriculum modules rejected: objective not owned by owner")
+                    return False
                 sets = ["modules_json = ?", "updated_at = ?"]
                 params: List[Any] = [self._j(modules), self._now()]
                 if title is not None:
@@ -355,6 +387,14 @@ class LessonsRepository(_LearningBase):
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                REFS = [
+                    ("learning_curricula", "curriculum_id", [curriculum_id]),
+                    ("learning_objectives", "objective_id", [objective_id]),
+                    ("knowledge_sources", "source_id", [source_id]),
+                ]
+                if not _refs_owned(cursor, owner_user_id, REFS):
+                    logger.warning("lesson rejected: curriculum, objective, or source not owned by owner")
+                    return None
                 cursor.execute(
                     "INSERT INTO learning_lessons "
                     "(owner_user_id, curriculum_id, objective_id, source_id, "
@@ -435,6 +475,14 @@ class SessionsRepository(_LearningBase):
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                REFS = [
+                    ("learning_goals", "goal_id", [goal_id]),
+                    ("learning_objectives", "objective_id", [objective_id]),
+                    ("learning_curricula", "curriculum_id", [curriculum_id]),
+                ]
+                if not _refs_owned(cursor, owner_user_id, REFS):
+                    logger.warning("session rejected: goal, objective, or curriculum not owned by owner")
+                    return None
                 cursor.execute(
                     "INSERT INTO learning_sessions "
                     "(owner_user_id, goal_id, objective_id, curriculum_id, mode, "
@@ -495,6 +543,12 @@ class SessionsRepository(_LearningBase):
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                REFS = [
+                    ("learning_lessons", "lesson_id", [lesson_id]),
+                ]
+                if not _refs_owned(cursor, owner_user_id, REFS):
+                    logger.warning("session step rejected: lesson not owned by owner")
+                    return False
                 if lesson_id is not None:
                     cursor.execute(
                         "UPDATE learning_sessions SET state = ?, step = ?, "
@@ -561,6 +615,12 @@ class MasteryRepository(_LearningBase):
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                REFS = [
+                    ("learning_objectives", "objective_id", [objective_id]),
+                ]
+                if not _refs_owned(cursor, owner_user_id, REFS):
+                    logger.warning("mastery rejected: objective not owned by owner")
+                    return False
                 cursor.execute(
                     "INSERT INTO learning_mastery (owner_user_id, objective_id, "
                     "state, score, evidence_count, recent_json, kinds_json, "
@@ -625,6 +685,12 @@ class ReviewsRepository(_LearningBase):
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                REFS = [
+                    ("learning_objectives", "objective_id", [objective_id]),
+                ]
+                if not _refs_owned(cursor, owner_user_id, REFS):
+                    logger.warning("review rejected: objective not owned by owner")
+                    return None
                 cursor.execute(
                     "INSERT OR IGNORE INTO learning_reviews "
                     "(owner_user_id, objective_id, concept, difficulty, next_review) "
@@ -728,6 +794,13 @@ class AssessmentsRepository(_LearningBase):
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                REFS = [
+                    ("learning_objectives", "objective_id", [objective_id]),
+                    ("learning_sessions", "session_id", [session_id]),
+                ]
+                if not _refs_owned(cursor, owner_user_id, REFS):
+                    logger.warning("assessment rejected: objective or session not owned by owner")
+                    return None
                 cursor.execute(
                     "INSERT INTO learning_assessments "
                     "(owner_user_id, session_id, objective_id, kind, concept, "
@@ -787,6 +860,12 @@ class MisconceptionsRepository(_LearningBase):
             item = self.get(owner_user_id, objective_id, pattern)
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                REFS = [
+                    ("learning_objectives", "objective_id", [objective_id]),
+                ]
+                if not _refs_owned(cursor, owner_user_id, REFS):
+                    logger.warning("misconception rejected: objective not owned by owner")
+                    return False
                 if item is None:
                     cursor.execute(
                         "INSERT INTO learning_misconceptions "
@@ -1012,6 +1091,13 @@ class LearningEventsRepository(_LearningBase):
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                REFS = [
+                    ("learning_objectives", "objective_id", [objective_id]),
+                    ("learning_sessions", "session_id", [session_id]),
+                ]
+                if not _refs_owned(cursor, owner_user_id, REFS):
+                    logger.warning("learning event rejected: objective or session not owned by owner")
+                    return False
                 cursor.execute(
                     "INSERT INTO learning_events (owner_user_id, action, "
                     "objective_id, session_id, detail_json) VALUES (?, ?, ?, ?, ?)",

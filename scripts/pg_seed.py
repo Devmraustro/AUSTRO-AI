@@ -9,9 +9,6 @@ import sys
 
 os.environ["DB_ENGINE"] = "postgresql"
 
-import psycopg2  # noqa: E402
-
-
 def main() -> int:
     import psycopg2 as pg2
 

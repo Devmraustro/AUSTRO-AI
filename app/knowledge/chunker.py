@@ -328,13 +328,17 @@ class SemanticChunker:
         for section in sections:
             end = section["end"]
             if section["start"] <= char_index < (end if end is not None else 10 ** 12):
-                best = section
-                break
+                # A subsection lies inside its chapter's range; the innermost
+                # (latest-starting) containing section is the chunk's section.
+                if best is None or section["start"] >= best["start"]:
+                    best = section
         if best is None and sections:
             best = sections[0]
         if best is None:
             return _SectionInfo(None, "")
-        return _SectionInfo(best["parent_section_ref"], best["title"])
+        # The chunk belongs to the section it was found in. Using the parent
+        # reference here left every top-level section's chunks unlinked.
+        return _SectionInfo(best["ref"], best["title"])
 
 
 __all__ = [

@@ -43,7 +43,9 @@ services:
     volumes:
       - knowledge_storage:/app/knowledge_storage
       - logs:/app/logs
-      - backups:/app/backups
+      # NOTE: the application container deliberately has NO access to the
+      # backup volume. Backup archives (encrypted, but still full memory and
+      # knowledge content) are only ever mounted into the `backup` worker.
     restart: unless-stopped
     # Startup ordering / DB readiness is handled by docker-entrypoint.sh
     # (poll DB_HOST until reachable, then apply migrations before boot).
@@ -58,6 +60,18 @@ services:
   #
   # Uses Dockerfile.backup, which pins postgresql-client-16 so pg_dump matches
   # the production PostgreSQL 16 server.
+  #
+  # ENCRYPTION IS MANDATORY HERE. AES-256-GCM is enabled and the 32-byte key is
+  # read from a read-only secret file (never from the environment). A missing
+  # or invalid key makes every run fail closed before any database contact.
+  # Create the key OUTSIDE the repository, e.g.:
+  #   head -c 32 /dev/urandom > secrets/backup_encryption_key
+  #   chmod 0400 secrets/backup_encryption_key && chown 10001:10001 ...
+  # (`secrets/` is git-ignored and excluded from the build context.)
+  #
+  # PLAINTEXT HYGIENE: the raw SQL dump is written only to the `/var/tmp`
+  # tmpfs work directory (never to the `backups` volume) and removed after
+  # every run. The root filesystem is read-only.
   #
   # Start:  docker compose --env-file .env up -d app backup
   # Logs:   docker compose logs -f backup
@@ -86,7 +100,22 @@ services:
       BACKUP_MONTHLY_KEEP: ${BACKUP_MONTHLY_KEEP:-30}
       # After a failed day the worker re-checks this often (never a hot loop)
       BACKUP_RETRY_MINUTES: ${BACKUP_RETRY_MINUTES:-60}
+      BACKUP_ENCRYPTION_ENABLED: "true"
+      BACKUP_ENCRYPTION_KEY_FILE: /run/secrets/backup_encryption_key
+      BACKUP_WORKDIR: /var/tmp/austro-backup-work
+    secrets:
+      - backup_encryption_key
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
     volumes:
+      - type: tmpfs
+        target: /var/tmp/austro-backup-work
+        tmpfs:
+          size: ${BACKUP_WORKDIR_TMPFS_BYTES:-4294967296}
+          mode: 1777
       - backups:/app/backups
     restart: unless-stopped
 
@@ -117,6 +146,10 @@ volumes:
   logs:
   backups:
   postgres_data:
+
+secrets:
+  backup_encryption_key:
+    file: ${BACKUP_ENCRYPTION_KEY_FILE_HOST:-./secrets/backup_encryption_key}
 
 networks:
   default:

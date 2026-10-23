@@ -29,7 +29,7 @@ from app.memory.models import (
     TaskContext,
     build_hash_key,
 )
-from app.memory.repositories import MemoryStore
+from app.memory.repositories import EraseFailed, MemoryStore
 from app.memory.retrieval import MemoryRetrieval
 from app.memory.write_gate import MemoryWriteGate
 
@@ -231,26 +231,9 @@ class MemoryService:
                 owner_user_id, item.scope, item.memory_type,
                 item.subject, item.claim,
             )
-            existing_any_status = self.store.memories.by_hash(
-                owner_user_id, item.scope, item.memory_type,
-                item.subject, item.claim,
-            )
-            if existing_any_status is not None:
-                # Same fact existed before but was forgotten: reactivate it.
-                resurrected = self.store.memories.resurrect(
-                    owner_user_id, existing_any_status.memory_id,
-                    consent_state=item.consent_state,
-                )
-                if resurrected:
-                    outcomes["created"] += 1
-                    self._metrics["created"] += 1
-                    self.store.events.log(
-                        owner_user_id=owner_user_id,
-                        memory_id=existing_any_status.memory_id,
-                        action="created", source=item.provenance,
-                        reason="re_remembered", actor=actor,
-                    )
-                continue
+            # A forgotten fact was scrubbed and its hash replaced by a tombstone
+            # key, so there is nothing to match or reactivate: relearning creates
+            # a fresh memory and never retains the old plaintext for dedup.
             memory_id = self.store.memories.create(item)
             if memory_id:
                 outcomes["created"] += 1
@@ -351,12 +334,15 @@ class MemoryService:
                     action="confirmed", source="user", actor=actor,
                 )
             return ok
-        self.store.memories.forget(owner_user_id, memory_id)
-        self.store.events.log(
-            owner_user_id=owner_user_id, memory_id=memory_id,
-            action="rejected", source="user", actor=actor,
-        )
-        return True
+        try:
+            erased = self.store.memories.erase(
+                owner_user_id, memory_id=memory_id,
+                audit={"action": "rejected", "source": "user", "actor": actor,
+                       "memory_id": memory_id},
+            )
+        except EraseFailed:
+            return False
+        return erased > 0
 
     # ------------------------------------------------------------------
     # Reading / management
@@ -421,36 +407,44 @@ class MemoryService:
 
     def forget(self, owner_user_id: int, memory_id: int,
                actor: Optional[int] = None) -> bool:
-        ok = self.store.memories.forget(owner_user_id, memory_id)
-        if ok:
-            self.store.versions.redact(owner_user_id, memory_id)
-            self.store.events.log(
-                owner_user_id=owner_user_id, memory_id=memory_id,
-                action="forgotten", source="user", actor=actor,
+        """Scrub one memory's content. Returns False (and changes nothing) if the
+        memory does not belong to the owner or the erasure could not complete."""
+        try:
+            erased = self.store.memories.erase(
+                owner_user_id, memory_id=memory_id,
+                audit={"action": "forgotten", "source": "user", "actor": actor,
+                       "memory_id": memory_id},
             )
-        return ok
+        except EraseFailed:
+            return False
+        return erased > 0
 
     def clear(self, owner_user_id: int, memory_type: Optional[str] = None,
               actor: Optional[int] = None) -> int:
-        count = self.store.memories.clear(owner_user_id, memory_type=memory_type)
-        if count:
-            self.store.versions.redact(owner_user_id)
-            self.store.events.log(
-                owner_user_id=owner_user_id, memory_id=None,
-                action="cleared", source="user", actor=actor,
-            )
-        return count
+        """Scrub every memory of the owner, or only one memory type and its history.
+
+        Raises EraseFailed if the erasure could not complete; nothing was changed
+        in that case, so the caller must not report a successful clear.
+        """
+        return self.store.memories.erase(
+            owner_user_id, memory_type=memory_type,
+            audit={"action": "cleared", "source": "user", "actor": actor,
+                   "memory_id": None},
+        )
 
     def delete(self, owner_user_id: int, memory_id: int,
                actor: Optional[int] = None) -> bool:
-        ok = self.store.memories.delete(owner_user_id, memory_id)
-        if ok:
-            self.store.versions.redact(owner_user_id, memory_id)
-            self.store.events.log(
-                owner_user_id=owner_user_id, memory_id=memory_id,
-                action="deleted", source="user", actor=actor,
+        """Hard-delete one memory and its history. The audit row keeps no memory_id,
+        because the row it would point at no longer exists."""
+        try:
+            deleted = self.store.memories.erase(
+                owner_user_id, memory_id=memory_id, hard=True,
+                audit={"action": "deleted", "source": "user", "actor": actor,
+                       "memory_id": None},
             )
-        return ok
+        except EraseFailed:
+            return False
+        return deleted > 0
 
     # ------------------------------------------------------------------
     # Retrieval / context pack

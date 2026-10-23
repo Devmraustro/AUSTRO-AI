@@ -1,0 +1,6 @@
+# Runtime dependencies of the backup worker image (Dockerfile.backup).
+# Kept in step with requirements.txt: same pins for the shared libraries.
+# cryptography: AES-256-GCM backup encryption (scripts/pg_backup.py).
+# psycopg2-binary: row-count snapshot and restore verification.
+psycopg2-binary>=2.9,<3
+cryptography>=42.0.5,<51
