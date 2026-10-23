@@ -26,6 +26,11 @@ This document describes the privacy guarantees, data retention rules, and deleti
 - **LLM Responses:** AI-generated responses are NOT stored in the database (see telemetry below).
 - **API Keys/Secrets:** Bot token, Gemini key, or any secrets are never stored in database records.
 - **Conversation Text:** Full conversation history is not stored as a monolithic blob; only audited events are logged.
+- **Knowledge search queries:** the text a user types into a knowledge search is NOT stored. Each
+  search writes a `knowledge_retrieval_events` row with the counts, latency, generator and cited chunks,
+  and `query` is written as an empty string (`KnowledgeEventRepository.log`). Verified by
+  `tests/test_retrieval_query_privacy.py` (SQLite) and `_pg.py` (PostgreSQL). Rows written by earlier
+  builds may still hold query text; `scrub_legacy_query_text()` blanks it and is run only deliberately.
 
 ## 2. Retention Rules
 
@@ -34,23 +39,24 @@ Most data is retained until the user explicitly deletes it.
 
 | Data Type | Retention | User Control |
 |-----------|-----------|--------------|
-| Goals | Indefinite | View, edit, delete via `/forget` or `/delete` |
-| Habits | Indefinite | View, edit, delete via `/forget` or `/delete` |
-| Memories | Indefinite | View, edit, forget, clear via coach menu |
-| Knowledge Sources | Indefinite | View, delete, re-upload (idempotent) |
-| Learning Sessions | Until course completion | Auto-clear on `/forget` |
-| Coach Logs | 90 days (configurable) | Visible in coach menu, exportable |
-| Activity Log | 90 days (configurable) | Audit trail, exportable |
-| Embeddings/Chunks | Indefinite (per knowledge source) | Depends on knowledge source deletion |
+| Goals | Indefinite | No `/forget` or `/delete` command exists (planned, see §3.1). Deletion through the bot is not available. |
+| Habits | Indefinite | No `/forget` or `/delete` command exists (planned, see §3.1). Deletion through the bot is not available. |
+| Memories | Indefinite | Coach menu: view, search, edit, forget by ID, clear all, export as JSON. Hard delete is not reachable from the bot. |
+| Knowledge Sources | Indefinite | View and re-upload are available. Deletion exists only in the service layer and has no user-facing command, so users cannot delete their sources. |
+| Learning Sessions | Until course completion | No `/forget` command exists, so there is no user-facing clear. |
+| Coach Logs | 90 days (planned) | No code writes this table, and no export exists. |
+| Activity Log | 90 days (planned) | No code writes this table, and no export exists. |
+| Embeddings/Chunks | Indefinite (per knowledge source) | Removed only when a source is deleted, and no user-facing source deletion exists (see above). |
 
 ### 2.2 System-Generated Retention
-- **Activity Log:** Retained for 90 days for audit purposes (configurable via `ACTIVITY_LOG_RETENTION_DAYS`).
-- **Coach Logs:** Retained for 90 days (configurable via `COACH_LOG_RETENTION_DAYS`).
+- **Activity Log:** Planned 90-day retention. Not implemented: no code writes this table, and no setting or purge job exists.
+- **Coach Logs:** Planned 90-day retention. Not implemented: no code writes this table, and no setting or purge job exists.
 - **Embedding Cache:** Cleared on knowledge source re-upload (dedup via checksum).
 
 ### 2.3 Default Retention Settings
+The retention values below are planned targets. They are **not** read by the application, and nothing enforces them today.
 ```python
-# Configurable in settings.py
+# Planned only. Not referenced anywhere in app/ or scripts/.
 ACTIVITY_LOG_RETENTION_DAYS = 90
 COACH_LOG_RETENTION_DAYS = 90
 ```
@@ -58,28 +64,47 @@ COACH_LOG_RETENTION_DAYS = 90
 ## 3. Deletion Rules
 
 ### 3.1 User-Initiated Deletion
-Users can delete their data via Telegram commands:
+**Implementation status (verified against the registered Telegram handlers):**
 
-| Command | What It Deletes | Cascade |
-|---------|----------------|---------|
-| `/forget` | Clears learning state: sessions, assessments, misconceptions, progress models | User data only; no cascade to other users |
-| `/delete` | Full account deletion: users row + all associated data | Cascades to: goals, habits, memories, knowledge sources, learning sessions, coach logs, activity log |
-| `/export` | Exports complete user data snapshot | Read-only; does not delete |
+- **Not implemented and not registered:** the `/forget`, `/delete` and `/export` commands. The bot
+  registers only `/start`, `/help`, `/plan`, `/goals`, `/habits`, `/progress`, `/review`, `/coach`,
+  `/dashboard`, `/settings`, `/cancel` and `/knowledge` (`app/telegram/main.py`). No account-deletion
+  code exists. The learning export function (`LearningEngine.export_learning`) has no caller.
+- **Available today, memory only (coach menu):** view, search, edit, forget by ID, clear all, and
+  export as JSON. Hard delete exists in the repository layer but is not reachable from the bot.
+- **Available today, knowledge sources:** list and upload. Source deletion exists in the service layer
+  but has no user-facing command.
 
-### 3.2 Deletion Cascade Order (per schema_migrations)
+The table below is the **planned** design for future commands. None of these commands works today.
+
+| Planned command | Intended effect | Status |
+|-----------------|-----------------|--------|
+| `/forget` | Clear learning state: sessions, assessments, misconceptions, progress models | Not implemented |
+| `/delete` | Full account deletion: users row and all associated data | Not implemented |
+| `/export` | Complete user data snapshot (read-only) | Not implemented. Memory-only JSON export exists in the coach menu. |
+
+**Memory erasure, as implemented:** the coach menu's forget (by ID) and clear (all) actions call the
+memory erase path (`MemoriesRepository.erase`, `app/memory/repositories.py`). For the scrub, tombstone
+and atomicity details, see `MEMORY_ARCHITECTURE.md` §4. Those details were not re-verified for this
+document update.
+
+### 3.2 Planned Deletion Cascade Order (not executed by any current command)
+Foreign keys cascade from the owning rows in the schema. A future account deletion would cover, in order:
 1. **knowledge** (v1) - knowledge sources and all derived data
 2. **memory** (v1) - memories, memory versions, memory events, memory access log
 3. **learning** (v1) - learning goals, objectives, curricula, lessons, sessions, assessments, misconceptions, progress, reviews, events
 
+No current command runs this cascade for a user account.
+
 ### 3.3 Admin-Initiated Deletion
-- Admins can trigger `/delete` on behalf of a user (with user consent verification).
-- Admin-initiated deletion follows the same cascade order.
-- Deletion events are logged to `activity_log` with the admin user ID and target user ID.
+- Not implemented: admins cannot trigger deletion on behalf of a user. No such command exists (see 3.1).
+- Planned: the same cascade order as 3.2, with consent verification.
+- Planned: deletion events logged to `activity_log`. No code currently writes that table (see §2.1).
 
 ### 3.4 Irreversibility
-- Once `/delete` is confirmed, data recovery is not possible through the normal interface.
-- Backup restoration may recover data if backups exist (see `SECURITY_ARCHITECTURE.md` backup procedures).
-- Users are warned before `/delete` confirmation.
+- Deletion is not available, so no user data can be erased through the bot today.
+- Backup restoration may recover data if backups exist (see `SECURITY_ARCHITECTURE.md` backup procedures). This applies to any data, whether or not it was later deleted.
+- Planned, not implemented: a warning and confirmation step before any future `/delete`.
 
 ## 4. Data Derivation & Sharing
 
@@ -95,7 +120,7 @@ Users can delete their data via Telegram commands:
 - **No Public Benchmarks:** Individual user progress, mastery levels, or assessment results are never shared or published.
 
 ### 4.3 What Is Shared (Explicitly)
-- **Export:** User-initiated data export provides a complete snapshot for the user's personal use.
+- **Export:** Only memories can be exported today, as JSON from the coach menu. A complete user data export is planned and not implemented.
 - **Coach Context:** Coach data is shared only within the user's own session (isolated per user).
 - **Knowledge Sources:** Uploaded documents are per-user owned; re-uploads are idempotent via `UNIQUE(owner_user_id, checksum)`.
 
@@ -122,34 +147,35 @@ Users can delete their data via Telegram commands:
 
 ## 6. Retention Summary Table
 
-| Category | Data | Retention | Deletion Method |
-|----------|------|-----------|-----------------|
-| User Goals | Goals | Until deleted | `/forget` or `/delete` |
-| User Habits | Habits | Until deleted | `/forget` or `/delete` |
-| User Memories | Memories | Until deleted | Coach menu / `/forget` or `/delete` |
-| Knowledge Sources | Documents, chunks, embeddings | Until deleted | `/delete` or re-upload (idempotent) |
-| Learning Data | Sessions, assessments, misconceptions | Until deleted | `/forget` or `/delete` |
-| Coach Data | Logs, focus, blockers | 90 days (configurable) | Export or `/delete` |
-| Activity Log | Audit events | 90 days (configurable) | Automatic purge / `/delete` |
+| Category | Data | Retention | Deletion Method (current) |
+|----------|------|-----------|---------------------------|
+| User Goals | Goals | Until deleted | Not available through the bot (`/forget` and `/delete` are planned) |
+| User Habits | Habits | Until deleted | Not available through the bot (`/forget` and `/delete` are planned) |
+| User Memories | Memories | Until deleted | Coach menu: forget by ID or clear all |
+| Knowledge Sources | Documents, chunks, embeddings | Until deleted | Not available through the bot (service layer only) |
+| Learning Data | Sessions, assessments, misconceptions | Until deleted | Not available through the bot (`/forget` is planned) |
+| Coach Data | Logs, focus, blockers | Planned 90 days | Not implemented (no writer exists for coach logs) |
+| Activity Log | Audit events | Planned 90 days | Not implemented (no writer exists for the activity log) |
 | Telemetry | Run metadata | Ring buffer (200 max) | Automatic (oldest purged) |
-| User Identity | Telegram user ID | Until account deleted | `/delete` |
+| User Identity | Telegram user ID | Until account deleted | Not available through the bot (`/delete` is planned) |
 
 ## 7. Compliance
 
 ### 7.1 GDPR Rights
-- **Right to Access:** `/export` provides complete user data export.
-- **Right to Rectification:** User can edit goals, habits, and other data through the UI.
-- **Right to Erasure:** `/delete` performs full account erasure per GDPR requirements.
-- **Right to Data Portability:** Export provides machine-readable data snapshot.
+These are the current capabilities. The GDPR rights are not fully met by the current application.
+- **Right to Access:** Not fully available. Only memories can be exported (JSON, coach menu). A complete export (`/export`) is not implemented.
+- **Right to Rectification:** Partially available. Memories can be edited through the coach menu. Other data editing paths were not re-verified for this document.
+- **Right to Erasure:** Not available as a full account erasure. `/delete` is not implemented. Memories can be forgotten or cleared through the coach menu. Knowledge sources cannot be deleted by users.
+- **Right to Data Portability:** Not available as a complete machine-readable snapshot. Memory-only JSON export exists.
 
 ### 7.2 Data Protection Principles
 - **Purpose Limitation:** Data is used only for the user's personal development coaching and learning.
 - **Data Minimization:** Only data necessary for coaching/learning is collected; no extraneous fields.
 - **Accuracy:** User can review and correct their data at any time.
-- **Storage Limitation:** Retention rules are documented and enforced (90-day default for logs).
+- **Storage Limitation:** Retention periods are documented as planned targets (90 days for logs). They are not enforced by current code (see §2.2).
 - **Integrity:** Checksums verify data integrity; duplicates are prevented.
 - **Confidentiality:** Data is isolated per user; no cross-user leakage.
-- **Accountability:** All data access/ modification events are logged to `activity_log`.
+- **Accountability:** Planned, not implemented. The `activity_log` table exists, but no code writes to it today.
 
 ---
 # File: PRIVACY_RETENTION.md

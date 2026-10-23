@@ -75,7 +75,9 @@ Full configuration options are documented in `.env.example` including:
 
 ## Chat commands (in Telegram)
 
-`/start` · `/help` · `/plan` · `/goals` · `/habits` · `/progress` · `/review` · `/coach` · `/dashboard` · `/settings` · `/cancel`
+`/start` · `/help` · `/plan` · `/goals` · `/habits` · `/progress` · `/review` · `/coach` · `/dashboard` · `/settings` · `/cancel` · `/knowledge`
+
+Not implemented: `/forget`, `/export` and `/delete` are not registered. See `PRIVACY_RETENTION.md` §3.1 for what is and is not available.
 
 ## Tests
 
@@ -86,10 +88,11 @@ pytest
 
 Tests run offline: they set a dummy `BOT_TOKEN`, use a temporary SQLite database, and leave `GEMINI_API_KEY` unset so nothing hits the network.
 
-**519 passed / 19 skipped** on a clean checkout (`pytest -q`, Python 3.11, SQLite only,
-measured 2026-10-22). The skipped tests are the PostgreSQL and Docker integration
-modules, which run in CI against a `postgres:16` service. The count is the measured
-value, not a target: run `pytest` for the current number.
+Test counts are measured, not targets: run `pytest -q` for the current number.
+Skipped tests locally are the PostgreSQL and Docker integration modules, which
+run in CI against a `postgres:16` service (PostgreSQL modules are gated to
+execute there, never silently skip). The CI run on the exact commit is the
+authoritative record.
 
 ### Evaluation & Regression (Phase F)
 

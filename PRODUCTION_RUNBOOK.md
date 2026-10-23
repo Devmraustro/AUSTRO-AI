@@ -88,7 +88,7 @@ run against the staging file or vice versa. See `STAGING_RUNBOOK.md`.
 
 ## 4. Backup & restore
 
-See `DISASTER_RECOVERY.md` (drill-verified on real PostgreSQL):
+See `DISASTER_RECOVERY.md` (encrypted-only backups; restore drill with explicit safety gates):
 
 - **Automated daily backup (independent container):** the `backup` Compose
   service runs `scripts/backup_scheduler.py`, which triggers the one-shot
@@ -109,10 +109,14 @@ See `DISASTER_RECOVERY.md` (drill-verified on real PostgreSQL):
 - Retention: newest 7 backups + the newest backup of each UTC month for up to
   30 further months, applied **only after** the new archive/manifest pair is
   published and verified. Details: `DISASTER_RECOVERY.md` §2.3.
-- Verify integrity + restore drill (destructive, disposable DB only):
-  `python scripts/pg_restore_drill.py <archive> <manifest>`.
-- Restore to a production-like target uses `pg_dump --clean --if-exists
-  --no-owner --no-acl` piped into `psql`, then the app reconnect path.
+- Restore drill (destructive, disposable DB only). It requires `RESTORE_TARGET_DB`,
+  `RESTORE_CONFIRM_DESTRUCTIVE=DROP-AND-RESTORE:<target>`, and explicit
+  `RESTORE_ADMIN_USER` / `RESTORE_ADMIN_PASSWORD`. Exit 2 means refused before any work.
+  `python scripts/pg_restore_drill.py <archive> <manifest>`. See
+  `DISASTER_RECOVERY.md` §3.
+- The archive is authenticated (key, checksums, decryption) before any database
+  change. The SQL is applied with `psql -v ON_ERROR_STOP=1` to the explicit target
+  only. The old `scripts/restore.sh` is disabled and exits 2.
 - RPO 24h, RTO <= 30 min. Status: automation implemented and unit-tested, but
   **not yet installed on the production host** — do not mark the nightly
   backup as active until `docker compose logs backup` shows a real 02:00 UTC

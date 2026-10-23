@@ -37,3 +37,7 @@ Thumbs.db
 # Generated runtime outputs
 audit-report.json
 baseline-results.json
+
+# Local secret material (backup encryption key, etc.). Never commit.
+secrets/
+*.key

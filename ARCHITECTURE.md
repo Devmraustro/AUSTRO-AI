@@ -250,7 +250,7 @@ Added in Phase F: comprehensive evaluation framework, security hardening, and pr
 
 - 9 security incident runbooks with revocation/rotation/containment procedures
 - Telegram E2E procedure with credential-dependent classification
-- Privacy/retention policy with GDPR compliance
+- Privacy/retention policy (documented; partially implemented. Not GDPR-compliant: no account erasure or full export. See `PRIVACY_RETENTION.md` §3.1 and §7)
 
 ## Security Notes
 

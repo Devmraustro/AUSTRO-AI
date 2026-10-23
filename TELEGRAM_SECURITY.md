@@ -45,30 +45,26 @@ The `/start` command is the entry point and initializes user onboarding.
 - **Parameter Validation:** Deep-link parameters (e.g., referral codes) are validated and bounded.
 - **No Admin-Only Restrictions at /start:** All users can start the bot.
 
-### 3.2 Admin-Only Commands
-Commands like `/forget`, `/export`, `/delete`, `/admin*` are restricted to authorized admins.
+### 3.2 Admin-Only Commands (status: not implemented)
+The `/forget`, `/export`, `/delete` and `/admin*` commands are **not registered** in the bot
+(`app/telegram/main.py`), and the application has **no** `ADMIN_USER_IDS` setting and **no** admin
+check in `app/`. The admin-only enforcement described in earlier revisions of this document does not
+exist. Any future admin command must add that check and be tested before the command is registered.
 
-**Mitigations:**
-- **Telegram User ID Check:** Each command handler checks `update.effective_user.id` against the configured admin list.
-- **Default Admin List:** Admins are configured via `ADMIN_USER_IDS` in settings (empty by default, meaning no admin commands are active unless explicitly configured).
-- **Fallback Response:** Non-admin users receive a "command not available" message when attempting admin commands.
+### 3.3 /forget Command (status: not implemented as a command)
+There is no `/forget` command. The equivalent user-facing actions exist only in the coach menu:
+- **Memory forget (by ID) and clear (all):** available from the memory menu (`memory_forget`,
+  `memory_clear`, `memory_clear_confirm`). They are scoped to the invoking user's memories.
+- **Learning state clearance:** not available to users. `LearningEngine.delete_learning` exists and is
+  unit-tested, but no handler calls it.
 
-### 3.3 /forget Command
-Allows users to clear their learning state and memory.
-
-**Mitigations:**
-- **User-Scope Only:** `/forget` only affects the invoking user's data.
-- **Audit Log:** `/forget` events are logged to `memory_events` and `activity_log` with the user ID.
-- **Confirmation Required:** The command may require a confirmation step before irreversible data deletion.
-
-### 3.4 /export and /delete
-Users can export their data or request account deletion.
-
-**Mitigations:**
-- **User-Scope Only:** Export and deletion only affect the invoking user's data.
-- **GDPR Compliance:** Export provides a complete snapshot of user data (goals, habits, memories, knowledge sources, learning progress).
-- **Deletion Cascade:** Deleting a user cascades to associated data (sessions, assessments, misconceptions) per the schema migration order.
-- **Export Log:** Export events are logged to `activity_log`.
+### 3.4 /export and /delete (status: not implemented)
+There is no `/export` or `/delete` command, and no account-deletion flow.
+- **Memory export:** available as a JSON export from the coach menu (`memory_export`). It covers memories only.
+- **Account export and account deletion:** not implemented. `LearningEngine.export_learning` exists and is
+  unit-tested, but no handler calls it. Knowledge-source deletion exists only in the service layer.
+- Deletion cascade order and GDPR-related claims are planned design, not verified behaviour. See
+  `PRIVACY_RETENTION.md` §3 and §7.
 
 ## 4. File Upload Handling
 
@@ -118,12 +114,11 @@ Users can export their data or request account deletion.
 
 ## 7. Admin-Only Actions
 
-### 7.1 Admin Command Filter
-All potentially destructive or admin-only actions check authorization.
-
-**Implementation:**
+### 7.1 Admin Command Filter (not implemented)
+No admin command filter exists. `app/` contains no `ADMIN_USER_IDS` setting and no admin-ID check.
+The pattern below is a design sketch for future work, not current code:
 ```python
-# Pseudocode pattern in all command handlers
+# Design sketch only. Not present in the codebase.
 ADMIN_USER_IDS = settings.ADMIN_USER_IDS or []
 if ADMIN_USER_IDS and update.effective_user.id not in ADMIN_USER_IDS:
     await update.message.reply_text("This command is not available.")
@@ -131,6 +126,7 @@ if ADMIN_USER_IDS and update.effective_user.id not in ADMIN_USER_IDS:
 ```
 
 ### 7.2 Admin-Protected Actions
+No admin-protected commands are registered. The following are planned, not implemented:
 - `/forget` - user state clearance
 - `/export` - data export
 - `/delete` - account deletion
@@ -142,14 +138,14 @@ if ADMIN_USER_IDS and update.effective_user.id not in ADMIN_USER_IDS:
 |---------|---------------|
 | Callback validation | Telegram hash verification |
 | Conversation state isolation | Database per-user filtering |
-| Command authorization | Admin user ID check |
+| Command authorization | No admin check exists (no admin commands are registered) |
 | File upload size | 50 MB max |
 | File upload type | PDF, DOCX, EPUB, TXT, MD only |
 | Path traversal protection | _resolve() guard |
 | Message size | 4096 Telegram limit, 4090 AUSTRO guard |
 | Flood/spam protection | Per-user rate limits |
 | User identity | update.effective_user.id only |
-| Admin actions | ID check against ADMIN_USER_IDS |
+| Admin actions | None registered (ADMIN_USER_IDS not implemented) |
 
 ---
 # File: TELEGRAM_SECURITY.md

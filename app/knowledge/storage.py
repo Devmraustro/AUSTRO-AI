@@ -63,15 +63,22 @@ class StorageService:
                 raise ValidationError("الملف يبدو معطوباً أو معدلاً")
         return data
 
-    def delete(self, storage_key: Optional[str]) -> None:
+    def delete(self, storage_key: Optional[str]) -> bool:
+        """Remove the stored file. True when no file remains (none, or removed).
+
+        False means the file is still on disk, so a caller that is about to drop
+        the database row that points at it must not do so.
+        """
         if not storage_key:
-            return
+            return True
         try:
             path = self._resolve(storage_key)
             if path.exists():
                 path.unlink()
+            return True
         except (OSError, ValidationError) as e:
             logger.error(f"Storage delete failed for {storage_key}: {e}")
+            return False
 
     def exists(self, storage_key: str) -> bool:
         try:
