@@ -330,10 +330,48 @@ class HabitRepository(_BaseRepository):
 
     def log(self, habit_id: int, user_id: int, date: str,
             completed: bool, note: str = "") -> bool:
-        """Log habit completion and update streaks."""
+        """Log habit completion and update streaks (idempotent per day).
+
+        One row per (habit_id, date) is enforced by uq_habit_logs_habit_date
+        (migration core v2). Re-submitting the same day with the same outcome
+        is a retry: it succeeds without touching streaks a second time.
+        Re-submitting with the opposite outcome corrects that day's row and
+        adjusts the streak exactly once for the change.
+        """
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
+                cursor.execute(
+                    "SELECT log_id, completed FROM habit_logs "
+                    "WHERE habit_id = ? AND date = ?",
+                    (habit_id, date),
+                )
+                existing = cursor.fetchone()
+                if existing is not None:
+                    if bool(existing[1]) == bool(completed):
+                        self._connection().commit()
+                        return True
+                    cursor.execute(
+                        "UPDATE habit_logs SET completed = ?, note = ? WHERE log_id = ?",
+                        (completed, note, existing[0]),
+                    )
+                    if completed:
+                        cursor.execute(
+                            "UPDATE habits SET current_streak = current_streak + 1, "
+                            "total_completions = total_completions + 1, "
+                            "longest_streak = MAX(longest_streak, current_streak + 1) "
+                            "WHERE habit_id = ?",
+                            (habit_id,),
+                        )
+                    else:
+                        cursor.execute(
+                            "UPDATE habits SET current_streak = 0, "
+                            "total_completions = MAX(total_completions - 1, 0) "
+                            "WHERE habit_id = ?",
+                            (habit_id,),
+                        )
+                    self._connection().commit()
+                    return True
                 cursor.execute(
                     "INSERT INTO habit_logs (habit_id, user_id, date, completed, note) "
                     "VALUES (?, ?, ?, ?, ?)",
@@ -507,6 +545,60 @@ class ReminderRepository(_BaseRepository):
             self._rollback()
             logger.error(f"Database error in get_all_active_reminders: {e}")
             return []
+
+    def record_failed_delivery(self, reminder_id: int, max_attempts: int) -> Optional[int]:
+        """Atomically count a failed one-off delivery and retire at the limit."""
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+        try:
+            with self._manager._lock:
+                cursor = self._connection().cursor()
+                cursor.execute(
+                    "UPDATE reminders SET "
+                    "delivery_attempts = COALESCE(delivery_attempts, 0) + 1, "
+                    "is_active = CASE "
+                    "WHEN COALESCE(delivery_attempts, 0) + 1 >= ? THEN FALSE "
+                    "ELSE is_active END "
+                    "WHERE reminder_id = ? AND is_active = TRUE",
+                    (max_attempts, reminder_id),
+                )
+                if cursor.rowcount != 1:
+                    self._connection().commit()
+                    return None
+                cursor.execute(
+                    "SELECT delivery_attempts FROM reminders WHERE reminder_id = ?",
+                    (reminder_id,),
+                )
+                row = cursor.fetchone()
+                self._connection().commit()
+                return int(row[0]) if row is not None else None
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error recording reminder delivery failure: {e}")
+            return None
+
+    def deactivate(self, reminder_id: int) -> bool:
+        """Retire a reminder so it is never delivered again.
+
+        Nothing in the application used to write ``is_active``. A one-off
+        reminder therefore stayed active forever and the hourly resync kept
+        re-creating a job for a time that had already passed, so a single
+        "remind me at 20:00" was re-sent every hour for the lifetime of the
+        deployment. This is the missing lifecycle transition.
+        """
+        try:
+            with self._manager._lock:
+                cursor = self._connection().cursor()
+                cursor.execute(
+                    "UPDATE reminders SET is_active = FALSE WHERE reminder_id = ?",
+                    (reminder_id,),
+                )
+                self._connection().commit()
+                return cursor.rowcount == 1
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in deactivate_reminder: {e}")
+            return False
 
 
 class ActivityRepository(_BaseRepository):
@@ -706,6 +798,15 @@ class Database:
 
     def get_all_active_reminders(self) -> List[Dict[str, Any]]:
         return self.reminders.list_all_active()
+
+    def deactivate_reminder(self, reminder_id: int) -> bool:
+        """Mark a (delivered) one-off reminder inactive."""
+        return self.reminders.deactivate(reminder_id)
+
+    def record_reminder_delivery_failure(self, reminder_id: int,
+                                        max_attempts: int) -> Optional[int]:
+        """Count one failed one-off delivery; retire it at the configured limit."""
+        return self.reminders.record_failed_delivery(reminder_id, max_attempts)
 
     def log_activity(self, user_id: int, action: str, details: str = "") -> bool:
         return self.activity.log(user_id, action, details)

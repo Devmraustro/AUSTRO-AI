@@ -86,7 +86,10 @@ pytest
 
 Tests run offline: they set a dummy `BOT_TOKEN`, use a temporary SQLite database, and leave `GEMINI_API_KEY` unset so nothing hits the network.
 
-**153 tests** (Phase A/B contract + Phase C knowledge + 57 Phase D memory + 27 Phase E learning + 13 Phase E coaching + 12 Phase F evaluation/performance/production).
+**519 passed / 19 skipped** on a clean checkout (`pytest -q`, Python 3.11, SQLite only,
+measured 2026-10-22). The skipped tests are the PostgreSQL and Docker integration
+modules, which run in CI against a `postgres:16` service. The count is the measured
+value, not a target: run `pytest` for the current number.
 
 ### Evaluation & Regression (Phase F)
 

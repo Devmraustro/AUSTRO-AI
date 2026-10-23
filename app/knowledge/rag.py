@@ -10,6 +10,7 @@ retrieval actually returned usable evidence.
 from __future__ import annotations
 
 import logging
+import re
 from typing import List, Optional
 
 from app.ai.gateway import AIGateway
@@ -61,6 +62,11 @@ class RAGService:
                              event_id=result.event_id, provider=result.generator)
 
         evidence = self._pack_evidence(result.chunks)
+        if not evidence:
+            # Chunks existed but carried no usable text: retrieval success is
+            # not evidential support, so never ask the model to improvise.
+            return RAGAnswer(text=_INSUFFICIENT_TEXT, grounded=False,
+                             event_id=result.event_id, provider=result.generator)
         prompt = _EVIDENCE_HEADER.format(question=question)
         for item in evidence:
             prompt += item["block"] + "\n"
@@ -86,10 +92,45 @@ class RAGService:
         return RAGAnswer(
             text=response.text,
             citations=citations,
-            grounded=True,
+            grounded=self._is_supported(response.text, evidence) and bool(citations),
             event_id=result.event_id,
             provider=response.metadata.provider,
         )
+
+    @staticmethod
+    def _is_supported(text: str, evidence: List[dict]) -> bool:
+        """Evidential support check (audit C-3).
+
+        ``grounded`` used to mean only "some chunks were retrieved". An
+        answer is now grounded only when it demonstrably rests on the packed
+        evidence: it cites a valid evidence marker ``[n]``, quotes a verbatim
+        multi-word span of the evidence, or shares substantial content tokens
+        with it. An insufficiency declaration, an empty answer, or an answer
+        unrelated to the evidence is reported as ungrounded. This is a
+        conservative heuristic, not a proof of entailment; contradictory
+        evidence cannot be resolved by it and stays a documented limitation.
+        """
+        answer = (text or "").strip()
+        if not answer or _INSUFFICIENT_TEXT.split("\n")[0] in answer:
+            return False
+        for marker in re.findall(r"\[(\d+)\]", answer):
+            if 1 <= int(marker) <= len(evidence):
+                return True
+        evidence_text = "\n".join(item["block"] for item in evidence)
+
+        def tokenize(s: str) -> List[str]:
+            return re.findall(r"[^\W_]+", s.lower(), flags=re.UNICODE)
+
+        answer_tokens = tokenize(answer)
+        evidence_tokens = tokenize(evidence_text)
+        evidence_token_set = set(evidence_tokens)
+        evidence_joined = " ".join(evidence_tokens)
+        # Verbatim multi-word quotation of the evidence (local provider path).
+        for start in range(max(0, len(answer_tokens) - 2)):
+            if " ".join(answer_tokens[start:start + 3]) in evidence_joined:
+                return True
+        shared = {t for t in answer_tokens if len(t) >= 3} & evidence_token_set
+        return len(shared) >= 4
 
     def _pack_evidence(self, chunks) -> List[dict]:
         budget = self._settings.knowledge_context_budget_chars

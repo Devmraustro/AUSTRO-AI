@@ -143,6 +143,9 @@ ENTRY_POINT_RATELIMITS: dict[str, str] = {
     # --- deliberately uncharged ---
     "fallback_cancel": NONE,   # recovery path, must always work
     "memory_text": NONE,       # flow charged at memory_search/edit/forget entry
+    # Single dispatcher for every plain-text message; the flows it forwards to
+    # are charged at their own entry points (see text_router's docstring).
+    "text_router": NONE,
     "_ingest_book": NONE,      # background task; charged at knowledge_document
 }
 
@@ -1551,26 +1554,42 @@ async def reminder_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def reminder_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Confirm and save the reminder."""
+    """Confirm, save and immediately activate the reminder."""
     services = get_services(context)
     query = update.callback_query
     await query.answer()
 
     user_id = update.effective_user.id
 
-    success = services.reminders.create_daily_reminder(
-        user_id=user_id,
-        title=context.user_data.get("reminder_title"),
-        message=context.user_data.get("reminder_message"),
-        time_str=context.user_data.get("reminder_time", "08:00"),
-    )
+    try:
+        success = services.reminders.create_daily_reminder(
+            user_id=user_id,
+            title=context.user_data.get("reminder_title"),
+            message=context.user_data.get("reminder_message"),
+            time_str=context.user_data.get("reminder_time", "08:00"),
+        )
+    except ValidationError:
+        # Keep the flow and the typed values so the user can correct the time
+        # instead of being dropped back to the menu with "something failed".
+        await query.edit_message_text(
+            "❌ وقت غير صالح. اكتب الوقت بصيغة HH:MM، مثال: 08:30\n\n"
+            "أعد إرسال الوقت:"
+        )
+        return REMINDER_TIME
 
     keyboard = [[InlineKeyboardButton("🔙 رجوع للإعدادات", callback_data="menu_settings")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     if success:
+        # Activate it now. The scheduler only reconciles on startup and once an
+        # hour, so without this the bot said "your reminder is saved" while the
+        # job did not exist yet - a reminder set for the next few minutes was
+        # silently skipped until the next hour's resync.
+        activated = await _resync_reminders(context)
+        note = "" if activated else "\n\n⏳ سيُجدول عند أول تحديث تلقائي."
         await query.edit_message_text(
-            "✅ **تم إنشاء التذكير بنجاح!**\n\nسيتم إرسال التذكير في الوقت المحدد.",
+            "✅ **تم إنشاء التذكير بنجاح!**\n\nسيتم إرسال التذكير في الوقت المحدد."
+            + note,
             reply_markup=reply_markup,
             parse_mode="Markdown",
         )
@@ -1581,6 +1600,23 @@ async def reminder_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     return ConversationHandler.END
+
+
+async def _resync_reminders(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Ask the running scheduler to pick up a reminder created just now.
+
+    Returns False when no scheduler is attached (tests, tooling), so callers can
+    avoid promising immediate delivery.
+    """
+    scheduler = (getattr(context, "bot_data", None) or {}).get("reminder_scheduler")
+    if scheduler is None:
+        return False
+    try:
+        await scheduler.resync()
+        return True
+    except Exception as e:  # noqa: BLE001 - a failed resync must not lose the row
+        logger.error(f"Reminder resync failed: {e}")
+        return False
 
 
 async def settings_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2339,6 +2375,39 @@ async def memory_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🗑️ تم نسيان الذاكرة." if ok else "❌ لم أجد ذاكرة بهذا الرقم.",
             reply_markup=InlineKeyboardMarkup(back),
         )
+
+
+#: Keys that put the bot into a "the next plain-text message is the input of
+#: this flow" mode. Each is consumed by exactly one branch of `text_router`.
+TEXT_MODE_KEYS = ("knowledge_mode", "memory_mode")
+
+
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Dispatch ONE plain-text message to the flow that is waiting for it.
+
+    python-telegram-bot stops at the first handler whose ``check_update``
+    matches and never offers that update to later handlers, so two global
+    ``MessageHandler(filters.TEXT ...)`` registrations can never both work:
+    whichever is registered first swallows every non-command message and the
+    second one is dead code. That was the shipped behaviour - the knowledge
+    handler was registered first and returned early whenever ask-mode was off,
+    so `memory_text` (search / edit / forget) could never run: the user was
+    told "send me the number" and the reply was then consumed by nobody.
+
+    Registering a single router makes the dispatch explicit and testable:
+
+    * knowledge ask-mode  -> the RAG answer flow (charges the AI budget there);
+    * memory text mode    -> search / edit / forget (charged at the menu tap);
+    * anything else       -> no answer, exactly as before, and no AI spend.
+
+    Texts that arrive while a ConversationHandler is active never reach this
+    handler: the conversation handler is registered earlier and matches first.
+    """
+    if context.user_data.get("knowledge_mode") == "ask":
+        return await knowledge_question(update, context)
+    if context.user_data.get("memory_mode"):
+        return await memory_text(update, context)
+    return None
 
 
 # ==================== MAIN MENU HANDLER ====================

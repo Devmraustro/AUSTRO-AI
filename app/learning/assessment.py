@@ -178,7 +178,29 @@ class AssessmentEngine:
     def submit(self, *, owner_user_id: int, objective_id: int, questions,
                answers: Dict[int, str], session_id: Optional[int] = None,
                on: Optional[str] = None) -> AssessmentResult:
-        """Grade a full attempt set, persist everything, update mastery."""
+        """Grade a full attempt set, persist everything, update mastery.
+
+        Service-layer validation (audit C-5): the handler used to be the only
+        guard, so any direct caller could submit forged attempts against a
+        foreign or nonexistent objective. Ownership, a non-empty well-formed
+        question set, and in-range answer indices are enforced here, at the
+        trusted boundary, regardless of the calling layer.
+        """
+        if not questions:
+            raise ValueError("assessment submission requires at least one question")
+        if self._store.objectives.get(owner_user_id, objective_id) is None:
+            raise ValueError("objective not found for this owner")
+        for question in questions:
+            if not (getattr(question, "prompt", "") or "").strip():
+                raise ValueError("assessment question is missing its prompt")
+            # Free-text kinds are keyword-graded and legitimately carry no
+            # reference answer; choice kinds must carry one to be gradeable.
+            if getattr(question, "kind", "") in ("multiple_choice", "true_false") \
+                    and not (getattr(question, "answer", "") or "").strip():
+                raise ValueError("choice question is missing its answer")
+        out_of_range = [i for i in (answers or {}) if not 0 <= int(i) < len(questions)]
+        if out_of_range:
+            raise ValueError(f"answer indices out of range: {out_of_range}")
         results = [self.grade(q, answers.get(index, ""))
                    for index, q in enumerate(questions)]
         correct_count = sum(1 for r in results if r["correct"])

@@ -660,12 +660,43 @@ _CORE_INDEXES = {
     "uq_progress_user_date": ("progress", "user_id, date"),
 }
 
+# Core v2: habit logging had no per-day idempotency (audit C-2). One habit
+# may have at most one log row per calendar day; a repeated submission is a
+# retry of the same event, not a second completion. As in CORE_V1, rows with
+# NULL habit_id/date are preserved untouched (a UNIQUE index treats NULLs as
+# distinct on both engines, so they can never collide or be collapsed).
+CORE_V2 = Migration(
+    schema_name="core",
+    version=2,
+    statements=[
+        # Partial legacy databases (e.g. knowledge-only fixtures) may not
+        # have the core habit table yet; create it exactly as connection.py
+        # does so the dedupe/index statements below always have a target.
+        "CREATE TABLE IF NOT EXISTS habit_logs ("
+        "log_id INTEGER PRIMARY KEY AUTOINCREMENT, habit_id INTEGER, "
+        "user_id INTEGER, date DATE, completed BOOLEAN DEFAULT 0, note TEXT, "
+        "FOREIGN KEY (habit_id) REFERENCES habits (habit_id) ON DELETE CASCADE)",
+        "DELETE FROM habit_logs WHERE habit_id IS NOT NULL AND date IS NOT NULL "
+        "AND log_id NOT IN (SELECT MAX(log_id) FROM habit_logs "
+        "WHERE habit_id IS NOT NULL AND date IS NOT NULL GROUP BY habit_id, date)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_habit_logs_habit_date "
+        "ON habit_logs (habit_id, date)",
+    ],
+)
 
-def _core_index_unique_state(conn, index_name: str):
+# Core v3: bounded retry accounting for one-off reminder delivery.
+CORE_V3 = Migration(schema_name="core", version=3, statements=[])
+
+_CORE_V2_INDEXES = {
+    "uq_habit_logs_habit_date": ("habit_logs", "habit_id, date"),
+}
+
+
+def _core_index_unique_state(conn, index_name: str, indexes=None):
     """Return True only for the expected unique index; False for a conflicting
     same-name index; None when the name is unused.
     """
-    expected = _CORE_INDEXES[index_name]
+    expected = (indexes or _CORE_INDEXES)[index_name]
     expected_table, expected_columns = expected
     expected_columns = [part.strip().lower() for part in expected_columns.split(",")]
     cursor = conn.cursor()
@@ -723,7 +754,75 @@ def _verify_core_v1_indexes_unique(conn) -> None:
             )
 
 
-MIGRATIONS: List[Migration] = [KNOWLEDGE_V1, KNOWLEDGE_V2, MEMORY_V1, LEARNING_V1, CORE_V1]
+def _validate_core_v2_indexes(conn) -> None:
+    for index_name in _CORE_V2_INDEXES:
+        if _core_index_unique_state(conn, index_name, _CORE_V2_INDEXES) is False:
+            raise RuntimeError(
+                f"Migration core v2 found a conflicting index definition for {index_name}"
+            )
+
+
+def _verify_core_v2_indexes_unique(conn) -> None:
+    for index_name in _CORE_V2_INDEXES:
+        if _core_index_unique_state(conn, index_name, _CORE_V2_INDEXES) is not True:
+            raise RuntimeError(
+                f"Migration core v2 did not establish unique index {index_name}"
+            )
+
+
+def _reminders_table_exists(conn) -> bool:
+    """Return whether the core reminders table exists on the configured engine."""
+    cursor = conn.cursor()
+    if _DB_ENGINE == "postgresql":
+        cursor.execute(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema = current_schema() AND table_name = %s",
+            ("reminders",),
+        )
+        return cursor.fetchone() is not None
+    cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        ("reminders",),
+    )
+    return cursor.fetchone() is not None
+
+
+def _ensure_core_v3_columns(conn) -> None:
+    """Ensure the retry counter exists, preserving existing reminder rows."""
+    cursor = conn.cursor()
+    if _DB_ENGINE == "postgresql":
+        cursor.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = %s",
+            ("reminders",),
+        )
+        columns = {str(row[0]) for row in cursor.fetchall()}
+    else:
+        cursor.execute("PRAGMA table_info(reminders)")
+        columns = {str(row[1]) for row in cursor.fetchall()}
+    if not columns:
+        raise RuntimeError("Migration core v3 requires the existing reminders table")
+    if "delivery_attempts" not in columns:
+        cursor.execute(
+            "ALTER TABLE reminders ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0"
+        )
+    # Recover if the column was manually added before migration bookkeeping.
+    cursor.execute("UPDATE reminders SET delivery_attempts = 0 WHERE delivery_attempts IS NULL")
+    if _DB_ENGINE == "postgresql":
+        cursor.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = %s",
+            ("reminders",),
+        )
+        columns = {str(row[0]) for row in cursor.fetchall()}
+    else:
+        cursor.execute("PRAGMA table_info(reminders)")
+        columns = {str(row[1]) for row in cursor.fetchall()}
+    if "delivery_attempts" not in columns:
+        raise RuntimeError("Migration core v3 failed to add reminders.delivery_attempts")
+
+
+MIGRATIONS: List[Migration] = [KNOWLEDGE_V1, KNOWLEDGE_V2, MEMORY_V1, LEARNING_V1, CORE_V1, CORE_V2, CORE_V3]
 
 
 def apply_migrations(conn) -> None:  # sqlite3.Connection or psycopg2 connection
@@ -745,9 +844,25 @@ def apply_migrations(conn) -> None:  # sqlite3.Connection or psycopg2 connection
         row = cursor.fetchone()
         if row is not None and len(row) > 0 and int(row[0]) >= migration.version:
             continue
+        # Some focused migration callers intentionally open a partial legacy
+        # database (for example, a knowledge-only store) without core tables.
+        # Do not mark v3 as applied until reminders exists: the regular database
+        # initializer creates core tables before calling migrations, so a later
+        # full initialization can safely apply this migration.
+        if (
+            migration.schema_name == "core"
+            and migration.version == 3
+            and not _reminders_table_exists(conn)
+        ):
+            logger.info("Deferring migration core v3 until the reminders table exists")
+            continue
         try:
             if migration.schema_name == "core" and migration.version == 1:
                 _validate_core_v1_indexes(conn)
+            if migration.schema_name == "core" and migration.version == 2:
+                _validate_core_v2_indexes(conn)
+            if migration.schema_name == "core" and migration.version == 3:
+                _ensure_core_v3_columns(conn)
             statements = (
                 translate_statements(migration.statements) if postgres else migration.statements
             )
@@ -755,6 +870,8 @@ def apply_migrations(conn) -> None:  # sqlite3.Connection or psycopg2 connection
                 cursor.execute(statement)
             if migration.schema_name == "core" and migration.version == 1:
                 _verify_core_v1_indexes_unique(conn)
+            if migration.schema_name == "core" and migration.version == 2:
+                _verify_core_v2_indexes_unique(conn)
             if postgres:
                 cursor.execute(
                     upsert_schema_migrations(),

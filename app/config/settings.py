@@ -9,9 +9,9 @@ removes hardcoded keys, URLs, models, quotas and timeouts from the code.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import List
 
 from dotenv import load_dotenv
 
@@ -20,14 +20,13 @@ from app.core.errors import ConfigurationError
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
-_DEFAULT_SYSTEM_PROMPTS: Dict[str, str] = {}
-
 
 @dataclass(frozen=True)
 class Settings:
     """Validated application settings."""
 
-    # Required fields (no defaults)
+    # Identity / storage roots: genuinely required, supplied by load_settings().
+    # Values without a default here fail loudly instead of silently falling back.
     bot_token: str
     bot_name: str
     bot_username: str
@@ -37,45 +36,45 @@ class Settings:
     backups_path: str
 
     gemini_api_key: str
-    gemini_model: str
-    gemini_api_url: str
-    use_local_fallback: bool
+    gemini_model: str = "gemini-2.5-flash"
+    gemini_api_url: str = "https://generativelanguage.googleapis.com/v1beta/models"
+    use_local_fallback: bool = True
 
     # Knowledge engine (book ingestion + RAG)
-    knowledge_storage_path: str
-    knowledge_max_file_size_mb: int
-    knowledge_max_pages: int
-    knowledge_max_chars: int
-    knowledge_max_chunks: int
-    knowledge_chunk_size: int
-    knowledge_chunk_overlap: int
-    knowledge_embedding_dimensions: int
-    knowledge_embedding_model: str
-    knowledge_embedding_version: str
-    knowledge_retrieval_top_k: int
-    knowledge_retrieval_min_score: float
-    knowledge_context_budget_chars: int
-    knowledge_embedding_batch_size: int
+    knowledge_storage_path: str = ""
+    knowledge_max_file_size_mb: int = 50
+    knowledge_max_pages: int = 1000
+    knowledge_max_chars: int = 2000000
+    knowledge_max_chunks: int = 20000
+    knowledge_chunk_size: int = 900
+    knowledge_chunk_overlap: int = 100
+    knowledge_embedding_dimensions: int = 128
+    knowledge_embedding_model: str = "local-hash"
+    knowledge_embedding_version: str = "1"
+    knowledge_retrieval_top_k: int = 8
+    knowledge_retrieval_min_score: float = 0.20
+    knowledge_context_budget_chars: int = 6000
+    knowledge_embedding_batch_size: int = 16
 
     # Personal memory engine (typed memory + context packs)
-    memory_max_retrieved: int
-    memory_context_budget_chars: int
-    memory_max_candidates: int
+    memory_max_retrieved: int = 12
+    memory_context_budget_chars: int = 1800
+    memory_max_candidates: int = 200
 
     # Adaptive learning engine (curriculum, sessions, schedules, planning)
-    learning_use_llm: bool
-    learning_max_lessons_cache: int
-    learning_default_session_minutes: int
-    learning_review_minutes: int
-    learning_planner_max_items: int
+    learning_use_llm: bool = False
+    learning_max_lessons_cache: int = 200
+    learning_default_session_minutes: int = 25
+    learning_review_minutes: int = 5
+    learning_planner_max_items: int = 8
 
     # AI tuning (removes hardcoded quotas/timeouts/backoff from call sites)
-    max_requests_per_day: int
-    min_request_interval: float
-    ai_request_timeout: float
-    ai_healthcheck_timeout: float
-    ai_max_retries: int
-    ai_retry_backoff_base: float
+    max_requests_per_day: int = 1500
+    min_request_interval: float = 0.5
+    ai_request_timeout: float = 30.0
+    ai_healthcheck_timeout: float = 15.0
+    ai_max_retries: int = 2
+    ai_retry_backoff_base: float = 0.5
 
     # Optional fields with defaults
     environment: str = "development"
@@ -121,75 +120,19 @@ class Settings:
     rate_limit_global_ai_max: int = 100
     rate_limit_global_ai_window: float = 60.0
 
-    gemini_model: str = "gemini-2.5-flash"
-    gemini_api_url: str = "https://generativelanguage.googleapis.com/v1beta/models"
-    use_local_fallback: bool = True
 
-    # Knowledge engine (book ingestion + RAG)
-    knowledge_storage_path: str = ""
-    knowledge_max_file_size_mb: int = 50
-    knowledge_max_pages: int = 1000
-    knowledge_max_chars: int = 2000000
     # ZIP-based formats (docx/epub) are checked against these limits *before*
     # decompression, because `knowledge_max_file_size_mb` only bounds the
     # compressed upload. Without them a 200 KB upload can inflate to GBs.
     knowledge_max_uncompressed_mb: int = 200
     knowledge_max_zip_members: int = 2000
     knowledge_max_zip_ratio: int = 200
-    knowledge_max_chunks: int = 20000
-    knowledge_chunk_size: int = 900
-    knowledge_chunk_overlap: int = 100
-    knowledge_embedding_dimensions: int = 128
-    knowledge_embedding_model: str = "local-hash"
-    knowledge_embedding_version: str = "1"
-    knowledge_retrieval_top_k: int = 8
-    knowledge_retrieval_min_score: float = 0.20
-    knowledge_context_budget_chars: int = 6000
-    knowledge_embedding_batch_size: int = 16
 
-    # Personal memory engine (typed memory + context packs)
-    memory_max_retrieved: int = 12
-    memory_context_budget_chars: int = 1800
-    memory_max_candidates: int = 200
 
-    # Adaptive learning engine (curriculum, sessions, schedules, planning)
-    learning_use_llm: bool = False
-    learning_max_lessons_cache: int = 200
-    learning_default_session_minutes: int = 25
-    learning_review_minutes: int = 5
-    learning_planner_max_items: int = 8
 
-    # AI tuning (removes hardcoded quotas/timeouts/backoff from call sites)
-    max_requests_per_day: int = 1500
-    min_request_interval: float = 0.5
-    ai_request_timeout: float = 30.0
-    ai_healthcheck_timeout: float = 15.0
-    ai_max_retries: int = 2
-    ai_retry_backoff_base: float = 0.5
 
-    system_prompts: Dict[str, str] = field(default_factory=dict)
 
-    # Production-specific settings
-    webhook_url: str = ""
-    webhook_port: int = 8443
-    webhook_secret: str = ""
-    log_level: str = "INFO"
 
-    # Database settings
-    db_engine: str = "sqlite"  # "sqlite" | "postgresql"
-    db_host: str = "localhost"
-    db_port: int = 5432
-    db_name: str = "austro_ai"
-    db_user: str = "austro"
-    db_password: str = ""
-    db_pool_size: int = 5
-    db_max_overflow: int = 10
-    db_pool_timeout: int = 30
-    db_pool_recycle: int = 1800
-    db_sslmode: str = "prefer"
-    db_sslrootcert: str = ""
-    db_sslcert: str = ""
-    db_sslkey: str = ""
 
     # Ingestion claim/lease (H1 concurrency hardening). The TTL is how long a
     # worker may own a source without renewing; the renewal interval must stay

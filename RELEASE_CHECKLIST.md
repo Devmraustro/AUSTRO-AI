@@ -20,6 +20,18 @@ Each step lists the command or file to use and what "done" means.
    failures. → **183 passed, 0 failed** (default env; PG tests self-hosted via
    per-test fixture). `PRODUCTION_E2E_CHECKLIST.md` §1.7 updated to VERIFIED.
 
+- [x] **2b. Reminder delivery reliability (bounded retries).**
+   One-off reminders are retired on successful delivery; each failed delivery
+   is persisted in `reminders.delivery_attempts` (migration `core v3`) and a
+   one-off reminder is deactivated after
+   `MAX_ONE_OFF_DELIVERY_ATTEMPTS = 5` failed attempts, after which scheduler
+   reconciliation no longer reschedules it. Counts survive restarts and are
+   incremented atomically (concurrency-safe). Delivery semantics are
+   **at-least-once**: a crash between a successful Telegram send and the
+   persistence update can cause one redelivery, and no exactly-once claim is
+   made. Covered by `tests/test_reminder_lifecycle.py` and
+   `tests/test_migrations_safety.py` (including partial-schema deferral).
+
 ## REQUIRES LIVE CREDENTIALS (operator)
 
 - [ ] **3. Obtain a real Telegram `BOT_TOKEN`** from @BotFather.

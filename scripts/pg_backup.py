@@ -338,9 +338,20 @@ def _load_encryption_key(required: bool = False) -> Optional[bytes]:
             raise RuntimeError(f"could not read encryption key file: {exc}") from exc
         log("warn", f"could not read encryption key file {key_file}: {exc}")
         return None
-    # Accept a raw 32-byte key, or a text file whose only extra byte is a
-    # trailing newline from a secret store / `echo` invocation.
-    for candidate in (raw, raw.strip()):
+    # Accept a raw 32-byte key, or a file whose only extra bytes are a single
+    # trailing newline (CRLF or LF) from a secret store / `echo` invocation.
+    # Never use strip(): a random 32-byte key may itself start or end with a
+    # whitespace byte (0x09/0x0A/0x0D/0x20), and stripping would silently eat
+    # key material and reject ~4% of valid keys (the old flaky-test cause).
+    # Try both single-LF and CRLF trims: a key ending in CR stored with an
+    # LF suffix is byte-identical to a key stored with a CRLF suffix, so the
+    # length check (exactly 32 bytes) is what disambiguates them.
+    candidates = [raw]
+    if raw.endswith(b"\r\n"):
+        candidates.append(raw[:-2])
+    if raw.endswith(b"\n"):
+        candidates.append(raw[:-1])
+    for candidate in candidates:
         if len(candidate) == _AES_KEY_BYTES:
             return candidate
     message = (

@@ -24,6 +24,9 @@ REMINDER_TIMES_FORMAT = {key: time.fromisoformat(value) for key, value in REMIND
 
 logger = logging.getLogger(__name__)
 
+# One-off reminders are retried during hourly reconciliation, but never forever.
+MAX_ONE_OFF_DELIVERY_ATTEMPTS = 5
+
 
 class ReminderScheduler:
     """Async reminder scheduler integrated with PTB job queue."""
@@ -111,7 +114,12 @@ class ReminderScheduler:
                 when = datetime.fromisoformat(rem["scheduled_time"])
                 title = rem.get("title") or ""
                 reminder_text = rem.get("message") or title
-                data = {"user_id": rem["user_id"], "message": reminder_text}
+                data = {
+                    "user_id": rem["user_id"],
+                    "message": reminder_text,
+                    "reminder_id": reminder_id,
+                    "is_recurring": bool(rem.get("is_recurring")),
+                }
 
                 if rem.get("is_recurring"):
                     self.application.job_queue.run_daily(
@@ -269,19 +277,51 @@ class ReminderScheduler:
             return False
 
     async def _send_custom_reminder(self, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Send a custom reminder."""
-        job_data = context.job.data
+        """Send a custom reminder, then retire it if it was a one-off."""
+        job_data = context.job.data or {}
         user_id = job_data.get("user_id")
         message = job_data.get("message") or "تذكير من AUSTRO AI"
 
+        delivered = False
         try:
             await context.bot.send_message(
                 chat_id=user_id, text=message, parse_mode="Markdown"
             )
+            delivered = True
         except TelegramError:
+            # Markdown in user-supplied text can be invalid; retry as plain text.
             try:
                 await context.bot.send_message(chat_id=user_id, text=message)
+                delivered = True
             except Exception as e:  # noqa: BLE001
                 logger.error(f"Failed to send custom reminder to {user_id}: {e}")
         except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to send custom reminder to {user_id}: {e}")
+
+        reminder_id = job_data.get("reminder_id")
+        is_recurring = bool(job_data.get("is_recurring"))
+        if reminder_id is not None and not is_recurring:
+            if delivered:
+                # A one-off reminder must leave the active set after success.
+                self._db.deactivate_reminder(int(reminder_id))
+            else:
+                # Persist the count so restarts cannot reset the retry budget.
+                attempts = self._db.record_reminder_delivery_failure(
+                    int(reminder_id), MAX_ONE_OFF_DELIVERY_ATTEMPTS
+                )
+                if attempts is None:
+                    logger.error(
+                        "Could not persist failed delivery attempt for reminder %s",
+                        reminder_id,
+                    )
+                elif attempts >= MAX_ONE_OFF_DELIVERY_ATTEMPTS:
+                    logger.error(
+                        "Deactivated one-off reminder %s after %s failed delivery attempts",
+                        reminder_id, attempts,
+                    )
+                else:
+                    logger.warning(
+                        "One-off reminder %s delivery failed (%s/%s); "
+                        "will be retried by scheduler reconciliation",
+                        reminder_id, attempts, MAX_ONE_OFF_DELIVERY_ATTEMPTS,
+                    )
