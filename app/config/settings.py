@@ -36,7 +36,7 @@ class Settings:
     backups_path: str
 
     gemini_api_key: str
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_model: str = "gemini-3.8-flash"
     gemini_api_url: str = "https://generativelanguage.googleapis.com/v1beta/models"
     use_local_fallback: bool = True
 
@@ -193,7 +193,7 @@ def load_settings() -> Settings:
         logs_path=str(logs_dir),
         backups_path=str(backups_dir),
         gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
-        gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+        gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
         gemini_api_url=os.getenv(
             "GEMINI_API_URL",
             "https://generativelanguage.googleapis.com/v1beta/models",
