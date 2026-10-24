@@ -156,3 +156,43 @@ def test_model_default_consistent_across_config_surfaces():
     assert f'default: "{DEFAULT_GEMINI_MODEL}"' in workflow
     env_example = (root / ".env.example").read_text()
     assert f"GEMINI_MODEL={DEFAULT_GEMINI_MODEL}" in env_example
+
+
+def test_redaction_removes_urls_newlines_and_api_key():
+    body = json.dumps({
+        "error": {
+            "status": "INVALID_ARGUMENT",
+            "message": "bad key AIzaSyD-1234567890abcdef at https://x.example/y\nsecret SECRETKEY",
+        }
+    }).encode()
+    line = smoke.safe_google_error(body, "SECRETKEY")
+    assert "SECRETKEY" not in line
+    assert "AIzaSyD-1234567890abcdef" not in line
+    assert "https://" not in line and "\n" not in line
+    assert "[URL]" in line and "[REDACTED]" in line
+    assert len(line) <= len("status=INVALID_ARGUMENT; message=") + 180
+    assert smoke.safe_google_error(b"\xff not json", "k") == "provider error details unavailable"
+
+
+def test_retry_after_http_date_supported_and_capped():
+    from datetime import datetime, timedelta, timezone
+    now = datetime(2026, 10, 24, 12, 0, 0, tzinfo=timezone.utc)
+    soon = (now + timedelta(seconds=9)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    assert smoke._retry_wait(1, soon, now=now) == 9.0
+    far = (now + timedelta(hours=5)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    assert smoke._retry_wait(1, far, now=now) == smoke.MAX_WAIT_SECONDS
+    past = (now - timedelta(seconds=30)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    assert smoke._retry_wait(1, past, now=now) == 0.0
+
+
+def test_unparseable_retry_after_falls_back_to_bounded_backoff():
+    assert smoke._retry_wait(2, "soon-ish") == 4.0
+    assert smoke._retry_wait(10, None) == smoke.MAX_WAIT_SECONDS
+
+
+def test_retry_budget_never_exceeds_configured_limit():
+    waits = []
+    opener = _Opener([_http_error(503, retry_after="30")] * smoke.MAX_ATTEMPTS)
+    ok, _ = smoke.check_gemini("SECRETKEY", "gemini-3.8-flash", opener=opener, sleeper=waits.append)
+    assert not ok and opener.calls == smoke.MAX_ATTEMPTS == 3
+    assert all(w <= smoke.MAX_WAIT_SECONDS for w in waits) and len(waits) == 2

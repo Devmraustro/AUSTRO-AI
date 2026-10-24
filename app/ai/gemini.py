@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 import time
 
@@ -35,6 +36,36 @@ def fallback_status(settings_: Settings) -> str:
         "Local AI fallback is disabled; the gateway will return its safe "
         "built-in response if Gemini is unavailable."
     )
+
+
+_GEMINI_VERSION_RE = re.compile(r"gemini-(\d+)(?:\.(\d+))?")
+
+
+def supports_sampling_params(model: str) -> bool:
+    """Whether the model honors custom temperature/topP/topK.
+
+    Google documents that custom sampling values are unsupported and ignored
+    for Gemini 3.6 Flash and later, that requests should drop them, and that
+    future generations reject them with 400 INVALID_ARGUMENT. Older models
+    keep the historical payload. Unknown identifiers keep the old behaviour,
+    so a mis-typed model never silently changes what we send.
+    """
+    match = _GEMINI_VERSION_RE.match(model or "")
+    if not match:
+        return True
+    major = int(match.group(1))
+    minor = int(match.group(2) or 0)
+    if major == 3:
+        return minor < 6
+    return major < 3
+
+
+def _generation_config(model: str, max_tokens: int, temperature: float) -> dict:
+    """Build `generationConfig`, omitting sampling knobs newer models reject."""
+    config = {"maxOutputTokens": max_tokens}
+    if supports_sampling_params(model):
+        config.update({"temperature": temperature, "topP": 0.9, "topK": 40})
+    return config
 
 
 _HARM_CATEGORIES = [
@@ -80,7 +111,9 @@ class GeminiProvider(AIProvider):
             headers = {"x-goog-api-key": self._settings.gemini_api_key}
             payload = {
                 "contents": [{"role": "user", "parts": [{"text": "Hello"}]}],
-                "generationConfig": {"temperature": 0.7, "maxOutputTokens": 10},
+                "generationConfig": _generation_config(
+                    self.model, 10, temperature=0.7
+                ),
             }
             response = requests.post(
                 url, headers=headers, json=payload,
@@ -89,7 +122,10 @@ class GeminiProvider(AIProvider):
             if response.status_code == 200:
                 data = response.json()
                 if "candidates" in data and data["candidates"]:
-                    logger.info("Gemini Flash 2.5 connected! (FREE - 1500 requests/day)")
+                    logger.info(
+                        f"Gemini connected (model={self.model}; "
+                        f"{self._settings.max_requests_per_day} requests/day budget)"
+                    )
                     return True
             error_msg = "Unknown error"
             try:
@@ -157,12 +193,9 @@ class GeminiProvider(AIProvider):
         contents.append({"role": "user", "parts": [{"text": request.prompt}]})
         return {
             "contents": contents,
-            "generationConfig": {
-                "temperature": request.temperature,
-                "maxOutputTokens": request.max_tokens,
-                "topP": 0.9,
-                "topK": 40,
-            },
+            "generationConfig": _generation_config(
+                self.model, request.max_tokens, temperature=request.temperature
+            ),
             "safetySettings": [
                 {"category": category, "threshold": threshold}
                 for category, threshold in _HARM_CATEGORIES

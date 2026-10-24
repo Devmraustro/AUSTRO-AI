@@ -193,3 +193,48 @@ async def test_sequential_pacing_still_works(monkeypatch):
     await provider.generate(_request())
     assert calls["n"] == 3  # 1 health check + 2 calls
     assert provider.request_count == 2
+
+
+@pytest.mark.parametrize("model,expected", [
+    ("gemini-2.5-flash", True),
+    ("gemini-3-flash-preview", True),
+    ("gemini-3.5-flash", True),
+    ("gemini-3.8-flash", False),
+    ("gemini-3.6-flash", False),
+    ("gemini-4-argon", False),
+    ("custom-model", True),
+])
+def test_sampling_param_support_matrix(model, expected):
+    from app.ai.gemini import supports_sampling_params
+    assert supports_sampling_params(model) is expected
+
+
+def test_payload_omits_sampling_params_for_gemini_3_8(monkeypatch):
+    seen = []
+
+    def _behaviour(*args, **kwargs):
+        seen.append(kwargs.get("json"))
+        return _Response()
+
+    provider = _provider(monkeypatch, _behaviour, gemini_model="gemini-3.8-flash")
+    asyncio.run(provider.generate(_request()))
+    config = seen[-1]["generationConfig"]
+    assert config["maxOutputTokens"] == _request().max_tokens
+    assert not ({"temperature", "topP", "topK"} & set(config))
+    # The health check must be equally compatible, or the provider would be
+    # marked unavailable and every answer would silently come from fallback.
+    assert not ({"temperature", "topP", "topK"} & set(seen[0]["generationConfig"]))
+
+
+def test_payload_keeps_sampling_params_for_legacy_models(monkeypatch):
+    seen = []
+
+    def _behaviour(*args, **kwargs):
+        seen.append(kwargs.get("json"))
+        return _Response()
+
+    provider = _provider(monkeypatch, _behaviour, gemini_model="gemini-2.5-flash")
+    asyncio.run(provider.generate(_request()))
+    config = seen[-1]["generationConfig"]
+    assert config["topP"] == 0.9 and config["topK"] == 40
+    assert "temperature" in config

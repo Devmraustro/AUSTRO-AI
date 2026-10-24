@@ -13,6 +13,7 @@ and `.env.example` in agreement with it.
 
 from __future__ import annotations
 
+import email.utils
 import json
 import os
 import re
@@ -20,6 +21,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from urllib.parse import quote
 
 DEFAULT_MODEL = "gemini-3.8-flash"
@@ -39,20 +41,35 @@ def safe_google_error(body: bytes, api_key: str) -> str:
         if api_key:
             message = message.replace(api_key, "[REDACTED]")
         message = re.sub(r"AIza[0-9A-Za-z_-]{10,}", "[REDACTED]", message)
-        message = re.sub(r"https?://\\S+", "[URL]", message)
-        message = re.sub(r"[\\r\\n\\t]+", " ", message)
+        message = re.sub(r"https?://\S+", "[URL]", message)
+        message = re.sub(r"[\r\n\t]+", " ", message)
         return f"status={status}; message={message[:180]}"
     except Exception:  # noqa: BLE001 - diagnostics must never raise
         return "provider error details unavailable"
 
 
-def _retry_wait(attempt: int, retry_after: str | None) -> float:
-    """Bounded wait: honor numeric Retry-After up to the strict cap."""
+def _retry_wait(attempt: int, retry_after: str | None, now=None) -> float:
+    """Bounded wait derived from Retry-After (delta-seconds or HTTP-date).
+
+    Both RFC 9110 forms are honored; either is capped at MAX_WAIT_SECONDS so
+    an upstream provider can never stretch the bounded budget. Unparseable
+    values fall back to exponential backoff (2, 4, ... seconds).
+    """
     if retry_after:
+        value = retry_after.strip()
         try:
-            return min(max(float(retry_after), 0.0), MAX_WAIT_SECONDS)
+            return min(max(float(value), 0.0), MAX_WAIT_SECONDS)
         except ValueError:
-            pass  # HTTP-date form: fall back to exponential backoff
+            pass  # not delta-seconds; try the HTTP-date form below
+        try:
+            when = email.utils.parsedate_to_datetime(value)
+            if when is not None:
+                reference = now or datetime.now(timezone.utc)
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=timezone.utc)
+                return min(max((when - reference).total_seconds(), 0.0), MAX_WAIT_SECONDS)
+        except (TypeError, ValueError):
+            pass  # unparseable header: use exponential backoff
     return min(float(2 ** attempt), MAX_WAIT_SECONDS)
 
 
@@ -65,7 +82,7 @@ def check_telegram(token: str, opener=urllib.request.urlopen) -> tuple[bool, str
     try:
         with opener(request, timeout=15) as response:
             data = json.loads(response.read())
-        if data.get("ok") is True and isinstance(data.get("result"), dict) \\
+        if data.get("ok") is True and isinstance(data.get("result"), dict) \
                 and data["result"].get("is_bot") is True:
             return True, "Telegram getMe: PASS (valid bot token; identity details suppressed)"
         return False, "Telegram getMe: FAIL (unexpected API response; body suppressed)"
