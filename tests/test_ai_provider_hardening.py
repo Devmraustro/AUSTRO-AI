@@ -199,6 +199,7 @@ async def test_sequential_pacing_still_works(monkeypatch):
     ("gemini-2.5-flash", True),
     ("gemini-3-flash-preview", True),
     ("gemini-3.5-flash", True),
+    ("gemini-3.5-flash-lite", False),
     ("gemini-3.8-flash", False),
     ("gemini-3.6-flash", False),
     ("gemini-4-argon", False),
@@ -224,6 +225,23 @@ def test_payload_omits_sampling_params_for_gemini_3_8(monkeypatch):
     # The health check must be equally compatible, or the provider would be
     # marked unavailable and every answer would silently come from fallback.
     assert not ({"temperature", "topP", "topK"} & set(seen[0]["generationConfig"]))
+
+
+
+
+def test_payload_omits_sampling_params_for_gemini_3_5_flash_lite(monkeypatch):
+    seen = []
+
+    def _behaviour(*args, **kwargs):
+        seen.append(kwargs.get("json"))
+        return _Response()
+
+    provider = _provider(monkeypatch, _behaviour, gemini_model="gemini-3.5-flash-lite")
+    asyncio.run(provider.generate(_request()))
+    for payload in (seen[0], seen[-1]):
+        config = payload["generationConfig"]
+        assert config["maxOutputTokens"] > 0
+        assert not ({"temperature", "topP", "topK"} & set(config))
 
 
 def test_payload_keeps_sampling_params_for_legacy_models(monkeypatch):
