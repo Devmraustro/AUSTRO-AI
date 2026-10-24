@@ -163,7 +163,7 @@ s = load_settings()
         "code": """
 from app.config.settings import load_settings
 s = load_settings()
-assert s.gemini_model == "gemini-2.5-flash"
+assert s.gemini_model == "gemini-3.8-flash"
 assert s.max_requests_per_day == 1500
 assert s.knowledge_chunk_size == 900
 assert s.memory_max_retrieved == 12

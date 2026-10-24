@@ -20,7 +20,7 @@ Records per-request metrics:
 - `capability`: AI capability used (chat, coaching, tutoring, etc.)
 - `category`: High-level category (personal_development, learning, etc.)
 - `provider`: `gemini` or `local-fallback`
-- `model`: Model name (e.g., `gemini-2.5-flash`)
+- `model`: Model name (e.g., `gemini-3.8-flash`)
 - `latency_ms`: End-to-end latency
 - `success`: Boolean success flag
 - `retry_count`: Number of retries attempted
