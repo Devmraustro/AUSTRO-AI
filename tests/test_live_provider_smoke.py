@@ -3,8 +3,8 @@
 No real network or API quota is consumed. Covers the required matrix:
 deterministic failures are never retried, transient failures are retried
 with bounded backoff honoring Retry-After, the retry budget is finite,
-diagnostics never contain credentials, and the model default is consistent
-across settings, workflow, script, and .env.example.
+diagnostics never leak credentials, Gemini 3 payload compatibility, and
+model-default consistency across configuration surfaces.
 """
 
 import io
@@ -64,12 +64,22 @@ def test_valid_response_with_candidate_passes():
     assert ok and "PASS" in line and opener.calls == 1
 
 
+def test_gemini3_payload_omits_unsupported_sampling_parameters():
+    opener = _Opener([_ok_candidate()])
+    ok, _ = _gemini(opener)
+    assert ok
+    payload = json.loads(opener.requests[0].data)
+    assert payload["generationConfig"] == {"maxOutputTokens": 8}
+    assert not ({"temperature", "topP", "topK", "candidateCount", "thinkingBudget"}
+                & set(payload["generationConfig"]))
+
+
 @pytest.mark.parametrize("code", [400, 401, 403, 404])
 def test_deterministic_http_errors_fail_without_retries(code):
     opener = _Opener([_http_error(code, b'{"error": {"status": "X", "message": "m SECRETKEY"}}')])
     ok, line = _gemini(opener)
     assert not ok and opener.calls == 1
-    assert "SECRETKEY" not in line  # diagnostics never leak the credential
+    assert "SECRETKEY" not in line
 
 
 def test_429_retries_with_retry_after_then_succeeds():
@@ -91,7 +101,7 @@ def test_retry_after_is_capped():
 @pytest.mark.parametrize("code", [500, 503])
 def test_transient_http_exhausts_budget_and_fails(code):
     opener = _Opener([_http_error(code)] * smoke.MAX_ATTEMPTS)
-    ok, line = _gemini(opener)
+    ok, _ = _gemini(opener)
     assert not ok and opener.calls == smoke.MAX_ATTEMPTS
 
 
