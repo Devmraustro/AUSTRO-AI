@@ -39,15 +39,15 @@ def safe_google_error(body: bytes, api_key: str) -> str:
         if api_key:
             message = message.replace(api_key, "[REDACTED]")
         message = re.sub(r"AIza[0-9A-Za-z_-]{10,}", "[REDACTED]", message)
-        message = re.sub(r"https?://\S+", "[URL]", message)
-        message = re.sub(r"[\r\n\t]+", " ", message)
+        message = re.sub(r"https?://\\S+", "[URL]", message)
+        message = re.sub(r"[\\r\\n\\t]+", " ", message)
         return f"status={status}; message={message[:180]}"
     except Exception:  # noqa: BLE001 - diagnostics must never raise
         return "provider error details unavailable"
 
 
 def _retry_wait(attempt: int, retry_after: str | None) -> float:
-    """Bounded wait: honor Retry-After (seconds) up to the strict cap."""
+    """Bounded wait: honor numeric Retry-After up to the strict cap."""
     if retry_after:
         try:
             return min(max(float(retry_after), 0.0), MAX_WAIT_SECONDS)
@@ -65,7 +65,7 @@ def check_telegram(token: str, opener=urllib.request.urlopen) -> tuple[bool, str
     try:
         with opener(request, timeout=15) as response:
             data = json.loads(response.read())
-        if data.get("ok") is True and isinstance(data.get("result"), dict) \
+        if data.get("ok") is True and isinstance(data.get("result"), dict) \\
                 and data["result"].get("is_bot") is True:
             return True, "Telegram getMe: PASS (valid bot token; identity details suppressed)"
         return False, "Telegram getMe: FAIL (unexpected API response; body suppressed)"
@@ -83,11 +83,13 @@ def check_gemini(api_key: str, model: str, opener=urllib.request.urlopen,
         return False, "Gemini generateContent: FAIL (invalid model identifier)"
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
            f"{quote(model, safe='._-')}:generateContent")
+    # Gemini 3 generation parameters differ from older models: temperature,
+    # top_p, top_k, candidate_count and legacy thinking_budget are unsupported.
+    # Keep this smoke payload to the universally supported output-token bound.
     body = json.dumps({
         "contents": [{"role": "user", "parts": [{"text": "Reply with exactly OK."}]}],
-        "generationConfig": {"temperature": 0, "maxOutputTokens": 8},
+        "generationConfig": {"maxOutputTokens": 8},
     }).encode("utf-8")
-    last_failure = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         request = urllib.request.Request(
             url, data=body, method="POST",
@@ -121,7 +123,7 @@ def check_gemini(api_key: str, model: str, opener=urllib.request.urlopen,
             return False, f"Gemini generateContent: FAIL (network/client error: {type(reason).__name__})"
         except Exception as exc:  # noqa: BLE001
             return False, f"Gemini generateContent: FAIL (client error: {type(exc).__name__})"
-    return False, f"Gemini generateContent: FAIL ({last_failure or 'retry budget exhausted'})"
+    return False, "Gemini generateContent: FAIL (retry budget exhausted)"
 
 
 def main() -> int:
