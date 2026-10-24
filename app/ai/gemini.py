@@ -44,11 +44,12 @@ _GEMINI_VERSION_RE = re.compile(r"gemini-(\d+)(?:\.(\d+))?")
 def supports_sampling_params(model: str) -> bool:
     """Whether the model honors custom temperature/topP/topK.
 
-    Google documents that custom sampling values are unsupported and ignored
-    for Gemini 3.6+ models and Gemini 3.5 Flash-Lite, and requests should omit
-    them for those families. Older supported models keep the historical
-    payload. Unknown identifiers keep the old behaviour, so a mis-typed model
-    never silently changes what we send.
+    Google recommends default sampling settings across Gemini 3 models;
+    Gemini 3.6+ and Gemini 3.5 Flash-Lite additionally deprecate explicit
+    values and may reject them in future API generations. We therefore omit
+    custom sampling fields for all Gemini 3 models. Gemini 2.5 and earlier
+    supported models retain the historical payload. Unknown identifiers keep
+    the old behaviour, so a mis-typed model never silently changes the request.
     """
     match = _GEMINI_VERSION_RE.match(model or "")
     if not match:
@@ -56,11 +57,9 @@ def supports_sampling_params(model: str) -> bool:
     major = int(match.group(1))
     minor = int(match.group(2) or 0)
     if major == 3:
-        # Google also deprecates sampling parameters for Gemini 3.5 Flash-Lite,
-        # even though other 3.5 models retain the legacy configuration.
-        if minor == 5 and "flash-lite" in (model or "").lower():
-            return False
-        return minor < 6
+        # Gemini 3 models are optimized for default sampling values; later
+        # families deprecate explicit values and may reject them entirely.
+        return False
     return major < 3
 
 
