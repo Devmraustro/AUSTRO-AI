@@ -197,8 +197,8 @@ async def test_sequential_pacing_still_works(monkeypatch):
 
 @pytest.mark.parametrize("model,expected", [
     ("gemini-2.5-flash", True),
-    ("gemini-3-flash-preview", True),
-    ("gemini-3.5-flash", True),
+    ("gemini-3-flash-preview", False),
+    ("gemini-3.5-flash", False),
     ("gemini-3.5-flash-lite", False),
     ("gemini-3.8-flash", False),
     ("gemini-3.6-flash", False),
@@ -208,6 +208,23 @@ async def test_sequential_pacing_still_works(monkeypatch):
 def test_sampling_param_support_matrix(model, expected):
     from app.ai.gemini import supports_sampling_params
     assert supports_sampling_params(model) is expected
+
+
+def test_payload_omits_sampling_params_for_earlier_gemini_3_models(monkeypatch):
+    for model in ("gemini-3-flash-preview", "gemini-3.5-flash"):
+        seen = []
+
+        def _behaviour(*args, **kwargs):
+            seen.append(kwargs.get("json"))
+            return _Response()
+
+        provider = _provider(monkeypatch, _behaviour, gemini_model=model)
+        asyncio.run(provider.generate(_request()))
+        assert len(seen) == 2
+        for payload in seen:
+            config = payload["generationConfig"]
+            assert config["maxOutputTokens"] > 0
+            assert not ({"temperature", "topP", "topK"} & set(config))
 
 
 def test_payload_omits_sampling_params_for_gemini_3_8(monkeypatch):
