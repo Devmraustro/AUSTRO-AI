@@ -55,7 +55,6 @@ def supports_sampling_params(model: str) -> bool:
     if not match:
         return True
     major = int(match.group(1))
-    minor = int(match.group(2) or 0)
     if major == 3:
         # Gemini 3 models are optimized for default sampling values; later
         # families deprecate explicit values and may reject them entirely.
@@ -154,8 +153,7 @@ class GeminiProvider(AIProvider):
             return False
         except Exception as exc:  # noqa: BLE001 - keep the loop alive
             logger.warning(
-                f"Gemini connection failed: {type(exc).__name__}. "
-                f"{fallback_status(self._settings)}"
+                f"Gemini connection failed: {type(exc).__name__}. {fallback_status(self._settings)}"
             )
             return False
 
