@@ -38,6 +38,11 @@ class Settings:
     gemini_api_key: str
     gemini_model: str = "gemini-2.5-flash"
     gemini_api_url: str = "https://generativelanguage.googleapis.com/v1beta/models"
+    # Secondary cloud provider (failover target when Gemini is quota-limited
+    # or transiently failing). Enabled purely by the presence of a key.
+    openrouter_api_key: str = ""
+    openrouter_model: str = "google/gemma-4-31b-it:free"
+    openrouter_api_url: str = "https://openrouter.ai/api/v1"
     use_local_fallback: bool = True
 
     # Knowledge engine (book ingestion + RAG)
@@ -146,6 +151,10 @@ class Settings:
     def has_gemini_key(self) -> bool:
         return bool(self.gemini_api_key) and len(self.gemini_api_key) >= 10
 
+    @property
+    def has_openrouter_key(self) -> bool:
+        return bool(self.openrouter_api_key) and len(self.openrouter_api_key) >= 10
+
 
 def _resolve_absolute(base: Path, value: str) -> str:
     if os.path.isabs(value):
@@ -197,6 +206,13 @@ def load_settings() -> Settings:
         gemini_api_url=os.getenv(
             "GEMINI_API_URL",
             "https://generativelanguage.googleapis.com/v1beta/models",
+        ),
+        openrouter_api_key=os.getenv("OPENROUTER_API_KEY", ""),
+        openrouter_model=os.getenv(
+            "OPENROUTER_MODEL", "google/gemma-4-31b-it:free"
+        ),
+        openrouter_api_url=os.getenv(
+            "OPENROUTER_API_URL", "https://openrouter.ai/api/v1"
         ),
         use_local_fallback=os.getenv("USE_LOCAL_FALLBACK", "true").lower() in ("1", "true", "yes"),
         knowledge_storage_path=str(knowledge_dir),

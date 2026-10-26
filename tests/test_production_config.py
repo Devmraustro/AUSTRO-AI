@@ -95,6 +95,27 @@ print("PASS")
 """,
     },
     {
+        "name": "Production config valid with OpenRouter key only",
+        "env": {
+            "BOT_TOKEN": "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken",
+            "GEMINI_API_KEY": "",
+            "OPENROUTER_API_KEY": "sk-or-test-key-0000000000",
+            "AUSTRO_ENVIRONMENT": "production",
+            "AUSTRO_LOG_LEVEL": "WARNING",
+            "USE_LOCAL_FALLBACK": "false",
+        },
+        "code": """
+from app.config.settings import load_settings
+s = load_settings()
+assert s.environment == "production"
+assert s.log_level == "WARNING"
+assert s.use_local_fallback is False
+assert s.has_gemini_key is False
+assert s.has_openrouter_key is True
+print("PASS")
+""",
+    },
+    {
         "name": "Production config invalid log_level",
         "env": {
             "BOT_TOKEN": "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken",

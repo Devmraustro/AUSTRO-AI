@@ -3,8 +3,23 @@ AUSTRO AI - AI Gateway.
 
 Routes generation by capability (chat/coaching/tutoring/planning/...), never
 by provider. Enforces bounded timeouts, retries with exponential backoff, a
-graceful local fallback and per-run telemetry. The gateway never raises raw
-networking exceptions into the update loop.
+provider failover chain (Gemini -> OpenRouter -> local), a graceful local
+fallback and per-run telemetry. The gateway never raises raw networking
+exceptions into the update loop.
+
+Failover rules:
+  * Providers are tried in order; a provider is skipped entirely when it is
+    unconfigured/unavailable.
+  * Rate-limit (quota/429) and authentication (401/403) failures are NOT
+    retried: the same key cannot succeed on a retry, so the gateway moves to
+    the next provider immediately.
+  * Transient failures (timeouts, 5xx, connection resets, malformed/empty
+    responses) are retried up to `ai_max_retries` with exponential backoff
+    before the next provider is tried.
+  * When every cloud provider fails, the local fallback answers (if enabled);
+    otherwise the caller receives the safe built-in response. Local canned
+    answers are always attributed to provider "local" in telemetry - never
+    reported as an LLM-generated response.
 """
 
 from __future__ import annotations
@@ -12,13 +27,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Optional
+from typing import List, Optional
 
 from app.ai.gemini import GeminiProvider, fallback_status
 from app.ai.local import LocalProvider
+from app.ai.openrouter import OpenRouterProvider
 from app.ai.telemetry import AITelemetry
 from app.config.settings import Settings
-from app.core.errors import AIProviderError, RateLimitError
+from app.core.errors import AIAuthenticationError, AIProviderError, RateLimitError
 from app.domain.ai import AIRequest, AIResponse, UNSUPPORTED_CAPABILITIES
 
 logger = logging.getLogger(__name__)
@@ -27,7 +43,7 @@ _UNAVAILABLE_MESSAGE = "عذراً، الخدمة غير متاحة حالياً
 
 
 class AIGateway:
-    """Capability-routed async AI gateway."""
+    """Capability-routed async AI gateway with a provider failover chain."""
 
     def __init__(
         self,
@@ -35,9 +51,16 @@ class AIGateway:
         provider: Optional[GeminiProvider] = None,
         local: Optional[LocalProvider] = None,
         telemetry: Optional[AITelemetry] = None,
+        secondary: Optional[OpenRouterProvider] = None,
     ):
         self._settings = settings_
         self.provider = provider or GeminiProvider(settings_)
+        # Secondary cloud provider (failover target). Auto-constructed from
+        # settings so the container needs no changes; inert when no key is
+        # configured (is_available stays False, no network is touched).
+        self.secondary = (
+            secondary if secondary is not None else OpenRouterProvider(settings_)
+        )
         self.local = local or LocalProvider()
         self.telemetry = telemetry or AITelemetry()
 
@@ -47,41 +70,44 @@ class AIGateway:
             return "⚠️ هذه الميزة غير متاحة حالياً."
         return _UNAVAILABLE_MESSAGE
 
-    async def generate(self, request: AIRequest) -> AIResponse:
-        run_id = self.telemetry.next_run_id()
-        started = time.perf_counter()
-        category = request.category()
+    async def _try_provider(self, provider, request: AIRequest):
+        """Run one provider with bounded retries.
+
+        Returns (text, last_error, attempts_used). text is None on failure.
+        Retries only transient errors (AIProviderError/timeout); rate-limit
+        and authentication failures break out immediately - the next provider
+        in the chain gets the request instead.
+        """
+        max_retries = max(0, self._settings.ai_max_retries)
         attempt = 0
         last_error: Optional[BaseException] = None
+        stage_started = time.perf_counter()
 
-        if category in UNSUPPORTED_CAPABILITIES:
-            return self._record(
-                run_id, request, category, "none", started, 0,
-                self._fallback_advice(request), False, "unsupported capability",
-            )
-
-        max_retries = max(0, self._settings.ai_max_retries)
         while attempt <= max_retries:
-            if not self.provider.is_available:
-                last_error = AIProviderError("AI provider currently unavailable")
+            if not provider.is_available:
+                last_error = last_error or AIProviderError(
+                    f"{getattr(provider, 'name', 'provider')} currently unavailable"
+                )
                 break
 
             try:
                 text = await asyncio.wait_for(
-                    self.provider.generate(request),
+                    provider.generate(request),
                     timeout=self._settings.ai_request_timeout,
                 )
-                return self._record(
-                    run_id, request, category, self.provider.name,
-                    started, attempt, text, True, None,
-                )
+                return text, None, attempt
             except RateLimitError as exc:
                 logger.warning(
                     f"Rate limit hit for {request.capability}: {exc}. "
                     f"{fallback_status(self._settings)}"
                 )
-                last_error = exc
-                break
+                return None, exc, attempt
+            except AIAuthenticationError as exc:
+                logger.error(
+                    f"Authentication rejected by "
+                    f"{getattr(provider, 'name', 'provider')}: {exc}; failing over"
+                )
+                return None, exc, attempt
             except (AIProviderError, asyncio.TimeoutError) as exc:
                 last_error = exc
                 if attempt >= max_retries:
@@ -89,18 +115,49 @@ class AIGateway:
                 attempt += 1
                 backoff = self._settings.ai_retry_backoff_base * (2 ** attempt)
                 logger.info(
-                    f"AI attempt {attempt}/{max_retries} failed for "
-                    f"'{request.capability}' ({(time.perf_counter() - started) * 1000:.0f}ms); "
+                    f"AI attempt {attempt}/{max_retries} failed on "
+                    f"{getattr(provider, 'name', 'provider')} for "
+                    f"'{request.capability}' "
+                    f"({(time.perf_counter() - stage_started) * 1000:.0f}ms); "
                     f"retrying in {backoff:.1f}s"
                 )
                 await asyncio.sleep(backoff)
+
+        return None, last_error, attempt
+
+    async def generate(self, request: AIRequest) -> AIResponse:
+        run_id = self.telemetry.next_run_id()
+        started = time.perf_counter()
+        category = request.category()
+
+        if category in UNSUPPORTED_CAPABILITIES:
+            return self._record(
+                run_id, request, category, "none", "none", started, 0,
+                self._fallback_advice(request), False, "unsupported capability",
+            )
+
+        # Provider chain: configured/available first, in priority order.
+        chain: List = [self.provider, self.secondary]
+        last_error: Optional[BaseException] = None
+
+        for provider in chain:
+            text, error, attempts = await self._try_provider(provider, request)
+            if text is not None:
+                return self._record(
+                    run_id, request, category,
+                    getattr(provider, "name", "provider"),
+                    getattr(provider, "model", "unknown"),
+                    started, attempts, text, True, None,
+                )
+            if error is not None:
+                last_error = error
 
         if self._settings.use_local_fallback:
             try:
                 text = self.local.generate(request)
                 return self._record(
-                    run_id, request, category, self.local.name,
-                    started, attempt, text, True, None,
+                    run_id, request, category, self.local.name, "deterministic-local",
+                    started, 0, text, True, None,
                 )
             except Exception as exc:  # noqa: BLE001 - fallback must never crash the loop
                 last_error = exc
@@ -108,7 +165,7 @@ class AIGateway:
 
         error_text = f"{type(last_error).__name__}: {last_error}" if last_error else "unknown"
         return self._record(
-            run_id, request, category, self.provider.name, started, attempt,
+            run_id, request, category, "none", "none", started, 0,
             self._fallback_advice(request), False, error_text,
         )
 
@@ -118,6 +175,7 @@ class AIGateway:
         request: AIRequest,
         category: str,
         provider: str,
+        model: str,
         started: float,
         retry_count: int,
         text: str,
@@ -125,7 +183,6 @@ class AIGateway:
         error: Optional[str],
     ) -> AIResponse:
         latency_ms = (time.perf_counter() - started) * 1000
-        model = self.provider.model if provider == self.provider.name else "fallback"
         metadata = self.telemetry.record(
             run_id=run_id,
             capability=request.capability,
@@ -142,6 +199,8 @@ class AIGateway:
     def status_text(self) -> str:
         """Arabic quota/status view (mirrors the original settings view)."""
         if not self.provider.is_available:
+            if self.secondary is not None and self.secondary.is_available:
+                return "🔄 Gemini غير متاح - OpenRouter يعمل كمزود بديل"
             if self._settings.use_local_fallback:
                 return "⚠️ Gemini غير متاح - الردود المحلية مفعلة"
             return "⚠️ Gemini غير متاح - الردود المحلية معطلة؛ سيتم إرجاع الرد الآمن الجاهز"
@@ -155,4 +214,6 @@ class AIGateway:
     async def reconnect(self) -> str:
         """Re-run the health check and reset the quota counter on success."""
         await asyncio.to_thread(self.provider.reconnect)
+        if self.secondary is not None:
+            await asyncio.to_thread(self.secondary.reconnect)
         return self.status_text()
