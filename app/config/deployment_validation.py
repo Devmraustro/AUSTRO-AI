@@ -10,7 +10,7 @@ The two environments are treated deliberately differently:
 | Check                          | production | staging | Why                                        |
 |--------------------------------|-----------|---------|--------------------------------------------|
 | local fallback disabled        | required   | required| parity: a real AI provider path is tested   |
-| Gemini API key configured      | required   | required| parity: same failure modes                 |
+| OpenRouter API key configured      | required   | required| parity: same failure modes                 |
 | webhook URL + secret configured| required   | required| parity: secrets wired the same way          |
 | PostgreSQL engine              | -          | required| staging always runs against a real PG       |
 | database name                  | -          | required| must be a dedicated, staging-marked DB      |
@@ -72,11 +72,9 @@ def production_violations(settings) -> List[str]:
         violations.append(
             "production environment should not use local fallback (USE_LOCAL_FALLBACK=false)"
         )
-    if not settings.gemini_api_key and not getattr(
-        settings, "openrouter_api_key", ""
-    ):
+    if not getattr(settings, "openrouter_api_key", ""):
         violations.append(
-            "production environment requires GEMINI_API_KEY or OPENROUTER_API_KEY "
+            "production environment requires OPENROUTER_API_KEY "
             "to be set"
         )
     return violations
@@ -95,9 +93,9 @@ def staging_violations(settings) -> List[str]:
             "staging environment must disable local fallback for production "
             "parity (USE_LOCAL_FALLBACK=false)"
         )
-    if settings.gemini_api_key == "":
+    if not getattr(settings, "openrouter_api_key", ""):
         violations.append(
-            "staging environment requires GEMINI_API_KEY to be set "
+            "staging environment requires OPENROUTER_API_KEY to be set "
             "(production parity)"
         )
     if not settings.webhook_url:
