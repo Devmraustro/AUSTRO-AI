@@ -1,7 +1,7 @@
 """AUSTRO AI - AI provider hardening regressions.
 
 AI-1 (reliability: retries defeated, permanent degradation)
-    `GeminiProvider.generate()` set `self._available = False` on a *timeout*.
+    `OpenRouterProvider.generate()` set `self._available = False` on a *timeout*.
     `AIGateway` consults `provider.is_available` before every attempt, so one
     slow upstream cancelled the bounded retries and then kept the provider
     disabled for the lifetime of the process: every later answer silently came
@@ -21,12 +21,12 @@ import os
 import time
 
 os.environ.setdefault("BOT_TOKEN", "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken")
-os.environ["GEMINI_API_KEY"] = ""
+os.environ["OPENROUTER_API_KEY"] = ""
 
 import pytest
 import requests
 
-from app.ai.gemini import GeminiProvider
+from app.ai.openrouter import OpenRouterProvider
 from app.ai.gateway import AIGateway
 from app.config.settings import settings as base_settings
 from app.core.errors import AIProviderError, RateLimitError
@@ -34,8 +34,8 @@ from app.domain.ai import AIRequest
 
 
 _DEFAULTS = dict(
-    gemini_api_key="test-key-0000000000",
-    gemini_api_url="https://example.invalid/v1beta/models",
+    openrouter_api_key="sk-or-test-key-0000000000",
+    openrouter_api_url="https://openrouter.example/api/v1",
     ai_request_timeout=5.0,
     ai_healthcheck_timeout=1.0,
     min_request_interval=0.0,
@@ -51,7 +51,7 @@ class _Response:
     def __init__(self, status_code=200, payload=None):
         self.status_code = status_code
         self._payload = payload if payload is not None else {
-            "candidates": [{"content": {"parts": [{"text": "ok"}]}}]
+            "choices": [{"message": {"content": "ok"}}]
         }
 
     def json(self):
@@ -60,8 +60,9 @@ class _Response:
 
 def _provider(monkeypatch, behaviour, **cfg_overrides):
     """Build an available provider; `behaviour(call_index)` returns a response."""
-    monkeypatch.setattr("app.ai.gemini.requests.post", behaviour)
-    provider = GeminiProvider(_cfg(**cfg_overrides))
+    monkeypatch.setattr("app.ai.openrouter.requests.get", lambda *a, **k: _Response())
+    monkeypatch.setattr("app.ai.openrouter.requests.post", behaviour)
+    provider = OpenRouterProvider(_cfg(**cfg_overrides))
     assert provider.is_available is True, "the health check should have succeeded"
     return provider
 
@@ -108,7 +109,7 @@ async def test_gateway_retries_after_a_timeout(monkeypatch):
             return _Response()
         if calls["n"] <= 3:
             raise requests.exceptions.Timeout("slow upstream")
-        return _Response(payload={"candidates": [{"content": {"parts": [{"text": "answer"}]}}]})
+        return _Response(payload={"choices": [{"message": {"content": "answer"}}]})
 
     provider = _provider(monkeypatch, behaviour)
     gateway = AIGateway(settings_=_cfg(ai_max_retries=2, ai_retry_backoff_base=0.0),
