@@ -3,7 +3,7 @@ AUSTRO AI - AI Gateway.
 
 Routes generation by capability (chat/coaching/tutoring/planning/...), never
 by provider. Enforces bounded timeouts, retries with exponential backoff, a
-provider failover chain (Gemini -> OpenRouter -> local), a graceful local
+OpenRouter primary provider with a graceful local fallback, a graceful local
 fallback and per-run telemetry. The gateway never raises raw networking
 exceptions into the update loop.
 
@@ -29,7 +29,6 @@ import logging
 import time
 from typing import List, Optional
 
-from app.ai.gemini import GeminiProvider, fallback_status
 from app.ai.local import LocalProvider
 from app.ai.openrouter import OpenRouterProvider
 from app.ai.telemetry import AITelemetry
@@ -48,19 +47,12 @@ class AIGateway:
     def __init__(
         self,
         settings_: Settings,
-        provider: Optional[GeminiProvider] = None,
+        provider: Optional[OpenRouterProvider] = None,
         local: Optional[LocalProvider] = None,
         telemetry: Optional[AITelemetry] = None,
-        secondary: Optional[OpenRouterProvider] = None,
     ):
         self._settings = settings_
-        self.provider = provider or GeminiProvider(settings_)
-        # Secondary cloud provider (failover target). Auto-constructed from
-        # settings so the container needs no changes; inert when no key is
-        # configured (is_available stays False, no network is touched).
-        self.secondary = (
-            secondary if secondary is not None else OpenRouterProvider(settings_)
-        )
+        self.provider = provider or OpenRouterProvider(settings_)
         self.local = local or LocalProvider()
         self.telemetry = telemetry or AITelemetry()
 
@@ -99,7 +91,7 @@ class AIGateway:
             except RateLimitError as exc:
                 logger.warning(
                     f"Rate limit hit for {request.capability}: {exc}. "
-                    f"{fallback_status(self._settings)}"
+                    "OpenRouter unavailable; using configured fallback"
                 )
                 return None, exc, attempt
             except AIAuthenticationError as exc:
@@ -136,8 +128,8 @@ class AIGateway:
                 self._fallback_advice(request), False, "unsupported capability",
             )
 
-        # Provider chain: configured/available first, in priority order.
-        chain: List = [self.provider, self.secondary]
+        # OpenRouter is the only cloud provider; local fallback is handled below.
+        chain: List = [self.provider]
         last_error: Optional[BaseException] = None
 
         for provider in chain:
@@ -199,11 +191,9 @@ class AIGateway:
     def status_text(self) -> str:
         """Arabic quota/status view (mirrors the original settings view)."""
         if not self.provider.is_available:
-            if self.secondary is not None and self.secondary.is_available:
-                return "🔄 Gemini غير متاح - OpenRouter يعمل كمزود بديل"
             if self._settings.use_local_fallback:
-                return "⚠️ Gemini غير متاح - الردود المحلية مفعلة"
-            return "⚠️ Gemini غير متاح - الردود المحلية معطلة؛ سيتم إرجاع الرد الآمن الجاهز"
+                return "⚠️ OpenRouter غير متاح - الردود المحلية مفعلة"
+            return "⚠️ OpenRouter غير متاح - سيتم إرجاع الرد الآمن الجاهز"
         remaining = self._settings.max_requests_per_day - self.provider.request_count
         percentage = (remaining / self._settings.max_requests_per_day) * 100
         return (
@@ -214,6 +204,4 @@ class AIGateway:
     async def reconnect(self) -> str:
         """Re-run the health check and reset the quota counter on success."""
         await asyncio.to_thread(self.provider.reconnect)
-        if self.secondary is not None:
-            await asyncio.to_thread(self.secondary.reconnect)
         return self.status_text()
