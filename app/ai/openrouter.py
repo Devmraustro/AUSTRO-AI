@@ -3,7 +3,7 @@ AUSTRO AI - OpenRouter provider (secondary cloud provider).
 
 Async provider for the OpenRouter chat-completions endpoint
 (`POST {base}/chat/completions`). Network I/O runs on a worker thread
-(asyncio.to_thread) exactly like the Gemini provider, so the Telegram update
+(asyncio.to_thread) using the same bounded threading pattern, so the Telegram update
 loop is never blocked; calls are additionally bounded by `asyncio.wait_for`
 in the gateway.
 
@@ -223,7 +223,7 @@ class OpenRouterProvider(AIProvider):
             raise AIProviderError(f"OpenRouter HTTP {response.status_code}")
 
         except requests.exceptions.Timeout as exc:
-            # Transient: the provider stays available (mirrors Gemini AI-1).
+            # Transient: the provider stays available (preserves availability on transient errors).
             logger.warning(
                 f"OpenRouter request timed out after {self._settings.ai_request_timeout}s"
             )
