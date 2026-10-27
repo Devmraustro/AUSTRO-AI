@@ -21,7 +21,7 @@ how it is tested.
 | Concern                | Before (Phase A/B)            | After (Phase C)                                          |
 |------------------------|-------------------------------|-----------------------------------------------------------|
 | Knowledge feature       | None (books/PDFs unsupported) | Full book ingestion + RAG knowledge base                 |
-| AI gateways             | Chat AI only                  | Separate `GeminiEmbedder` + deterministic `LocalHashEmbedder`; embeddings never routed through chat AI |
+| AI gateways             | Chat AI only                  | Deterministic `LocalHashEmbedder`; embeddings never routed through chat AI |
 | Prompt trust            | Single persona prompt         | Trust-separated `RETRIEVAL_SYSTEM_PROMPT` for RAG       |
 | Background work         | PTB job queue (reminders)     | `asyncio.create_task` for ingestion; CPU stages via `asyncio.to_thread` |
 | Schema changes          | None                          | `schema_migrations` + 11 knowledge tables (idempotent, non-destructive) |
@@ -38,7 +38,7 @@ how it is tested.
 | `extractors.py` | `TextExtractor` registry: pdf (pypdf), docx/epub (stdlib zipfile+xml), txt/md. |
 | `cleaner.py`    | `TextCleaner`: normalize (blocks, control chars, zero-widths, reflow) + transform/tokens for hashing matching. |
 | `chunker.py`    | `SemanticChunker`: overlapping paragraph chunking with section + page attribution; heading detection; title/language inference. |
-| `embeddings.py` | `EmbeddingProvider` ABC, `LocalHashEmbedder` (default), `GeminiEmbedder` (optional), `EmbeddingService`, `cosine_similarity`. |
+| `embeddings.py` | `EmbeddingProvider` ABC, `LocalHashEmbedder` (only provider), `EmbeddingService`, `cosine_similarity`. |
 | `retrieval.py`  | Hybrid owner-scoped retrieval + retrieval events/citations logging. |
 | `rag.py`        | Evidence packing → `grounded_answer` AIRequest → citations; `_INSUFFICIENT_TEXT` for empty evidence. |
 | `collections.py`| Owner-scoped named collections of sources (optional retrieval filter). |
@@ -117,8 +117,7 @@ Tests: `tests/test_ingestion_purge_failure.py` (SQLite) and
   `local-hash` version `1`. Features = hashed character n-grams of
   `cleaner.transform()` text, L2-normalized. Works for Arabic without any
   pretrained model and keeps tests fully deterministic.
-- Optional `GeminiEmbedder`: `:embedContent` via the Gemini client when a key
-  is configured; vectors plug into the same `EmbeddingService` abstraction.
+- Remote embeddings are intentionally disabled; vectors are generated locally through `LocalHashEmbedder`.
 - Embeddings are **never** computed or routed through the chat AI gateway.
 
 ## 7. Retrieval
@@ -141,7 +140,7 @@ source title + section + real page only.
 `RAGService.answer()`: retrieve → pack evidence (snippet ≤1400 chars each,
 into `knowledge_context_budget_chars`) → build an `AIRequest` with
 `capability="grounded_answer"`, `system_prompt=RETRIEVAL_SYSTEM_PROMPT`, and
-evidence markers `[1]`, `[2]`… → `AIGateway.generate` (cloud `GeminiProvider`
+evidence markers `[1]`, `[2]`… → `AIGateway.generate` (cloud `OpenRouterProvider`
 with offline `LocalProvider` fallback) → attach citations.
 
 - Empty evidence → `grounded=False` and the fixed
