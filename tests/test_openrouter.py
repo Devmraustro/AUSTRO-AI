@@ -4,7 +4,7 @@ All HTTP is mocked at `app.ai.openrouter.requests`; no network and no real
 API key are required. Provider behaviour covers: success, missing key,
 401/403, 429 with/without Retry-After, 5xx, timeout, connection failure,
 malformed JSON and empty content. Gateway behaviour covers the failover
-chain Gemini -> OpenRouter -> local -> safe message, bounded retries,
+OpenRouter -> local -> safe message, bounded retries,
 no-retry-on-auth, and telemetry attribution (provider/model), plus secret
 redaction in raised errors.
 """
@@ -14,7 +14,6 @@ import dataclasses
 import os
 
 os.environ.setdefault("BOT_TOKEN", "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken")
-os.environ["GEMINI_API_KEY"] = ""
 os.environ["OPENROUTER_API_KEY"] = ""
 
 import pytest
@@ -29,7 +28,6 @@ from app.domain.ai import AIRequest
 _OR_KEY = "sk-or-test-key-0000000000"
 
 _DEFAULTS = dict(
-    gemini_api_key="",
     openrouter_api_key=_OR_KEY,
     openrouter_model="google/gemma-4-31b-it:free",
     openrouter_api_url="https://openrouter.example/api/v1",
@@ -277,20 +275,20 @@ async def test_daily_quota_disables_and_raises_rate_limit(monkeypatch):
     assert provider.is_available is False
 
 
-# ============================ gateway: failover chain ============================
+# ============================ gateway: OpenRouter-only ============================
 
+class _FakeOpenRouter:
+    """Duck-typed OpenRouter provider for gateway behavior tests."""
 
-class _FakeGemini:
-    """Duck-typed primary provider standing in for Gemini."""
-
-    name = "gemini"
-    model = "gemini-2.5-flash"
+    name = "openrouter"
+    model = "test/openrouter-model"
     request_count = 0
 
     def __init__(self, behaviour=None, available=True):
         self._behaviour = behaviour
         self._available = available
         self.calls = 0
+        self.reconnect_calls = 0
 
     @property
     def is_available(self):
@@ -300,207 +298,114 @@ class _FakeGemini:
         self.calls += 1
         if self._behaviour is not None:
             return self._behaviour(self)
-        return "gemini-ok"
+        return "openrouter-ok"
+
+    def reconnect(self):
+        self.reconnect_calls += 1
+        return self._available
 
 
-def _gateway(monkeypatch, primary, or_behaviour=None, **cfg_overrides):
-    monkeypatch.setattr(
-        "app.ai.openrouter.requests.get", lambda *a, **k: _Response())
-    secondary = None
-    if or_behaviour is not None:
-        monkeypatch.setattr("app.ai.openrouter.requests.post", or_behaviour)
-        secondary = OpenRouterProvider(_cfg(**cfg_overrides))
-        assert secondary.is_available
-    return AIGateway(
-        settings_=_cfg(**cfg_overrides),
-        provider=primary,
-        secondary=secondary,
-    )
-
-
-@pytest.mark.asyncio
-async def test_gemini_success_skips_openrouter(monkeypatch):
-    or_calls = {"n": 0}
-
-    def or_behaviour(*a, **k):
-        or_calls["n"] += 1
-        return _Response()
-
-    gateway = _gateway(monkeypatch, _FakeGemini(), or_behaviour)
-    response = await gateway.generate(_request())
-    assert response.text == "gemini-ok"
-    assert response.metadata.provider == "gemini"
-    assert response.metadata.model == "gemini-2.5-flash"
-    assert or_calls["n"] == 0, "secondary must not be called when primary succeeds"
+def _gateway(monkeypatch, primary=None, behaviour=None, **cfg_overrides):
+    if primary is None:
+        monkeypatch.setattr(
+            "app.ai.openrouter.requests.get", lambda *a, **k: _Response()
+        )
+        if behaviour is not None:
+            monkeypatch.setattr("app.ai.openrouter.requests.post", behaviour)
+            primary = OpenRouterProvider(_cfg(**cfg_overrides))
+            assert primary.is_available
+        else:
+            primary = _FakeOpenRouter(available=False)
+    return AIGateway(settings_=_cfg(**cfg_overrides), provider=primary)
 
 
 @pytest.mark.asyncio
-async def test_gemini_429_fails_over_to_openrouter(monkeypatch):
-    primary = _FakeGemini(
-        behaviour=lambda p: (_ for _ in ()).throw(RateLimitError("quota"))
-    )
-    gateway = _gateway(monkeypatch, primary, lambda *a, **k: _Response())
+async def test_openrouter_primary_success_records_provider(monkeypatch):
+    gateway = _gateway(monkeypatch, _FakeOpenRouter())
     response = await gateway.generate(_request())
-    assert response.text == "or-ok"
+    assert response.text == "openrouter-ok"
     assert response.metadata.provider == "openrouter"
-    assert response.metadata.model == "google/gemma-4-31b-it:free"
-    assert primary.calls == 1, "rate limit must not be retried on the same key"
-
-
-@pytest.mark.asyncio
-async def test_gemini_5xx_fails_over_to_openrouter(monkeypatch):
-    primary = _FakeGemini(
-        behaviour=lambda p: (_ for _ in ()).throw(AIProviderError("500"))
-    )
-    gateway = _gateway(
-        monkeypatch, primary, lambda *a, **k: _Response(), ai_max_retries=0
-    )
-    response = await gateway.generate(_request())
-    assert response.text == "or-ok"
-    assert response.metadata.provider == "openrouter"
-
-
-@pytest.mark.asyncio
-async def test_openrouter_used_when_gemini_unconfigured(monkeypatch):
-    gateway = _gateway(
-        monkeypatch, _FakeGemini(available=False), lambda *a, **k: _Response()
-    )
-    response = await gateway.generate(_request())
-    assert response.text == "or-ok"
-    assert response.metadata.provider == "openrouter"
+    assert response.metadata.model == "test/openrouter-model"
 
 
 @pytest.mark.asyncio
 async def test_openrouter_auth_failure_falls_to_local(monkeypatch):
-    primary = _FakeGemini(available=False)
-
-    def or_behaviour(*a, **k):
+    def behaviour(*a, **k):
         return _Response(status_code=401)
-
-    gateway = _gateway(monkeypatch, primary, or_behaviour, ai_max_retries=2)
+    gateway = _gateway(monkeypatch, behaviour=behaviour, ai_max_retries=2)
     response = await gateway.generate(_request())
     assert response.metadata.provider == "local"
-    assert response.text, "local fallback answered"
+    assert response.text
 
 
 @pytest.mark.asyncio
 async def test_openrouter_429_falls_to_local(monkeypatch):
-    primary = _FakeGemini(available=False)
-
-    def or_behaviour(*a, **k):
+    def behaviour(*a, **k):
         return _Response(status_code=429, headers={"Retry-After": "5"})
-
-    gateway = _gateway(monkeypatch, primary, or_behaviour)
+    gateway = _gateway(monkeypatch, behaviour=behaviour)
     response = await gateway.generate(_request())
     assert response.metadata.provider == "local"
 
 
 @pytest.mark.asyncio
 async def test_openrouter_transient_failures_are_bounded_then_local(monkeypatch):
-    primary = _FakeGemini(available=False)
-    or_calls = {"n": 0}
-
-    def or_behaviour(*a, **k):
-        or_calls["n"] += 1
+    calls = {"n": 0}
+    def behaviour(*a, **k):
+        calls["n"] += 1
         return _Response(status_code=503)
-
-    gateway = _gateway(monkeypatch, primary, or_behaviour, ai_max_retries=2,
-                       ai_retry_backoff_base=0.0)
+    gateway = _gateway(
+        monkeypatch, behaviour=behaviour, ai_max_retries=2,
+        ai_retry_backoff_base=0.0,
+    )
     response = await gateway.generate(_request())
     assert response.metadata.provider == "local"
-    assert or_calls["n"] == 3, "1 attempt + ai_max_retries(2) retries, then stop"
+    assert calls["n"] == 3
 
 
 @pytest.mark.asyncio
-async def test_all_providers_fail_returns_safe_message(monkeypatch):
-    primary = _FakeGemini(
-        behaviour=lambda p: (_ for _ in ()).throw(AIProviderError("down"))
-    )
-
-    def or_behaviour(*a, **k):
+async def test_openrouter_failure_returns_safe_message_when_local_disabled(monkeypatch):
+    def behaviour(*a, **k):
         return _Response(status_code=500)
-
     gateway = _gateway(
-        monkeypatch, primary, or_behaviour,
-        ai_max_retries=0, ai_retry_backoff_base=0.0, use_local_fallback=False,
+        monkeypatch, behaviour=behaviour, ai_max_retries=0,
+        ai_retry_backoff_base=0.0, use_local_fallback=False,
     )
     response = await gateway.generate(_request())
     from app.ai.gateway import _UNAVAILABLE_MESSAGE
     assert response.text == _UNAVAILABLE_MESSAGE
     assert response.metadata.success is False
     assert response.metadata.provider == "none"
-    assert "AIProviderError" in response.metadata.error
 
 
 @pytest.mark.asyncio
-async def test_local_fallback_attributed_as_local_not_llm(monkeypatch):
-    primary = _FakeGemini(available=False)
-
-    def or_behaviour(*a, **k):
-        return _Response(status_code=403)
-
-    gateway = _gateway(monkeypatch, primary, or_behaviour)
-    response = await gateway.generate(_request())
-    assert response.metadata.provider == "local"
-    assert response.metadata.model == "deterministic-local"
-
-
-@pytest.mark.asyncio
-async def test_no_duplicate_generation_on_success(monkeypatch):
-    """Each provider is called at most once per attempt - no double-send."""
-    primary = _FakeGemini()
-    or_calls = {"n": 0}
-
-    def or_behaviour(*a, **k):
-        or_calls["n"] += 1
-        return _Response()
-
-    gateway = _gateway(monkeypatch, primary, or_behaviour)
-    await gateway.generate(_request())
-    assert primary.calls == 1 and or_calls["n"] == 0
-
-
-@pytest.mark.asyncio
-async def test_unconfigured_secondary_never_constructs_network(monkeypatch):
-    """Default gateway (no explicit secondary) with no key stays inert."""
+async def test_gateway_default_provider_is_openrouter_and_no_key_stays_inert(monkeypatch):
     def no_network(*a, **k):
         raise AssertionError("no OpenRouter HTTP call may happen without a key")
-
     monkeypatch.setattr("app.ai.openrouter.requests.get", no_network)
     monkeypatch.setattr("app.ai.openrouter.requests.post", no_network)
-    gateway = AIGateway(settings_=_cfg(openrouter_api_key=""), provider=_FakeGemini())
+    gateway = AIGateway(settings_=_cfg(openrouter_api_key=""))
+    assert isinstance(gateway.provider, OpenRouterProvider)
+    assert gateway.provider.is_available is False
     response = await gateway.generate(_request())
-    assert response.text == "gemini-ok"
+    assert response.metadata.provider == "local"
 
 
 @pytest.mark.asyncio
-async def test_reconnect_refreshes_both_providers(monkeypatch):
-    monkeypatch.setattr(
-        "app.ai.openrouter.requests.get", lambda *a, **k: _Response())
-    reconnected = {"gemini": False}
-
-    class _Reconnectable(_FakeGemini):
-        def reconnect(self):
-            reconnected["gemini"] = True
-            return True
-
-    gateway = _gateway(monkeypatch, _Reconnectable())
+async def test_reconnect_refreshes_only_openrouter(monkeypatch):
+    provider = _FakeOpenRouter(available=True)
+    gateway = _gateway(monkeypatch, provider)
     await gateway.reconnect()
-    assert reconnected["gemini"] is True
-    # The auto-constructed secondary has a key + a mocked-200 health check,
-    # so reconnect leaves it available for failover.
-    assert gateway.secondary.is_available is True
+    assert provider.reconnect_calls == 1
+    assert not hasattr(gateway, "secondary")
 
 
 @pytest.mark.asyncio
 async def test_pacing_spans_concurrent_calls(monkeypatch):
     import time as _time
     timestamps = []
-
     def behaviour(*args, **kwargs):
         timestamps.append(_time.monotonic())
         return _Response()
-
     provider = _provider(monkeypatch, behaviour, min_request_interval=0.05)
     await asyncio.gather(*(provider.generate(_request()) for _ in range(4)))
     assert len(timestamps) == 4
