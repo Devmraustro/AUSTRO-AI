@@ -72,9 +72,12 @@ def production_violations(settings) -> List[str]:
         violations.append(
             "production environment should not use local fallback (USE_LOCAL_FALLBACK=false)"
         )
-    if settings.gemini_api_key == "":
+    if not settings.gemini_api_key and not getattr(
+        settings, "openrouter_api_key", ""
+    ):
         violations.append(
-            "production environment requires GEMINI_API_KEY to be set"
+            "production environment requires GEMINI_API_KEY or OPENROUTER_API_KEY "
+            "to be set"
         )
     return violations
 

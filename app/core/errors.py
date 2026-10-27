@@ -29,6 +29,14 @@ class AIProviderError(AUSTROError):
     """The AI provider failed or could not be reached."""
 
 
+class AIAuthenticationError(AIProviderError):
+    """The provider rejected our credentials (401/403).
+
+    Non-recoverable within a run: retrying with the same key cannot succeed,
+    so the gateway fails over to the next provider instead of retrying.
+    """
+
+
 class DatabaseError(AUSTROError):
     """A persistence-layer failure occurred."""
 
