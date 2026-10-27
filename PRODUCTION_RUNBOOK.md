@@ -23,7 +23,7 @@ Operational guide for the AUSTRO AI Telegram bot. Pairs with `DISASTER_RECOVERY.
 
 ```
 BOT_TOKEN=                # Telegram bot token (real, required)
-GEMINI_API_KEY=           # Google Gemini key (required in production)
+OPENROUTER_API_KEY=       # OpenRouter key (required in production)
 AUSTRO_ENVIRONMENT=production
 AUSTRO_LOG_LEVEL=WARNING  # WARNING or ERROR required by the prod validator
 WEBHOOK_URL=https://yourdomain.com/webhook
@@ -199,7 +199,7 @@ level only. Do not claim PostgreSQL production readiness for the app layer.
 
 ## 8. Known polish items
 
-- `app/ai/gemini.py` logs "Using local fallback." on ANY provider error even when
+- `app/ai/openrouter.py` logs "Using local fallback." on ANY provider error even when
   `USE_LOCAL_FALLBACK=0` (the gateway still honors the flag — the message is
   misleading). Re-word provider warning lines to avoid implying fallback occurs.
 
