@@ -129,10 +129,18 @@ def now_epoch_sql(engine: str) -> str:
 
 
 def upsert_schema_migrations(pk_column: str = "schema_name") -> str:
-    """PostgreSQL upsert used to record an applied migration idempotently."""
+    """PostgreSQL upsert used to record an applied migration idempotently.
+
+    `pk_column` is a code-controlled SQL identifier (every caller uses the
+    default); it is validated below so a future caller cannot interpolate
+    anything that is not a plain column name. The bound values travel via %s
+    placeholders.
+    """
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", pk_column):
+        raise ValueError(f"pk_column must be a plain SQL identifier: {pk_column!r}")
     return (
-        f"INSERT INTO schema_migrations ({pk_column}, version) VALUES (%s, %s) "
-        f"ON CONFLICT ({pk_column}) DO UPDATE SET version = EXCLUDED.version"
+        f"INSERT INTO schema_migrations ({pk_column}, version) VALUES (%s, %s) "  # nosec B608 - pk_column validated as identifier above
+        f"ON CONFLICT ({pk_column}) DO UPDATE SET version = EXCLUDED.version"  # nosec B608 - pk_column validated as identifier above
     )
 
 
@@ -194,10 +202,13 @@ def translate_query(sql: str) -> Tuple[str, bool]:
             update_cols = [c for c in columns if c not in conflict]
             out = re.sub(r"\bINSERT\s+OR\s+REPLACE\s+INTO", "INSERT INTO", out, count=1, flags=re.IGNORECASE)
             if update_cols:
+                # nosec B608 - identifiers originate from the repository's own
+                # checked-in migration DDL (parsed by _parse_insert_columns)
+                # and the hardcoded _REPLACE_TABLE_CONFLICT map; no user input.
                 assignments = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
                 out = (
-                    f"{out} ON CONFLICT ({', '.join(conflict)}) "
-                    f"DO UPDATE SET {assignments}"
+                    f"{out} ON CONFLICT ({', '.join(conflict)}) "  # nosec B608 - see comment above
+                    f"DO UPDATE SET {assignments}"  # nosec B608 - see comment above
                 )
             else:
                 # No non-conflict columns (defensive; conflicts cannot be
