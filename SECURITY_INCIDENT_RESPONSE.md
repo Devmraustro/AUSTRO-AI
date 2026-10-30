@@ -61,42 +61,48 @@ Incidents are classified by severity:
 
 ---
 
-## 2. AI Provider Key Compromise (Gemini API Key)
+## 2. AI Provider Key Compromise (OpenRouter API Key)
 
 ### Detection
-- Unusual API request patterns in Google Cloud Console
-- Unexpected charges or quota exhaustion
-- Alerts from Gemini API about anomalous usage
+- Unusual API request patterns in the OpenRouter dashboard (Activity / Usage)
+- Unexpected credit consumption or quota exhaustion on OpenRouter
+- Alerts from OpenRouter about anomalous usage
 - Reports of strange AI output behavior
+- `AIAuthenticationError` entries in AUSTRO logs (key revoked by OpenRouter)
 
 ### Containment
-1. Immediately revoke the current API key
-2. Set `GEMINI_API_KEY` environment variable to empty
-3. System falls back to local AI mode (use_local_fallback=True)
-4. Isolate affected services from AI gateway
+1. Immediately revoke the current API key in the OpenRouter dashboard (Keys)
+2. Set `OPENROUTER_API_KEY` environment variable to empty
+3. With the key unset the OpenRouter provider reports unavailable; per the
+   deployment policy the gateway answers with local fallback or the safe
+   built-in response (`USE_LOCAL_FALLBACK` governs which)
+4. Isolate affected services from the AI gateway
 
 ### Revoke/Rotate
-1. Generate a new API key in Google AI Studio
+1. Generate a new API key on https://openrouter.ai/keys
 2. Rotate the compromised key immediately
-3. Update all configuration and code references
+3. Update the secret store / deployment configuration only (no key ever lives
+   in the repository or in code references)
 4. Rotate any API gateway secrets or downstream tokens
 
 ### Investigate
-1. Review API usage logs for the compromise period
+1. Review OpenRouter usage logs for the compromise period
 2. Identify what requests were made, by whom, and with what parameters
-3. Check for any unauthorized model modifications
+3. Check for any unauthorized model changes (`OPENROUTER_MODEL`)
 4. Determine what data was sent to the AI provider
 5. Preserve all logs and API request/response evidence
 
 ### Recover
-1. Deploy the new API key
-2. Re-enable Gemini API if desired (set `use_local_fallback=False`)
-3. Monitor API usage for anomalous patterns
+1. Deploy the new API key via the secret store
+2. Restore the configured fallback policy (staging/production run with
+   `USE_LOCAL_FALLBACK=false`)
+3. Run the provider health check (`/reconnect` path) and monitor usage for
+   anomalous patterns
 4. Test all AI-dependent functionality
 
 ### Verify
 1. Test all LLM-dependent features work with new key
-2. Verify local fallback still works if Gemini key is unavailable
+2. Verify local fallback still works if the OpenRouter key is unavailable
 3. Test assessment grading, lesson generation, coach advice
 4. Confirm no user data was exposed in AI prompts
 
@@ -412,7 +418,7 @@ Incidents are classified by severity:
 ### Revoke/Rotate
 1. Rotate all leaked credentials immediately
 2. Rotate the bot token if it appeared in logs
-3. Rotate the Gemini API key if it appeared in logs
+3. Rotate the OpenRouter API key if it appeared in logs
 4. Rotate any database passwords found in logs
 5. Update any other exposed secrets
 

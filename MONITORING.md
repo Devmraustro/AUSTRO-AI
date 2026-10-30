@@ -19,8 +19,8 @@ Records per-request metrics:
 - `run_id`: Unique request identifier
 - `capability`: AI capability used (chat, coaching, tutoring, etc.)
 - `category`: High-level category (personal_development, learning, etc.)
-- `provider`: `gemini` or `local-fallback`
-- `model`: Model name (e.g., `gemini-2.5-flash`)
+- `provider`: `openrouter` or `local` (deterministic fallback)
+- `model`: Model name (e.g., `google/gemma-4-31b-it:free`)
 - `latency_ms`: End-to-end latency
 - `success`: Boolean success flag
 - `retry_count`: Number of retries attempted
