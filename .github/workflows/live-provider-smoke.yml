@@ -27,6 +27,7 @@ jobs:
           import os
           import re
           import sys
+          import time
           import urllib.error
           import urllib.request
 
@@ -93,9 +94,38 @@ jobs:
                       print("OpenRouter chat completion: FAIL (unexpected response; body suppressed)")
                       failures.append("OpenRouter API")
               except urllib.error.HTTPError as exc:
-                  # Do not print response body; it may echo request metadata.
-                  print(f"OpenRouter chat completion: FAIL (HTTP {exc.code}; body suppressed)")
-                  failures.append("OpenRouter API")
+                  # 429 means the key authenticated but the model/account is
+                  # rate limited: report the (non-secret) Retry-After hint and
+                  # retry once with a bounded wait, so a throttled free tier
+                  # is distinguishable from a broken setup.
+                  if exc.code == 429:
+                      retry_after = (exc.headers.get("Retry-After") or "").strip()
+                      try:
+                          delay = max(1, min(int(retry_after or "30"), 60))
+                      except ValueError:
+                          delay = 30
+                      print(f"OpenRouter chat completion: HTTP 429 (Retry-After={retry_after or 'not given'}; body suppressed); retrying once in {delay}s")
+                      time.sleep(delay)
+                      try:
+                          with urllib.request.urlopen(req, timeout=30) as response:
+                              data = json.loads(response.read())
+                          choices = data.get("choices")
+                          if isinstance(choices, list) and choices and isinstance(choices[0].get("message"), dict):
+                              print(f"OpenRouter chat completion: PASS (model={model}; on retry; output suppressed)")
+                          else:
+                              print("OpenRouter chat completion: FAIL (unexpected response on retry; body suppressed)")
+                              failures.append("OpenRouter API")
+                      except urllib.error.HTTPError as exc2:
+                          retry_after2 = (exc2.headers.get("Retry-After") or "").strip()
+                          print(f"OpenRouter chat completion: FAIL (HTTP {exc2.code}; retry_after={retry_after2}; body suppressed)")
+                          failures.append("OpenRouter API")
+                      except Exception as exc2:
+                          print(f"OpenRouter chat completion: FAIL ({type(exc2).__name__} on retry; details suppressed)")
+                          failures.append("OpenRouter API")
+                  else:
+                      # Do not print response body; it may echo request metadata.
+                      print(f"OpenRouter chat completion: FAIL (HTTP {exc.code}; body suppressed)")
+                      failures.append("OpenRouter API")
               except Exception as exc:
                   print(f"OpenRouter chat completion: FAIL ({type(exc).__name__}; details suppressed)")
                   failures.append("OpenRouter API")
