@@ -35,7 +35,7 @@ Each step lists the command or file to use and what "done" means.
 ## REQUIRES LIVE CREDENTIALS (operator)
 
 - [ ] **3. Obtain a real Telegram `BOT_TOKEN`** from @BotFather.
-- [ ] **4. Obtain a real `GEMINI_API_KEY`** for the Google Gemini project.
+- [ ] **4. Obtain a real `OPENROUTER_API_KEY`** from the OpenRouter dashboard.
 - [ ] **5. Run the live Telegram E2E** exactly per `TELEGRAM_E2E_PROCEDURE.md`
   (onboarding → goals → habits → plans → study → knowledge upload + RAG Q&A →
   memory → coaching → reminders → memory export/forget (coach menu) → error/rate-limit UX).
@@ -113,12 +113,12 @@ Each step lists the command or file to use and what "done" means.
 ## HARDENING (after E2E passes)
 
 - [x] **9. Fix the misleading "Using local fallback." warning** in
-  `app/ai/gemini.py` — ✅ **verified done (2026-10-02)**.
+  `app/ai/gateway.py` — ✅ **verified done (2026-10-02)**.
   `fallback_status()` now reports the *configured* state instead of claiming a
   fallback already happened: `"Local AI fallback is enabled."` when
   `USE_LOCAL_FALLBACK` is on, otherwise an explicit
   `"Local AI fallback is disabled; the gateway will return its safe built-in
-  response if Gemini is unavailable."` The string `"Using local fallback."` no
+  response if OpenRouter is unavailable."` The string `"Using local fallback."` no
   longer exists in the codebase. Covered by `tests/test_architecture.py` for
   the enabled case, the disabled case, and for timeout / connection / error
   paths not logging a false fallback claim.

@@ -56,7 +56,7 @@ services:
       AUSTRO_LOG_LEVEL: ${STAGING_LOG_LEVEL:-INFO}
       # Production-like security parity: real provider path, no local fallback.
       USE_LOCAL_FALLBACK: "false"
-      GEMINI_API_KEY: ${GEMINI_API_KEY:?set GEMINI_API_KEY in .env.staging}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?set OPENROUTER_API_KEY in .env.staging}
       # Dedicated staging bot (from @BotFather) - never the production token.
       BOT_TOKEN: ${BOT_TOKEN:?set the staging BOT_TOKEN in .env.staging}
       # Dedicated staging webhook URL + secret (configuration only today:

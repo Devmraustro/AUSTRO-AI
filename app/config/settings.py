@@ -35,11 +35,7 @@ class Settings:
     logs_path: str
     backups_path: str
 
-    gemini_api_key: str
-    gemini_model: str = "gemini-2.5-flash"
-    gemini_api_url: str = "https://generativelanguage.googleapis.com/v1beta/models"
-    # Secondary cloud provider (failover target when Gemini is quota-limited
-    # or transiently failing). Enabled purely by the presence of a key.
+    # OpenRouter is the sole cloud AI provider. An empty key is permitted in development/test so deterministic local fallback remains usable.
     openrouter_api_key: str = ""
     openrouter_model: str = "google/gemma-4-31b-it:free"
     openrouter_api_url: str = "https://openrouter.ai/api/v1"
@@ -148,10 +144,6 @@ class Settings:
     knowledge_claim_worker_id: str = ""
 
     @property
-    def has_gemini_key(self) -> bool:
-        return bool(self.gemini_api_key) and len(self.gemini_api_key) >= 10
-
-    @property
     def has_openrouter_key(self) -> bool:
         return bool(self.openrouter_api_key) and len(self.openrouter_api_key) >= 10
 
@@ -201,12 +193,6 @@ def load_settings() -> Settings:
         db_path=db_path,
         logs_path=str(logs_dir),
         backups_path=str(backups_dir),
-        gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
-        gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
-        gemini_api_url=os.getenv(
-            "GEMINI_API_URL",
-            "https://generativelanguage.googleapis.com/v1beta/models",
-        ),
         openrouter_api_key=os.getenv("OPENROUTER_API_KEY", ""),
         openrouter_model=os.getenv(
             "OPENROUTER_MODEL", "google/gemma-4-31b-it:free"

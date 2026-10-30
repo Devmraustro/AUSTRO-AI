@@ -463,7 +463,7 @@ def main() -> None:
     """Main function to start the bot"""
     logger.info("Starting AUSTRO AI Bot...")
     logger.info("=" * 50)
-    logger.info("AI Engine: Google Gemini Flash 2.5 (FREE)")
+    logger.info("AI Engine: OpenRouter (local fallback configured)")
     logger.info("Cost: 1500 requests/day FREE")
     logger.info("Environment: %s", settings.environment)
     # The runtime long-polls; WEBHOOK_URL/WEBHOOK_SECRET are validated config

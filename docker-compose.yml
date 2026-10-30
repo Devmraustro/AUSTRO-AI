@@ -9,7 +9,7 @@
 # development / DR drills and must NOT be used for production persistence.
 #
 # Run: docker compose --env-file .env up -d
-# REQUIRED .env values: BOT_TOKEN, GEMINI_API_KEY, DB_PASSWORD, WEBHOOK_URL,
+# REQUIRED .env values: BOT_TOKEN, OPENROUTER_API_KEY, DB_PASSWORD, WEBHOOK_URL,
 #                       WEBHOOK_SECRET, DB_HOST
 
 services:
@@ -20,7 +20,7 @@ services:
     container_name: austro-app
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
-      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
       AUSTRO_ENVIRONMENT: production
       AUSTRO_LOG_LEVEL: WARNING
       USE_LOCAL_FALLBACK: "false"

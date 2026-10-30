@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 from app.ai.gateway import AIGateway
-from app.config.prompts import GEMINI_SYSTEM_PROMPT
+from app.config.prompts import AUSTRO_SYSTEM_PROMPT
 from app.domain.ai import AIRequest
 from app.knowledge.domains import system_prompt_for
 from app.memory.conversation import ConversationMemory
@@ -59,7 +59,7 @@ class ChatService:
         request = AIRequest(
             capability="chat",
             prompt=prompt,
-            system_prompt=system_prompt_for(system_key) or GEMINI_SYSTEM_PROMPT,
+            system_prompt=system_prompt_for(system_key) or AUSTRO_SYSTEM_PROMPT,
             max_tokens=1024,
             user_id=user_id,
             data={"message": message, "context": system_key,

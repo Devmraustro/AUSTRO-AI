@@ -60,7 +60,7 @@ ISOLATED_KEYS = (
     "DB_NAME",
     "DB_USER",
     "DB_PASSWORD",
-    "GEMINI_API_KEY",
+    "OPENROUTER_API_KEY",
 )
 
 PASS = "PASS"

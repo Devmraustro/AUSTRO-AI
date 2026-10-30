@@ -44,7 +44,7 @@ Required in `.env.staging` (the stack refuses to start without them, and
 | `AUSTRO_ENVIRONMENT` | `staging` |
 | `STAGING_ID` | non-empty, e.g. `staging-1` |
 | `BOT_TOKEN` | the **second** bot's token from @BotFather |
-| `GEMINI_API_KEY` | a staging key (parity with production) |
+| `OPENROUTER_API_KEY` | an OpenRouter staging key (parity with production) |
 | `WEBHOOK_URL` / `WEBHOOK_SECRET` | staging values, secret ≥ 16 characters, different from production |
 | `DB_HOST` / `DB_PORT` / `DB_NAME` / `DB_USER` / `DB_PASSWORD` | a **dedicated staging** database; `DB_NAME` must contain `staging`/`uat`/`sbx`/`preprod` |
 
@@ -56,7 +56,7 @@ committed. Never commit the real file.
 At startup, staging additionally requires:
 
 * `DB_ENGINE=postgresql`
-* `USE_LOCAL_FALLBACK=false` and a non-empty `GEMINI_API_KEY`
+* `USE_LOCAL_FALLBACK=false` and a non-empty `OPENROUTER_API_KEY`
 * a non-placeholder bot token (CI/demo tokens are rejected)
 * `TELEGRAM_TRANSPORT=polling` (the only implemented transport)
 * a dedicated, staging-marked database name — `austro_ai` is rejected

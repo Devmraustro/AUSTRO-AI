@@ -129,10 +129,33 @@ def test_deprecated_backup_wrapper_fails_closed_without_key(tmp_path):
     database contact or archive write.
     """
     import os
+    import sys
 
     env = {k: v for k, v in os.environ.items()
            if k not in ("BACKUP_ENCRYPTION_ENABLED", "BACKUP_ENCRYPTION_KEY_FILE")}
     env.update({"DB_HOST": "127.0.0.1", "DB_PORT": "1"})
+    if os.name == "nt":
+        # The wrapper execs `python3`; on Windows, Git Bash would otherwise
+        # resolve the extensionless WindowsApps python3 stub. Put an
+        # extensionless #!/bin/sh shim ahead of PATH that re-execs the same
+        # interpreter running this test, so the real wrapper logic is what
+        # gets exercised on every platform.
+        def msys_path(p):
+            s = str(p)
+            if len(s) > 2 and s[1] == ":":
+                return "/" + s[0].lower() + s[2:].replace("\\", "/")
+            return s.replace("\\", "/")
+
+        shim = tmp_path / "py3shim"
+        shim.mkdir()
+        shim_script = shim / "python3"
+        shim_script.write_text(
+            "#!/bin/sh\n"
+            'exec "' + msys_path(sys.executable) + '" "$@"\n',
+            encoding="utf-8",
+        )
+        shim_script.chmod(0o755)
+        env["PATH"] = str(shim) + os.pathsep + env.get("PATH", "")
     outdir = tmp_path / "backups"
     result = subprocess.run(
         ["bash", str(REPO_ROOT / "scripts" / "backup.sh"), str(outdir)],

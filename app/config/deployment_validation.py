@@ -10,7 +10,8 @@ The two environments are treated deliberately differently:
 | Check                          | production | staging | Why                                        |
 |--------------------------------|-----------|---------|--------------------------------------------|
 | local fallback disabled        | required   | required| parity: a real AI provider path is tested   |
-| Gemini API key configured      | required   | required| parity: same failure modes                 |
+| OpenRouter API key configured      | required   | required| parity: same failure modes                 |
+| OpenRouter https endpoint + model | required   | required| key never crosses the wire unencrypted     |
 | webhook URL + secret configured| required   | required| parity: secrets wired the same way          |
 | PostgreSQL engine              | -          | required| staging always runs against a real PG       |
 | database name                  | -          | required| must be a dedicated, staging-marked DB      |
@@ -27,6 +28,7 @@ Rather than silently ignoring a webhook configuration, an unsupported
 
 from __future__ import annotations
 
+import re
 from typing import List
 
 PRODUCTION = "production"
@@ -52,6 +54,32 @@ def _transport_violations(transport: str, environment: str) -> List[str]:
     return []
 
 
+def _ai_provider_violations(settings, environment: str) -> List[str]:
+    """OpenRouter endpoint/model sanity for any deployed environment.
+
+    A non-TLS base URL would send the API key in the clear, and a malformed
+    model identifier fails at request time instead of at startup.
+    """
+    violations: List[str] = []
+    url = (settings.openrouter_api_url or "").strip()
+    if not url.startswith("https://") or "@" in url:
+        violations.append(
+            f"{environment} environment requires OPENROUTER_API_URL to be an "
+            f"https:// URL without embedded credentials, got '{url or '<empty>'}'"
+        )
+    model = (settings.openrouter_model or "").strip()
+    if not _MODEL_ID_RE.fullmatch(model):
+        violations.append(
+            f"{environment} environment requires a valid OPENROUTER_MODEL "
+            "identifier (vendor/model, no whitespace), "
+            f"got '{model or '<empty>'}'"
+        )
+    return violations
+
+
+_MODEL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,120}(:free)?")
+
+
 def production_violations(settings) -> List[str]:
     """Rules for `AUSTRO_ENVIRONMENT=production` (unchanged behaviour)."""
     violations: List[str] = []
@@ -72,13 +100,12 @@ def production_violations(settings) -> List[str]:
         violations.append(
             "production environment should not use local fallback (USE_LOCAL_FALLBACK=false)"
         )
-    if not settings.gemini_api_key and not getattr(
-        settings, "openrouter_api_key", ""
-    ):
+    if not getattr(settings, "openrouter_api_key", ""):
         violations.append(
-            "production environment requires GEMINI_API_KEY or OPENROUTER_API_KEY "
+            "production environment requires OPENROUTER_API_KEY "
             "to be set"
         )
+    violations.extend(_ai_provider_violations(settings, "production"))
     return violations
 
 
@@ -95,9 +122,9 @@ def staging_violations(settings) -> List[str]:
             "staging environment must disable local fallback for production "
             "parity (USE_LOCAL_FALLBACK=false)"
         )
-    if settings.gemini_api_key == "":
+    if not getattr(settings, "openrouter_api_key", ""):
         violations.append(
-            "staging environment requires GEMINI_API_KEY to be set "
+            "staging environment requires OPENROUTER_API_KEY to be set "
             "(production parity)"
         )
     if not settings.webhook_url:
@@ -143,6 +170,7 @@ def staging_violations(settings) -> List[str]:
             "dedicated staging bot from @BotFather"
         )
     violations.extend(_transport_violations(settings.telegram_transport, "staging"))
+    violations.extend(_ai_provider_violations(settings, "staging"))
     return violations
 
 

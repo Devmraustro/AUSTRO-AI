@@ -11,7 +11,7 @@ import tempfile
 _FAKE_TOKEN = "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken"
 
 os.environ.setdefault("BOT_TOKEN", _FAKE_TOKEN)
-os.environ.setdefault("GEMINI_API_KEY", "")
+os.environ.setdefault("OPENROUTER_API_KEY", "")
 os.environ["DB_PATH"] = os.path.join(tempfile.mkdtemp(), "smoke.db")
 
 import main as app_module  # noqa: E402

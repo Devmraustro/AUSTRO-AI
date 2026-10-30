@@ -14,7 +14,7 @@ import pathlib
 import tempfile
 
 os.environ.setdefault("BOT_TOKEN", "123456789:TEST-rate-limit-commands-token")
-os.environ["GEMINI_API_KEY"] = ""
+os.environ["OPENROUTER_API_KEY"] = ""
 os.environ["DB_PATH"] = str(
     pathlib.Path(tempfile.gettempdir()) / "austro_ai_test_rate_limit_commands.db"
 )

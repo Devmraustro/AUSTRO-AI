@@ -125,7 +125,7 @@ class AssessmentEngine:
                        count: int) -> List[AssessmentQuestion]:
         try:
             from app.domain.ai import AIRequest
-            from app.config.prompts import GEMINI_STUDY_PROMPT
+            from app.config.prompts import AUSTRO_STUDY_PROMPT
         except Exception:  # pragma: no cover - import is guarded
             return []
         request = AIRequest(
@@ -137,7 +137,7 @@ class AssessmentEngine:
                 "\"concept\": \"\", \"prompt\": \"\", \"options\": [], "
                 "\"answer\": \"\", \"keywords\": [], \"explanation\": \"\"}]}",
             ),
-            system_prompt=GEMINI_STUDY_PROMPT,
+            system_prompt=AUSTRO_STUDY_PROMPT,
             max_tokens=1200, temperature=0.2, user_id=owner_user_id,
             data={"objective": objective.get("title")},
         )

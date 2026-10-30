@@ -34,7 +34,7 @@ os.environ.setdefault("AUSTRO_LOG_LEVEL", "WARNING")
 os.environ.setdefault("WEBHOOK_URL", "https://austro.example.com/webhook")
 os.environ.setdefault("WEBHOOK_SECRET", "validate-webhook-secret-12345")
 os.environ.setdefault("USE_LOCAL_FALLBACK", "false")
-os.environ.setdefault("GEMINI_API_KEY", "validate-gemini-key-0000000000")
+os.environ.setdefault("OPENROUTER_API_KEY", "validate-openrouter-key-0000000000")
 os.environ.setdefault("BOT_TOKEN", "123456789:VALIDATE-bot-token-abcdefghij")
 
 import datetime  # noqa: E402
