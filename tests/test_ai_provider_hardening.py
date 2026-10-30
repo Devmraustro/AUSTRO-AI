@@ -17,6 +17,7 @@ AI-2 (reliability: pacing race)
 
 import asyncio
 import dataclasses
+import json
 import os
 import time
 
@@ -50,6 +51,7 @@ def _cfg(**overrides):
 class _Response:
     def __init__(self, status_code=200, payload=None):
         self.status_code = status_code
+        self.headers = {}
         self._payload = payload if payload is not None else {
             "choices": [{"message": {"content": "ok"}}]
         }
@@ -57,10 +59,23 @@ class _Response:
     def json(self):
         return self._payload
 
+    def close(self):
+        pass
+
+    def iter_content(self, chunk_size=None):
+        raw = json.dumps(self._payload).encode("utf-8")
+        for i in range(0, len(raw), max(1, chunk_size or 65536)):
+            yield raw[i:i + (chunk_size or 65536)]
+
 
 def _provider(monkeypatch, behaviour, **cfg_overrides):
-    """Build an available provider; `behaviour(call_index)` returns a response."""
-    monkeypatch.setattr("app.ai.openrouter.requests.get", lambda *a, **k: _Response())
+    """Build an available provider; `behaviour(call_index)` returns a response.
+
+    Both the health check (requests.get) and generation (requests.post) are
+    routed through the same counter function: call 1 is always the health
+    check, every later call is a generation attempt.
+    """
+    monkeypatch.setattr("app.ai.openrouter.requests.get", behaviour)
     monkeypatch.setattr("app.ai.openrouter.requests.post", behaviour)
     provider = OpenRouterProvider(_cfg(**cfg_overrides))
     assert provider.is_available is True, "the health check should have succeeded"

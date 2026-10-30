@@ -21,7 +21,7 @@ import tempfile
 from unittest.mock import AsyncMock, Mock
 
 os.environ.setdefault("BOT_TOKEN", "123456789:TEST-rate-limit-integration-token")
-os.environ["GEMINI_API_KEY"] = ""
+os.environ["OPENROUTER_API_KEY"] = ""
 os.environ["DB_PATH"] = str(pathlib.Path(tempfile.gettempdir()) / "austro_ai_test_rate_limit_integration.db")
 
 import pytest

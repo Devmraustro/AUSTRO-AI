@@ -2,10 +2,10 @@
 AUSTRO AI - AI Gateway.
 
 Routes generation by capability (chat/coaching/tutoring/planning/...), never
-by provider. Enforces bounded timeouts, retries with exponential backoff, a
-OpenRouter primary provider with a graceful local fallback, a graceful local
-fallback and per-run telemetry. The gateway never raises raw networking
-exceptions into the update loop.
+by provider. Enforces bounded timeouts, retries with exponential backoff, an
+OpenRouter primary provider with a graceful local fallback and per-run
+telemetry. The gateway never raises raw networking exceptions into the update
+loop.
 
 Failover rules:
   * Providers are tried in order; a provider is skipped entirely when it is
@@ -39,6 +39,20 @@ from app.domain.ai import AIRequest, AIResponse, UNSUPPORTED_CAPABILITIES
 logger = logging.getLogger(__name__)
 
 _UNAVAILABLE_MESSAGE = "عذراً، الخدمة غير متاحة حالياً. حاول لاحقاً."
+
+
+def _fallback_status(settings_: Settings) -> str:
+    """One-line statement of the configured fallback state for logs.
+
+    Reports whether local fallback is enabled/available without claiming it has
+    already executed.
+    """
+    if settings_.use_local_fallback:
+        return "Local AI fallback is enabled."
+    return (
+        "Local AI fallback is disabled; the gateway will return its safe "
+        "built-in response if OpenRouter is unavailable."
+    )
 
 
 class AIGateway:
@@ -91,7 +105,7 @@ class AIGateway:
             except RateLimitError as exc:
                 logger.warning(
                     f"Rate limit hit for {request.capability}: {exc}. "
-                    "OpenRouter unavailable; using configured fallback"
+                    f"{_fallback_status(self._settings)}"
                 )
                 return None, exc, attempt
             except AIAuthenticationError as exc:
@@ -193,7 +207,7 @@ class AIGateway:
         if not self.provider.is_available:
             if self._settings.use_local_fallback:
                 return "⚠️ OpenRouter غير متاح - الردود المحلية مفعلة"
-            return "⚠️ OpenRouter غير متاح - سيتم إرجاع الرد الآمن الجاهز"
+            return "⚠️ OpenRouter غير متاح - الردود المحلية معطلة؛ سيتم إرجاع الرد الآمن الجاهز"
         remaining = self._settings.max_requests_per_day - self.provider.request_count
         percentage = (remaining / self._settings.max_requests_per_day) * 100
         return (

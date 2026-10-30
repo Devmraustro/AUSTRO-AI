@@ -11,6 +11,7 @@ redaction in raised errors.
 
 import asyncio
 import dataclasses
+import json
 import os
 
 os.environ.setdefault("BOT_TOKEN", "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken")
@@ -48,18 +49,33 @@ def _request():
 
 class _Response:
     def __init__(self, status_code=200, payload=None, headers=None,
-                 raise_json=False):
+                 raise_json=False, raw=None):
         self.status_code = status_code
         self._payload = payload if payload is not None else {
             "choices": [{"message": {"content": "or-ok"}}]
         }
         self._raise_json = raise_json
         self.headers = headers or {}
+        if raw is not None:
+            self._raw = raw
+        elif raise_json:
+            # Invalid JSON bytes: mirrors an upstream that answers 200 with a
+            # broken body (the old json() double, now streamed).
+            self._raw = b'{"choices": [{"message": {"content"'
+        else:
+            self._raw = json.dumps(self._payload).encode("utf-8")
 
     def json(self):
         if self._raise_json:
             raise ValueError("malformed json")
         return self._payload
+
+    def close(self):
+        pass
+
+    def iter_content(self, chunk_size=None):
+        for i in range(0, len(self._raw), max(1, chunk_size or 65536)):
+            yield self._raw[i:i + (chunk_size or 65536)]
 
 
 def _or_payload(text="or-ok"):
@@ -227,10 +243,61 @@ async def test_connection_failure_raises_provider_error(monkeypatch):
 @pytest.mark.asyncio
 async def test_malformed_json_raises_provider_error(monkeypatch):
     provider = _provider(
-        monkeypatch, lambda *a, **k: _Response(raise_json=True)
+        monkeypatch, lambda *a, **k: _Response(raw=b'{"choices": no json')
     )
     with pytest.raises(AIProviderError, match="Malformed JSON"):
         await provider.generate(_request())
+
+
+@pytest.mark.asyncio
+async def test_oversized_response_body_is_refused(monkeypatch):
+    """A hostile/broken upstream cannot push unbounded bytes into memory.
+
+    The provider reads at most _MAX_RESPONSE_BYTES of a 200 body; anything
+    larger is an AIProviderError, never an OOM or a hang.
+    """
+    from app.ai.openrouter import _MAX_RESPONSE_BYTES
+    blob = b'{"choices": [{"message": {"content": "' + b"x" * _MAX_RESPONSE_BYTES
+    provider = _provider(monkeypatch, lambda *a, **k: _Response(raw=blob))
+    with pytest.raises(AIProviderError, match="exceeds the size limit"):
+        await provider.generate(_request())
+    assert provider.is_available is True, "a size-cap refusal is not permanent"
+
+
+@pytest.mark.asyncio
+async def test_oversized_content_length_is_refused_without_reading(monkeypatch):
+    declared = {"n": 0}
+
+    class _Huge:
+        status_code = 200
+        headers = {"Content-Length": str(50 * 1024 * 1024)}
+
+        def iter_content(self, chunk_size=None):  # must never be reached
+            declared["n"] += 1
+            raise AssertionError("oversized Content-Length must fail closed")
+
+    provider = _provider(monkeypatch, lambda *a, **k: _Huge())
+    with pytest.raises(AIProviderError, match="exceeds the size limit"):
+        await provider.generate(_request())
+    assert declared["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_body_read_failure_is_provider_error(monkeypatch):
+    def behaviour(*args, **kwargs):
+        class _Broken:
+            status_code = 200
+            headers = {}
+
+            def iter_content(self, chunk_size=None):
+                raise requests.exceptions.ConnectionError("reset mid-body")
+
+        return _Broken()
+
+    provider = _provider(monkeypatch, behaviour)
+    with pytest.raises(AIProviderError, match="body read failed"):
+        await provider.generate(_request())
+    assert provider.is_available is True
 
 
 @pytest.mark.asyncio

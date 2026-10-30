@@ -1,5 +1,5 @@
 """
-AUSTRO AI - OpenRouter provider (secondary cloud provider).
+AUSTRO AI - OpenRouter provider (sole cloud provider).
 
 Async provider for the OpenRouter chat-completions endpoint
 (`POST {base}/chat/completions`). Network I/O runs on a worker thread
@@ -18,6 +18,7 @@ could echo the key back is redacted before it is raised.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import time
@@ -42,6 +43,10 @@ _MAX_OUTPUT_TOKENS_CAP = 2048
 
 #: HTTP statuses treated as transient for bounded gateway retries.
 _TRANSIENT_STATUS = {408, 500, 502, 503, 504}
+
+#: Hard cap on the upstream response body that may be buffered, so a broken
+#: or hostile endpoint cannot push unbounded bytes into memory.
+_MAX_RESPONSE_BYTES = 1 * 1024 * 1024
 
 
 def _redact(text: str, key: str) -> str:
@@ -186,18 +191,19 @@ class OpenRouterProvider(AIProvider):
                 headers=headers,
                 json=payload,
                 timeout=self._settings.ai_request_timeout,
+                # Streaming keeps the body read behind the same bounded-read
+                # cap as the parse step below.
+                stream=True,
             )
             self._count_request()
 
             if response.status_code == 200:
-                try:
-                    data = response.json()
-                except ValueError as exc:
-                    raise AIProviderError("Malformed JSON from OpenRouter") from exc
+                data = await asyncio.to_thread(self._bounded_payload, response)
                 return self._extract_text(data)
 
             if response.status_code in (401, 403):
                 # Credentials are wrong/revoked: fail over, do not retry.
+                response.close()
                 self._available = False
                 raise AIAuthenticationError(
                     f"OpenRouter rejected credentials (HTTP {response.status_code})"
@@ -205,6 +211,7 @@ class OpenRouterProvider(AIProvider):
 
             if response.status_code == 429:
                 retry_after = response.headers.get("Retry-After", "")
+                response.close()
                 self._available = False
                 detail = f"Retry-After={retry_after}" if retry_after else "no Retry-After"
                 raise RateLimitError(
@@ -216,10 +223,12 @@ class OpenRouterProvider(AIProvider):
                 raise AIProviderError(_redact(f"OpenRouter 400: {message}", key))
 
             if response.status_code in _TRANSIENT_STATUS:
+                response.close()
                 raise AIProviderError(
                     f"OpenRouter transient HTTP {response.status_code}"
                 )
 
+            response.close()
             raise AIProviderError(f"OpenRouter HTTP {response.status_code}")
 
         except requests.exceptions.Timeout as exc:
@@ -244,9 +253,55 @@ class OpenRouterProvider(AIProvider):
             raise AIProviderError("OpenRouter returned empty content")
         return text
 
-    def _error_message(self, response, key: str) -> str:
+    def _bounded_bytes(self, response) -> bytes:
+        """Read a response body with a hard byte cap.
+
+        A declared Content-Length beyond the cap fails before reading; the
+        streamed read fails as soon as the cap is exceeded, so a hostile or
+        broken endpoint can never buffer unbounded bytes. Runs on a worker
+        thread (the callers use asyncio.to_thread), keeping the event loop
+        untouched.
+        """
+        declared = ""
         try:
-            payload = response.json()
+            declared = (response.headers.get("Content-Length") or "").strip()
+            if declared and int(declared) > _MAX_RESPONSE_BYTES:
+                raise AIProviderError("OpenRouter response body exceeds the size limit")
+        except ValueError:
+            declared = ""
+        chunks = []
+        received = 0
+        try:
+            for chunk in response.iter_content(chunk_size=65536):
+                if chunk:
+                    received += len(chunk)
+                    if received > _MAX_RESPONSE_BYTES:
+                        raise AIProviderError(
+                            "OpenRouter response body exceeds the size limit"
+                        )
+                    chunks.append(chunk)
+        except AIProviderError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - diagnostics only
+            raise AIProviderError(_redact(
+                f"OpenRouter body read failed: {type(exc).__name__}",
+                self._settings.openrouter_api_key,
+            )) from exc
+        return b"".join(chunks)
+
+    def _bounded_payload(self, response) -> dict:
+        """Parse the success body read under the hard byte cap."""
+        try:
+            return json.loads(self._bounded_bytes(response).decode("utf-8"))
+        except AIProviderError:
+            raise
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise AIProviderError("Malformed JSON from OpenRouter") from exc
+
+    def _error_message(self, response, key: str) -> str:
+        """Read a (small) provider error body under the same byte cap."""
+        try:
+            payload = json.loads(self._bounded_bytes(response).decode("utf-8"))
             message = payload.get("error", {})
             if isinstance(message, dict):
                 message = message.get("message", "")

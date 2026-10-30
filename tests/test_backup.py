@@ -917,10 +917,25 @@ def _fake_tool(directory: Path, name: str = "pg_dump") -> Path:
     return tool
 
 
+def _path_tool(directory: Path, name: str = "pg_dump") -> Path:
+    """A fake tool resolvable through PATH on every supported platform.
+
+    POSIX resolves an executable extensionless file; Windows `shutil.which`
+    consults PATHEXT, so on win32 the fixture also writes a `.bat` twin and
+    the lookup is expected to return that one.
+    """
+    tool = _fake_tool(directory, name)
+    if os.name != "nt":
+        return tool
+    bat = directory / (name + ".bat")
+    bat.write_text("@exit /b 0\r\n", encoding="utf-8")
+    return bat
+
+
 def test_find_tool_uses_path_when_pg_bin_is_unset(monkeypatch, tmp_path):
     """Regression: the backup image sets no PG_BIN. The old lookup checked
     relative paths only, so a valid pg_dump on PATH was reported missing."""
-    tool = _fake_tool(tmp_path / "bin")
+    tool = _path_tool(tmp_path / "bin")
     monkeypatch.delenv("PG_BIN", raising=False)
     monkeypatch.setenv("PATH", str(tool.parent))
     assert pg_backup.find_tool("pg_dump") == tool
@@ -949,7 +964,7 @@ def test_restore_drill_resolves_psql_from_path_without_pg_bin(monkeypatch, tmp_p
     (the backup image) the restore failed with 'Could not find psql'."""
     from scripts import pg_restore_drill
 
-    tool = _fake_tool(tmp_path / "bin", name="psql")
+    tool = _path_tool(tmp_path / "bin", name="psql")
     monkeypatch.delenv("PG_BIN", raising=False)
     monkeypatch.setenv("PATH", str(tool.parent))
     assert pg_restore_drill.find_tool("psql") == tool

@@ -8,30 +8,30 @@ copy in one place.
 from __future__ import annotations
 
 from app.config.prompts import (
-    GEMINI_COACH_PROMPT,
-    GEMINI_CYBER_PROMPT,
-    GEMINI_ENGLISH_PROMPT,
-    GEMINI_PROGRAMMING_PROMPT,
-    GEMINI_STUDY_PROMPT,
-    GEMINI_SYSTEM_PROMPT,
+    AUSTRO_COACH_PROMPT,
+    AUSTRO_CYBER_PROMPT,
+    AUSTRO_ENGLISH_PROMPT,
+    AUSTRO_PROGRAMMING_PROMPT,
+    AUSTRO_STUDY_PROMPT,
+    AUSTRO_SYSTEM_PROMPT,
 )
 
 # system_key -> system prompt
 SYSTEM_PROMPTS_BY_SYSTEM = {
-    "general": GEMINI_SYSTEM_PROMPT,
-    "goal_system": GEMINI_SYSTEM_PROMPT,
-    "smart_planner": GEMINI_SYSTEM_PROMPT,
-    "discipline_mode": GEMINI_SYSTEM_PROMPT,
-    "study_mode": GEMINI_STUDY_PROMPT,
-    "english_mode": GEMINI_ENGLISH_PROMPT,
-    "programming_mode": GEMINI_PROGRAMMING_PROMPT,
-    "cybersecurity_mode": GEMINI_CYBER_PROMPT,
-    "productivity_mode": GEMINI_SYSTEM_PROMPT,
-    "habit_builder": GEMINI_SYSTEM_PROMPT,
-    "knowledge_assistant": GEMINI_SYSTEM_PROMPT,
-    "progress_tracker": GEMINI_SYSTEM_PROMPT,
-    "ai_coach": GEMINI_COACH_PROMPT,
-    "life_dashboard": GEMINI_SYSTEM_PROMPT,
+    "general": AUSTRO_SYSTEM_PROMPT,
+    "goal_system": AUSTRO_SYSTEM_PROMPT,
+    "smart_planner": AUSTRO_SYSTEM_PROMPT,
+    "discipline_mode": AUSTRO_SYSTEM_PROMPT,
+    "study_mode": AUSTRO_STUDY_PROMPT,
+    "english_mode": AUSTRO_ENGLISH_PROMPT,
+    "programming_mode": AUSTRO_PROGRAMMING_PROMPT,
+    "cybersecurity_mode": AUSTRO_CYBER_PROMPT,
+    "productivity_mode": AUSTRO_SYSTEM_PROMPT,
+    "habit_builder": AUSTRO_SYSTEM_PROMPT,
+    "knowledge_assistant": AUSTRO_SYSTEM_PROMPT,
+    "progress_tracker": AUSTRO_SYSTEM_PROMPT,
+    "ai_coach": AUSTRO_COACH_PROMPT,
+    "life_dashboard": AUSTRO_SYSTEM_PROMPT,
 }
 
 DOMAIN_DESCRIPTIONS = {
@@ -52,4 +52,4 @@ DOMAIN_DESCRIPTIONS = {
 
 
 def system_prompt_for(system_key: str) -> str:
-    return SYSTEM_PROMPTS_BY_SYSTEM.get(system_key, GEMINI_SYSTEM_PROMPT)
+    return SYSTEM_PROMPTS_BY_SYSTEM.get(system_key, AUSTRO_SYSTEM_PROMPT)

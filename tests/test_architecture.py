@@ -10,7 +10,6 @@ import dataclasses
 import logging
 
 import pytest
-import requests
 
 from app.ai.gateway import AIGateway
 from app.config.settings import settings

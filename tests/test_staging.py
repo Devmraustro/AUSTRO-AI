@@ -45,7 +45,9 @@ def _settings(**overrides):
         environment="staging",
         log_level="INFO",
         use_local_fallback=False,
-        gemini_api_key="gemini-key-for-tests",
+        openrouter_api_key="openrouter-key-for-tests",
+        openrouter_api_url="https://openrouter.ai/api/v1",
+        openrouter_model="google/gemma-4-31b-it:free",
         webhook_url="https://staging.example.com/webhook",
         webhook_secret="staging-webhook-secret",
         staging_id="staging-1",
@@ -83,7 +85,7 @@ class TestStagingValidationRules:
                       use_local_fallback=True))) == 1
         assert len(dv.production_violations(
             _settings(environment="production", log_level="WARNING",
-                      gemini_api_key=""))) == 1
+                      openrouter_api_key=""))) == 1
 
     def test_production_ignores_staging_only_rules(self):
         """A production deploy must not be forced to satisfy staging rules."""
@@ -97,7 +99,13 @@ class TestStagingValidationRules:
 
     @pytest.mark.parametrize("field,value,needle", [
         ("use_local_fallback", True, "local fallback"),
-        ("gemini_api_key", "", "GEMINI_API_KEY"),
+        ("openrouter_api_key", "", "OPENROUTER_API_KEY"),
+        ("openrouter_api_url", "http://openrouter.example/api/v1",
+         "https:// URL without embedded credentials"),
+        ("openrouter_api_url", "https://user:key@openrouter.example/api/v1",
+         "https:// URL without embedded credentials"),
+        ("openrouter_model", "", "valid OPENROUTER_MODEL"),
+        ("openrouter_model", "vendor   model  with spaces", "valid OPENROUTER_MODEL"),
         ("webhook_url", "", "WEBHOOK_URL"),
         ("webhook_secret", "", "WEBHOOK_SECRET"),
         ("staging_id", "", "AUSTRO_STAGING_ID"),
@@ -184,7 +192,7 @@ class TestStagingComposeIsolation:
         assert env["USE_LOCAL_FALLBACK"] == "false"
         assert env["DB_ENGINE"] == "postgresql"
         assert env["TELEGRAM_TRANSPORT"] == "polling"
-        for key in ("AUSTRO_STAGING_ID", "BOT_TOKEN", "GEMINI_API_KEY", "DB_NAME",
+        for key in ("AUSTRO_STAGING_ID", "BOT_TOKEN", "OPENROUTER_API_KEY", "DB_NAME",
                     "DB_USER", "DB_PASSWORD", "WEBHOOK_URL", "WEBHOOK_SECRET"):
             assert key in env, key
 
@@ -252,7 +260,7 @@ class TestStagingEnvTemplate:
             if stripped.startswith("#") or "=" not in stripped:
                 continue
             key, _, value = stripped.partition("=")
-            if key.strip() in ("BOT_TOKEN", "DB_PASSWORD", "GEMINI_API_KEY",
+            if key.strip() in ("BOT_TOKEN", "DB_PASSWORD", "OPENROUTER_API_KEY",
                                "WEBHOOK_SECRET"):
                 assert value.strip() == "", f"{key} must be blank in the template"
 
@@ -301,7 +309,7 @@ class TestValidationHarness:
                 text = " ".join(argv)
                 if "docker-compose.staging.yml" in text:
                     assert "--env-file" in text, text
-                for forbidden in ("BOT_TOKEN=", "DB_PASSWORD=", "GEMINI_API_KEY=",
+                for forbidden in ("BOT_TOKEN=", "DB_PASSWORD=", "OPENROUTER_API_KEY=",
                                   "WEBHOOK_SECRET="):
                     assert forbidden not in text, text
 
@@ -512,7 +520,7 @@ class TestSmokeTestReusability:
             "DB_ENGINE": "sqlite",
             "DB_PATH": str(tmp_path / "smoke_staging.db"),
             "BOT_TOKEN": "123456789:AAstagingSmokeToken0000000000",
-            "GEMINI_API_KEY": "staging-gemini-key-for-tests",
+            "OPENROUTER_API_KEY": "staging-openrouter-key-for-tests",
             "WEBHOOK_URL": "https://staging.example.com/webhook",
             "WEBHOOK_SECRET": "staging-webhook-secret",
             "TELEGRAM_TRANSPORT": "polling",
@@ -520,7 +528,8 @@ class TestSmokeTestReusability:
         })
         proc = subprocess.run([sys.executable, "scripts/smoke_test.py"],
                               cwd=str(REPO_ROOT), capture_output=True, text=True,
-                              env=env, timeout=600)
+                              env=env, timeout=600, encoding="utf-8",
+                              errors="replace")
         output = proc.stdout + proc.stderr
         # sqlite is not a valid staging engine, so the battery must fail closed
         assert proc.returncode != 0
@@ -539,7 +548,7 @@ class TestSmokeTestReusability:
             "USE_LOCAL_FALLBACK": "false",
             "DB_ENGINE": "sqlite",
             "DB_PATH": str(tmp_path / "smoke_prod.db"),
-            "GEMINI_API_KEY": "smoke-gemini-key-0000000000",
+            "OPENROUTER_API_KEY": "smoke-openrouter-key-0000000000",
             "WEBHOOK_URL": "https://smoke.example.com/webhook",
             "WEBHOOK_SECRET": "smoke-webhook-secret-0000000",
             "PYTHONIOENCODING": "utf-8",
@@ -547,7 +556,8 @@ class TestSmokeTestReusability:
         env.setdefault("BOT_TOKEN", "123456789:ABCdefgh-DummyToken")
         proc = subprocess.run([sys.executable, "scripts/smoke_test.py"],
                               cwd=str(REPO_ROOT), capture_output=True, text=True,
-                              env=env, timeout=600)
+                              env=env, timeout=600, encoding="utf-8",
+                              errors="replace")
         output = proc.stdout + proc.stderr
         assert "FAILURES PRESENT" not in output, output
         assert "SMOKE RESULT: ALL 8 COLD-START CHECKS PASSED (production)" in output

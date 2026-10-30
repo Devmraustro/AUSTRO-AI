@@ -24,7 +24,7 @@ REMINDER-3 (data correctness)
 import os
 
 os.environ.setdefault("BOT_TOKEN", "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken")
-os.environ["GEMINI_API_KEY"] = ""
+os.environ["OPENROUTER_API_KEY"] = ""
 
 from datetime import datetime
 from unittest.mock import AsyncMock, Mock

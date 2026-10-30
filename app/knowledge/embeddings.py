@@ -16,7 +16,6 @@ import re
 from typing import List, Optional
 
 from app.config.settings import Settings
-from app.core.errors import AIProviderError
 
 logger = logging.getLogger(__name__)
 
