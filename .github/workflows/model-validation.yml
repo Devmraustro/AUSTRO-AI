@@ -1,0 +1,177 @@
+name: Model Validation (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      models:
+        description: 'Comma-separated OpenRouter model ids to validate'
+        required: false
+        default: 'nvidia/nemotron-3-ultra-550b-a55b:free,nvidia/nemotron-3.5-lightning:free'
+
+# Credential check only. Never starts the bot, never touches data.
+permissions: {}
+
+concurrency:
+  group: model-validation
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: OpenRouter model validation round
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Run fixed validation suite
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          MODELS: ${{ github.event.inputs.models }}
+        run: |
+          python - <<'PY'
+          import io, json, os, re, sys, time
+          import urllib.request, urllib.error
+
+          sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+          key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+          models = [m.strip() for m in os.environ.get("MODELS", "").split(",") if m.strip()]
+          if not key:
+              print("ABORT: OPENROUTER_API_KEY missing")
+              sys.exit(2)
+          ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
+          HEADERS = {"Authorization": "Bearer " + key,
+                     "Content-Type": "application/json",
+                     "HTTP-Referer": "https://github.com/Devmraustro/AUSTRO-AI",
+                     "X-Title": "AUSTRO model validation"}
+
+          LONGCTX = ("الفصل الأول: كان الرمز السري في الفصل الأول هو AR-4921، وقد سُجل في دفتر "
+                     "الحارس الرئيسي قبل شروق الشمس. " * 40
+                     + "الفصل الثاني: أعقب ذلك رحلة طويلة عبر الهضاب العليا حيث عُثر على أطلال "
+                     "قديمة؛ وثّق الباحثون أن عدد الأطلال المسجلة في السجل الجديد بلغ 172 موقعاً "
+                     "قبل نهاية الموسم. " * 160
+                     + "الفصل الثالث: في الليلة الأخيرة من الحملة، كتب المرافق في مذكراته أن اسم "
+                     "الحارس الأخير الذي أغلق بوابات الموقع كان يوسف، ثم خُتم التقرير وخُتم "
+                     "بشهادتين. " * 120)
+          QUESTIONS = ("بناءً على النص السابق فقط، أجب بإيجاز شديد عن ثلاثة أسئلة:\n"
+                       "1) ما الرمز السري المذكور في الفصل الأول؟\n"
+                       "2) كم عدد الأطلال المسجلة في السجل الجديد؟\n"
+                       "3) ما اسم الحارس الأخير الذي أغلق بوابات الموقع؟")
+          TESTS = [
+            {"id": "arabic_quality", "max_tokens": 700, "prompt":
+             "اشرح بالعربية الفصحى الفرق بين النحو والصرف في اللغة العربية. "
+             "استخدم عنوانين (عنوان للنحو وعنوان للصرف)، واذكر تحت كل عنوان "
+             "تعريفًا في سطر واحد ثم مثالين مرقّمين. اجعل الرد منظّمًا ودقيقًا ودون حشو."},
+            {"id": "algerian_arabic", "max_tokens": 700, "prompt":
+             "شنو الفرق بين 'زعما' و'كاش كاش' في الدارجة الجزائرية؟ عطيني مثال واقعي "
+             "على كل وحدة، وجاوبني بالدارجة الجزائرية طبيعية ماشي فصحى."},
+            {"id": "programming", "max_tokens": 800, "prompt":
+             "ما الخطأ في هذا الكود البايثوني؟ ما الناتج الفعلي عند تنفيذ السطرين "
+             "الأخيرين ولماذا؟ أعطني التصحيح الصحيح ثم اختبره ذهنياً:\n\n"
+             "def add_item(item, items=[]):\n    items.append(item)\n    return items\n\n"
+             "print(add_item(1))\nprint(add_item(2))"},
+            {"id": "reasoning", "max_tokens": 600, "prompt":
+             "قطار يغادر الجزائر العاصمة الساعة 09:15 بسرعة 90 كم/س باتجاه وهران، وقطار "
+             "آخر يغادر وهران الساعة 10:00 بسرعة 120 كم/س باتجاه الجزائر العاصمة. المسافة "
+             "بين المدينتين 400 كم ويسيران على مسار مستقيم. في أي ساعة ودقيقة يلتقي "
+             "القطران؟ اشرح خطوات الحل باختصار ثم أعط النتيجة النهائية بصيغة ساعة:دقيقة."},
+            {"id": "instruction_following", "max_tokens": 1500, "prompt":
+             "اكتب فقرة عن فوائد النوم بشرط: خمس جمل بالضبط، الجملة الأولى تبدأ بحرف "
+             "'ا'، والثانية بحرف 'ب'، والثالثة بحرف 'ت'، والرابعة بحرف 'س'، والخامسة "
+             "بحرف 'م'، ويجب أن ترد كلمة 'تركيز' في الجملة الثالثة بالذات، وممنوق ذكر "
+             "كلمة 'قهوة' إطلاقًا، وأن تنتهي الفقرة بكلمة 'ريحة'. لا تكتب أي شيء آخر "
+             "غير الفقرة."},
+            {"id": "hallucination", "max_tokens": 400, "prompt":
+             "من مؤلف كتاب 'أسرار الحضارة المفقودة في شمال إفريقيا' الذي صدر عام 1994؟ "
+             "أجب باسم المؤلف فقط إن كنت متأكدًا، وإلا فصرّح بوضوح أنك لا تستطيع التحقق."},
+            {"id": "long_context", "max_tokens": 300, "prompt": None},
+            {"id": "structured_output", "max_tokens": 400, "prompt":
+             "أعد JSON صالحًا فقط (بدون أي نص أو أسوار كود) بهذا الشكل تمامًا: كائن واحد "
+             'فيه المفتاح "users" وقيمته قائمة من 3 كائنات، كل كائن فيه "name" نص، '
+             '"age" عدد صحيح، "active" قيمة منطقية، و"skills" قائمة نصوص من عنصرين على '
+             "الأقل. اجعل الاسم الأول 'أمين'."},
+          ]
+          COT_MARKERS = re.compile(
+              r"(We need to|Let me|I'?ll (?:start|begin)|First, I|Step 1:|The user wants|"
+              "Okay, |Hmm, |Let's think|As an AI|### ?Plan|plan:)", re.I)
+
+          def call(model, prompt, max_tokens):
+              payload = {"model": model,
+                         "messages": [{"role": "user", "content": prompt}],
+                         "temperature": 0, "max_tokens": max_tokens}
+              body = json.dumps(payload).encode("utf-8")
+              req = urllib.request.Request(ENDPOINT, data=body, headers=HEADERS, method="POST")
+              started = time.perf_counter()
+              rec = {"outcome": "exception", "detail": "", "latency_s": None,
+                     "text": None, "finish_reason": None, "msg_keys": [],
+                     "cot_leak": False}
+              try:
+                  with urllib.request.urlopen(req, timeout=120) as resp:
+                      data = json.loads(resp.read())
+                  rec["latency_s"] = round(time.perf_counter() - started, 2)
+                  ch = (data.get("choices") or [{}])[0]
+                  msg = ch.get("message") or {}
+                  rec["msg_keys"] = sorted(msg.keys())
+                  text = msg.get("content")
+                  rec["finish_reason"] = ch.get("finish_reason")
+                  if isinstance(text, str) and text.strip():
+                      rec["text"] = text
+                      rec["outcome"] = "ok"
+                      rec["cot_leak"] = bool(COT_MARKERS.search(text))
+                  else:
+                      rec["outcome"] = ("truncated_empty" if ch.get("finish_reason") == "length"
+                                        else "provider_empty")
+                  rec["detail"] = "http_200"
+              except urllib.error.HTTPError as exc:
+                  rec["latency_s"] = round(time.perf_counter() - started, 2)
+                  rec["outcome"] = {429: "rate_429", 401: "auth",
+                                    402: "payment_required", 403: "forbidden"
+                                    }.get(exc.code, "server_5xx" if 500 <= exc.code < 600
+                                          else f"http_{exc.code}")
+                  rec["detail"] = f"http_{exc.code}"
+              except Exception as exc:
+                  rec["latency_s"] = round(time.perf_counter() - started, 2)
+                  rec["outcome"] = "timeout" if "timed out" in str(exc).lower() else "connection_error"
+                  rec["detail"] = type(exc).__name__
+              return rec
+
+          out = open("validation-results.jsonl", "a", encoding="utf-8")
+          fatal = None
+          for model in models:
+              for t in TESTS:
+                  prompt = t["prompt"] if t["prompt"] else LONGCTX + "\n\n" + QUESTIONS
+                  for attempt in (1, 2):
+                      rec = call(model, prompt, t["max_tokens"])
+                      rec.update({"model": model, "test": t["id"], "attempt": attempt})
+                      out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                      out.flush()
+                      print(f"{model} {t['id']} a{attempt}: {rec['outcome']} "
+                            f"({rec['latency_s']}s, finish={rec['finish_reason']}, "
+                            f"cot_leak={rec['cot_leak']}, keys={rec['msg_keys']})",
+                            flush=True)
+                      if rec["outcome"] == "auth":
+                          fatal = "auth rejected (401): key invalid for this account"
+                          break
+                      if rec["outcome"] in ("rate_429", "server_5xx", "timeout",
+                                            "connection_error", "truncated_empty",
+                                            "provider_empty") and attempt < 2:
+                          time.sleep(30)
+                          continue
+                      break
+                  if fatal:
+                      break
+                  time.sleep(3)
+              if fatal:
+                  break
+              print(f"--- model done: {model} ---", flush=True)
+              time.sleep(8)
+          out.close()
+          if fatal:
+              print("ABORT:", fatal)
+              sys.exit(2)
+          print("VALIDATION ROUND COMPLETE")
+          PY
+
+      - name: Upload raw results (JSONL)
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-results-${{ github.run_id }}
+          path: validation-results.jsonl
+          if-no-files-found: error
