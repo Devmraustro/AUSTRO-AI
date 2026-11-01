@@ -1020,3 +1020,133 @@ async def test_reconnect_during_inflight_request_documents_reconciliation(monkey
     assert provider.is_available is True
     await provider.generate(_request())
     assert provider._daily_used == 11
+
+
+# --------------------------------------------------------------------------- #
+# Finding 1: generate() vs concurrent state transitions (deterministic)       #
+# --------------------------------------------------------------------------- #
+async def test_generate_racing_key_snapshot_is_arbitrated_by_reservation(monkeypatch):
+    """A /key snapshot landing between the advisory check and the reservation
+    is handled by the authoritative gate: exhausting the quota in the race
+    window means the request is refused by the reservation, never admitted."""
+    init_key = _Response(payload={
+        "data": {"free_model_daily_requests": {"used": 0, "limit": 2}}
+    })  # healthy at advisory time (0/2)
+    racing_key = {"data": {"free_model_daily_requests": {"used": 2, "limit": 2}}}
+
+    def behaviour(url, **kwargs):
+        return _Response(payload=_ok_payload("ok", model="google/gemma-4-31b-it:free"))
+
+    provider = _provider(monkeypatch, behaviour, key_response=init_key)
+
+    async def racing_pacing():
+        # ...the snapshot lands in the race window, exhausting the quota
+        provider._parse_key_quota(racing_key)
+
+    monkeypatch.setattr(provider, "_rate_limit", racing_pacing)
+    with pytest.raises(RateLimitError, match="Daily quota"):
+        await provider.generate(_request())
+
+
+async def test_generate_racing_utc_rollover_is_arbitrated_by_reservation(monkeypatch):
+    """A UTC rollover landing in the race window re-opens the quota: the
+    reservation admits the request against the rolled-over (empty) counter."""
+    def behaviour(url, **kwargs):
+        return _Response(payload=_ok_payload("ok", model="google/gemma-4-31b-it:free"))
+
+    provider = _provider(monkeypatch, behaviour)
+    provider._daily_used = provider._settings.max_requests_per_day
+    provider._daily_limit = provider._settings.max_requests_per_day
+    provider._daily_exhausted = True  # exhausted "today"...
+    yesterday = "2000-01-01"
+    provider._quota_date = yesterday  # ...but the counter belongs to yesterday
+
+    async def rolling_pacing():
+        # the date flips back in the race window: the rollover is applied
+        provider._quota_date = provider._utc_today()
+
+    monkeypatch.setattr(provider, "_rate_limit", rolling_pacing)
+    request = _request()
+    assert await provider.generate(request) == "ok"
+    assert provider._daily_used == 1, "the rolled-over day starts fresh"
+
+
+async def test_exhaustion_in_race_window_is_refused_by_reservation(monkeypatch):
+    """Exhaustion appearing inside the race window must be caught by the
+    authoritative reservation, not only by the advisory fast-fail."""
+    def behaviour(url, **kwargs):
+        return _Response(payload=_ok_payload("ok", model="google/gemma-4-31b-it:free"))
+
+    provider = _provider(monkeypatch, behaviour)
+    provider._daily_limit = 2
+    provider._daily_used = 2
+    provider._daily_exhausted = False  # advisory snapshot is still stale-healthy
+
+    async def exhausting_pacing():
+        provider._daily_exhausted = True  # exhausts before the reservation
+
+    monkeypatch.setattr(provider, "_rate_limit", exhausting_pacing)
+    with pytest.raises(RateLimitError):
+        await provider.generate(_request())
+    assert provider._daily_used == 2, "no slot may be reserved past the limit"
+
+
+# --------------------------------------------------------------------------- #
+# Finding 2: strict numeric validation                                        #
+# --------------------------------------------------------------------------- #
+def test_quota_number_accepts_only_integer_counts():
+    import math
+    accept = (0, 1, 50, 2**40, 5.0, 0.0)
+    for v in accept:
+        assert OpenRouterProvider._quota_number(v), v
+    reject = (True, False, 5.9, -0.5, float("nan"), float("inf"),
+              float("-inf"), "5", None, [5], {"used": 1}, 5 + 0j)
+    for v in reject:
+        assert not OpenRouterProvider._quota_number(v), repr(v)
+    # sanity: the accepted integral float survives int() losslessly
+    assert int(5.0) == 5 and math.isfinite(5.0)
+
+
+def test_snapshot_fractional_and_nonfinite_are_rejected_wholesale(monkeypatch):
+    """Fractional usage/limit and NaN/Infinity snapshots are rejected as a
+    pair: (date, used, limit, exhausted) must remain exactly as before."""
+    provider = _provider(monkeypatch, lambda url, **k: _Response())
+    provider._daily_used = 17
+    provider._daily_limit = 50
+    provider._daily_exhausted = False
+    before = (provider._quota_date, 17, 50, False)
+
+    cases = [
+        {"data": {"free_model_daily_requests": {"used": 5.9, "limit": 80}}},
+        {"data": {"free_model_daily_requests": {"used": 5, "limit": 80.5}}},
+        {"data": {"free_model_daily_requests": {"used": float("nan"), "limit": 80}}},
+        {"data": {"free_model_daily_requests": {"used": 5, "limit": float("inf")}}},
+        {"data": {"free_model_daily_requests": {"used": float("-inf"), "limit": 80}}},
+        {"data": {"free_model_daily_requests": {
+            "used": 5.0, "limit": 80.0}}},  # finite integral floats are VALID
+    ]
+    for payload in cases[:-1]:
+        provider._parse_key_quota(payload)
+        assert (provider._quota_date, provider._daily_used,
+                provider._daily_limit, provider._daily_exhausted) == before, payload
+
+    # the valid integral-float snapshot IS applied (intentional support)
+    provider._parse_key_quota(cases[-1])
+    assert (provider._daily_used, provider._daily_limit, provider._daily_exhausted) == (5, 80, False)
+
+
+def test_snapshot_negative_usage_and_zero_limit_rejected(monkeypatch):
+    provider = _provider(monkeypatch, lambda url, **k: _Response())
+    provider._daily_used = 17
+    provider._daily_limit = 50
+    provider._daily_exhausted = False
+    before = (provider._quota_date, 17, 50, False)
+
+    for payload in (
+        {"data": {"free_model_daily_requests": {"used": -1, "limit": 80}}},
+        {"data": {"free_model_daily_requests": {"used": 5, "limit": -80}}},
+        {"data": {"free_model_daily_requests": {"used": 5, "limit": 0}}},
+    ):
+        provider._parse_key_quota(payload)
+        assert (provider._quota_date, provider._daily_used,
+                provider._daily_limit, provider._daily_exhausted) == before, payload

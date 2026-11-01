@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import threading
+import math
 import time
 
 import requests
@@ -163,6 +164,20 @@ class OpenRouterProvider(AIProvider):
     def _cooldown_active(self) -> bool:
         return time.monotonic() < self._cooldown_until
 
+    def _daily_exhausted_snapshot(self) -> bool:
+        """Locked advisory read of the exhausted flag.
+
+        Fast-fail only: the authoritative admission decision is always
+        `_reserve_daily_slot()`, which re-validates the whole daily state
+        under the lock immediately before the HTTP call — so a concurrent
+        `/key` snapshot or UTC rollover landing between this advisory read
+        and the reservation can never admit or reject a request on stale
+        state.
+        """
+        with self._state_lock:
+            self._reset_daily_if_needed_locked()
+            return self._daily_exhausted
+
     def cooldown_remaining(self) -> float:
         """Seconds left in the 429 cooldown (0 = no cooldown)."""
         return max(0.0, self._cooldown_until - time.monotonic())
@@ -218,8 +233,17 @@ class OpenRouterProvider(AIProvider):
 
     @staticmethod
     def _quota_number(value) -> bool:
-        """True for a real quota number; booleans are never numbers here."""
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
+        """Accept only values representing valid non-negative integer counts.
+
+        Integers are accepted (booleans excluded); floats only when finite
+        AND integral (5.0 ok, 5.9, NaN and both infinities rejected) so the
+        later int() conversion can never raise or silently truncate.
+        """
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        if isinstance(value, float):
+            return math.isfinite(value) and value == int(value)
+        return True
 
     def _parse_key_quota(self, payload: dict) -> None:
         """Apply a GET /key quota snapshot, atomically and all-or-nothing.
@@ -396,7 +420,7 @@ class OpenRouterProvider(AIProvider):
                 f"OpenRouter cooling down for another "
                 f"{self.cooldown_remaining():.0f}s after rate limiting"
             )
-        if self._daily_exhausted:
+        if self._daily_exhausted_snapshot():
             raise RateLimitError("Daily free quota exhausted; resets at UTC midnight")
 
         # Pacing happens BEFORE the quota reservation: a task cancelled while
