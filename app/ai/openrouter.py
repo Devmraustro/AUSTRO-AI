@@ -164,20 +164,6 @@ class OpenRouterProvider(AIProvider):
     def _cooldown_active(self) -> bool:
         return time.monotonic() < self._cooldown_until
 
-    def _daily_exhausted_snapshot(self) -> bool:
-        """Locked advisory read of the exhausted flag.
-
-        Fast-fail only: the authoritative admission decision is always
-        `_reserve_daily_slot()`, which re-validates the whole daily state
-        under the lock immediately before the HTTP call — so a concurrent
-        `/key` snapshot or UTC rollover landing between this advisory read
-        and the reservation can never admit or reject a request on stale
-        state.
-        """
-        with self._state_lock:
-            self._reset_daily_if_needed_locked()
-            return self._daily_exhausted
-
     def cooldown_remaining(self) -> float:
         """Seconds left in the 429 cooldown (0 = no cooldown)."""
         return max(0.0, self._cooldown_until - time.monotonic())
@@ -411,8 +397,14 @@ class OpenRouterProvider(AIProvider):
         return payload
 
     async def generate(self, request: AIRequest) -> str:
-        """Call OpenRouter async; raises AUSTRO errors on failure."""
-        self._maybe_reset_daily()
+        """Call OpenRouter async; raises AUSTRO errors on failure.
+
+        Quota admission is decided EXCLUSIVELY by `_reserve_daily_slot()`,
+        the last lock-protected step before the HTTP call: an advisory check
+        here could reject a request on state that a concurrent `/key`
+        snapshot or UTC rollover has already restored (stale rejection), or
+        admit one it has already exhausted. No quota state is read or
+        written before the reservation."""
         if not self._available:
             raise AIProviderError("OpenRouter not available")
         if self._cooldown_active():
@@ -420,18 +412,18 @@ class OpenRouterProvider(AIProvider):
                 f"OpenRouter cooling down for another "
                 f"{self.cooldown_remaining():.0f}s after rate limiting"
             )
-        if self._daily_exhausted_snapshot():
-            raise RateLimitError("Daily free quota exhausted; resets at UTC midnight")
 
         # Pacing happens BEFORE the quota reservation: a task cancelled while
         # waiting to send must not burn a daily slot it never used.
         await self._rate_limit()
 
-        # Atomic reservation: one daily slot, reserved as the last step
-        # before the HTTP call (no await in between, so concurrent tasks
-        # can never exceed the remaining slots). The slot is held even if
-        # the request later fails — conservative accounting when the
-        # provider may have billed it.
+        # Atomic reservation: the FINAL quota admission decision, executed as
+        # the last step before the HTTP call (no await in between, so
+        # concurrent tasks can never exceed the remaining slots). It re-rolls
+        # the UTC date and re-checks exhaustion under the lock, honoring any
+        # concurrent /key snapshot or rollover - never a stale rejection. The
+        # slot is held even if the request later fails - conservative
+        # accounting when the provider may have billed it.
         self._reserve_daily_slot()
 
         key = self._settings.openrouter_api_key

@@ -358,7 +358,7 @@ async def test_daily_quota_seeded_from_key_endpoint(monkeypatch):
     assert provider._daily_exhausted is True  # 50/50 used
     assert provider.request_count == 1, "lifetime stats counted the response"
     assert provider.is_available is False
-    with pytest.raises(RateLimitError, match="Daily free quota exhausted"):
+    with pytest.raises(RateLimitError, match="Daily quota exceeded"):
         await provider.generate(_request())
 
 
@@ -931,7 +931,6 @@ async def test_rollover_racing_snapshot_and_reservation_stays_consistent(monkeyp
     provider = _provider(
         monkeypatch, behaviour, key_response=key_resp, min_request_interval=0.0,
     )
-    real_utc_today = OpenRouterProvider._utc_today
     sequence = ["2000-01-01", "2000-01-01", "2000-01-01",
                 "2000-01-02", "2000-01-02", "2000-01-02"]
     flipping = {"i": 0}
@@ -966,14 +965,14 @@ async def test_rollover_racing_snapshot_and_reservation_stays_consistent(monkeyp
         mixed_worker(i) for i in range(4)
     ]), timeout=30)
 
-    today = real_utc_today()
-    assert provider._quota_date in (today, "2000-01-02")  # never yesterday's state
-    if provider._quota_date == today:
-        assert provider._daily_used >= 0
-        if provider._daily_used >= provider._effective_daily_limit():
-            assert provider._daily_exhausted is True
-        else:
-            assert provider._daily_exhausted is False
+    # the quota date must be one the mocked clock actually produced, and
+    # the exhausted flag must be consistent with the usage it governs
+    assert provider._quota_date in ("2000-01-01", "2000-01-02")
+    with provider._state_lock:
+        if provider._daily_limit > 0:
+            assert provider._daily_exhausted == (
+                provider._daily_used >= provider._daily_limit
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -1188,3 +1187,91 @@ def test_snapshot_negative_usage_and_zero_limit_rejected(monkeypatch):
         provider._parse_key_quota(payload)
         assert (provider._quota_date, provider._daily_used,
                 provider._daily_limit, provider._daily_exhausted) == before, payload
+
+
+# --------------------------------------------------------------------------- #
+# Stale-state regressions: reservation is the ONLY admission decision         #
+# --------------------------------------------------------------------------- #
+async def test_exhausted_snapshot_then_utc_rollover_admits(monkeypatch):
+    """Exhausted on day D + the clock advancing to D+1 inside the pacing
+    window: the reservation (not any earlier check) must arbitrate - the
+    rollover re-opens the quota and the request succeeds."""
+    clock = {"today": "2030-01-01"}
+    monkeypatch.setattr(
+        OpenRouterProvider, "_utc_today", staticmethod(lambda: clock["today"])
+    )
+
+    post_calls = {"n": 0}
+
+    def behaviour(url, **kwargs):
+        post_calls["n"] += 1
+        return _Response(payload=_ok_payload("ok", model="google/gemma-4-31b-it:free"))
+
+    provider = _provider(
+        monkeypatch, behaviour, key_response=_Response(payload={"data": {}}),
+    )
+    # exhausted on day D, arranged under the state lock
+    _arrange_quota_state(provider, date="2030-01-01", used=2, limit=2,
+                         exhausted=True)
+    assert provider.is_available is False
+
+    async def rollover_pacing():
+        # the UTC day advances strictly inside the pacing window
+        clock["today"] = "2030-01-02"
+
+    monkeypatch.setattr(provider, "_rate_limit", rollover_pacing)
+
+    request = _request()
+    assert await provider.generate(request) == "ok"
+    assert provider._quota_date == "2030-01-02"
+    assert provider._daily_used == 1, "exactly one slot reserved on the new day"
+    assert provider._daily_exhausted is False
+    assert post_calls["n"] == 1
+
+
+async def test_exhausted_snapshot_then_key_update_admits(monkeypatch):
+    """Exhausted locally + a valid non-exhausted /key snapshot landing inside
+    the pacing window: the reservation honors the account's truth and the
+    request succeeds."""
+    def behaviour(url, **kwargs):
+        return _Response(payload=_ok_payload("ok", model="google/gemma-4-31b-it:free"))
+
+    provider = _provider(monkeypatch, behaviour)
+    _arrange_quota_state(provider, date=provider._utc_today(), used=2, limit=2,
+                         exhausted=True)
+
+    async def key_update_pacing():
+        provider._parse_key_quota({"data": {
+            "free_model_daily_requests": {"used": 1, "limit": 5}
+        }})
+
+    monkeypatch.setattr(provider, "_rate_limit", key_update_pacing)
+
+    request = _request()
+    assert await provider.generate(request) == "ok"
+    assert provider._daily_used == 2, "seeded 1 + exactly one reserved slot"
+    assert provider._daily_exhausted is False
+    assert provider._daily_limit == 5
+
+
+async def test_still_exhausted_at_reservation_is_refused(monkeypatch):
+    """Quota exhausted with nothing restoring it: the authoritative
+    reservation refuses - zero HTTP requests, no additional reservation."""
+    post_calls = {"n": 0}
+
+    def behaviour(url, **kwargs):
+        post_calls["n"] += 1
+        return _Response(payload=_ok_payload("ok", model="google/gemma-4-31b-it:free"))
+
+    provider = _provider(monkeypatch, behaviour)
+    _arrange_quota_state(provider, date=provider._utc_today(), used=2, limit=2,
+                         exhausted=True)
+
+    async def noop_pacing():
+        return None
+
+    monkeypatch.setattr(provider, "_rate_limit", noop_pacing)
+    with pytest.raises(RateLimitError, match="Daily quota"):
+        await provider.generate(_request())
+    assert post_calls["n"] == 0
+    assert provider._daily_used == 2, "no additional reservation happened"
