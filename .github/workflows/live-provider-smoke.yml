@@ -62,8 +62,14 @@ jobs:
           if not key:
               print("OpenRouter chat completion: FAIL (repository secret OPENROUTER_API_KEY missing)")
               failures.append("OPENROUTER_API_KEY")
-          elif not re.fullmatch(r"[A-Za-z0-9._:/-]{1,200}", model):
-              print("OpenRouter chat completion: FAIL (invalid model identifier)")
+          elif not (
+              model == "openrouter/free"
+              or re.fullmatch(
+                  r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*:free",
+                  model,
+              )
+          ):
+              print("OpenRouter chat completion: FAIL (free models only; invalid model identifier)")
               failures.append("OpenRouter model")
           else:
               payload = json.dumps({
