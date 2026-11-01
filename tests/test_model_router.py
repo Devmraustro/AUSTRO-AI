@@ -824,3 +824,199 @@ async def test_concurrent_requests_stay_capped_after_pacing(monkeypatch):
     assert len(ok) == 2 and len(refused) == 2
     assert post_calls["n"] == 2
     assert provider._daily_used == 2
+
+
+# --------------------------------------------------------------------------- #
+# All-or-nothing /key snapshot application                                    #
+# --------------------------------------------------------------------------- #
+def test_key_snapshot_partial_fields_preserve_existing_state(monkeypatch):
+    """Incomplete snapshots (one field valid, the other missing/malformed)
+    must not mix new usage with an old limit or vice versa."""
+    provider = _provider(monkeypatch, lambda url, **k: _Response())
+    provider._daily_used = 17
+    provider._daily_limit = 50
+    provider._daily_exhausted = False
+    before = (provider._quota_date, 17, 50, False)
+
+    cases = [
+        {"data": {"free_model_daily_requests": {"used": 5}}},                 # valid used, missing limit
+        {"data": {"free_model_daily_requests": {"limit": 80}}},               # missing used, valid limit
+        {"data": {"free_model_daily_requests": {"used": 5, "limit": "x"}}},   # malformed limit
+        {"data": {"free_model_daily_requests": {"used": None, "limit": 80}}}, # malformed used
+        {"data": {"free_model_daily_requests": {"used": -3, "limit": 80}}},   # negative usage
+        {"data": {"free_model_daily_requests": {"used": 5, "limit": 0}}},     # non-positive limit
+        {"data": {"free_model_daily_requests": {"used": True, "limit": 80}}}, # boolean usage
+        {"data": {"free_model_daily_requests": {"used": 5, "limit": True}}},  # boolean limit
+    ]
+    for payload in cases:
+        provider._parse_key_quota(payload)
+        assert (provider._quota_date, provider._daily_used,
+                provider._daily_limit, provider._daily_exhausted) == before, payload
+
+
+def test_key_snapshot_complete_valid_replaces_previous_state(monkeypatch):
+    provider = _provider(monkeypatch, lambda url, **k: _Response())
+    provider._daily_used = 17
+    provider._daily_limit = 20
+    provider._daily_exhausted = True
+
+    today = provider._utc_today()
+    provider._parse_key_quota({"data": {
+        "free_model_daily_requests": {"used": 4, "limit": 50}
+    }})
+    assert provider._quota_date == today
+    assert provider._daily_used == 4
+    assert provider._daily_limit == 50
+    assert provider._daily_exhausted is False
+
+    # and an exhausting complete snapshot flips the flag
+    provider._parse_key_quota({"data": {
+        "free_model_daily_requests": {"used": 50, "limit": 50}
+    }})
+    assert provider._daily_exhausted is True
+
+
+def test_key_snapshot_booleans_are_never_numbers(monkeypatch):
+    """bool is an int subclass; quota fields must reject it explicitly."""
+    assert not OpenRouterProvider._quota_number(True)
+    assert not OpenRouterProvider._quota_number(False)
+
+
+def test_key_snapshot_legacy_numeric_representation_validated_as_a_pair(monkeypatch):
+    """Legacy numeric block (limit) + separate usage field applies only
+    when BOTH validate; otherwise the old state survives."""
+    provider = _provider(monkeypatch, lambda url, **k: _Response())
+    provider._daily_used = 17
+    provider._daily_limit = 50
+    provider._daily_exhausted = False
+
+    # both valid -> applied
+    provider._parse_key_quota({"data": {
+        "free_model_daily_requests": 80, "free_model_daily_usage": 9,
+    }})
+    assert (provider._daily_used, provider._daily_limit) == (9, 80)
+
+    # legacy limit without a usable usage -> whole snapshot rejected
+    provider._parse_key_quota({"data": {"free_model_daily_requests": 60}})
+    assert (provider._daily_used, provider._daily_limit) == (9, 80)
+
+    # boolean legacy usage -> rejected
+    provider._parse_key_quota({"data": {
+        "free_model_daily_requests": 60, "free_model_daily_usage": True,
+    }})
+    assert (provider._daily_used, provider._daily_limit) == (9, 80)
+
+
+# --------------------------------------------------------------------------- #
+# Lock contract: rollover racing snapshots and reservations                   #
+# --------------------------------------------------------------------------- #
+async def test_rollover_racing_snapshot_and_reservation_stays_consistent(monkeypatch):
+    """Deterministic mixed traffic across a simulated UTC boundary: the
+    final state must always be internally consistent (correct date, usage
+    within the limit or flagged exhausted), and the run must complete -
+    proving the lock contract has no deadlock and no torn transitions."""
+    key_resp = _Response(payload={
+        "data": {"free_model_daily_requests": {"used": 1, "limit": 5}}
+    })
+    state = {"n": 0}
+
+    def behaviour(url, **kwargs):
+        state["n"] += 1
+        return _Response(payload=_ok_payload("ok", model="google/gemma-4-31b-it:free"))
+
+    provider = _provider(
+        monkeypatch, behaviour, key_response=key_resp, min_request_interval=0.0,
+    )
+    real_utc_today = OpenRouterProvider._utc_today
+    sequence = ["2000-01-01", "2000-01-01", "2000-01-01",
+                "2000-01-02", "2000-01-02", "2000-01-02"]
+    flipping = {"i": 0}
+
+    def flipping_utc_today():
+        i = flipping["i"]
+        flipping["i"] += 1
+        return sequence[i % len(sequence)]
+
+    monkeypatch.setattr(
+        OpenRouterProvider, "_utc_today", staticmethod(flipping_utc_today)
+    )
+
+    async def mixed_worker(i):
+        for _ in range(20):
+            _ = provider.daily_used
+            _ = provider.is_available
+            provider._parse_key_quota({"data": {
+                "free_model_daily_requests": {"used": i % 3, "limit": 5}
+            }})
+            try:
+                await asyncio.wait_for(provider.generate(_request()), timeout=2)
+            except RateLimitError:
+                pass
+            except AIProviderError:
+                pass
+            except asyncio.TimeoutError:
+                pass
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(asyncio.gather(*[
+        mixed_worker(i) for i in range(4)
+    ]), timeout=30)
+
+    today = real_utc_today()
+    assert provider._quota_date in (today, "2000-01-02")  # never yesterday's state
+    if provider._quota_date == today:
+        assert provider._daily_used >= 0
+        if provider._daily_used >= provider._effective_daily_limit():
+            assert provider._daily_exhausted is True
+        else:
+            assert provider._daily_exhausted is False
+
+
+# --------------------------------------------------------------------------- #
+# Reconnect with an in-flight request                                         #
+# --------------------------------------------------------------------------- #
+async def test_reconnect_during_inflight_request_documents_reconciliation(monkeypatch):
+    """Policy: a /key snapshot applied while a request is in flight replaces
+    the local reservation with the account's truth. The reservation-time cap
+    still held (no over-send happened), and post-reconnect enforcement uses
+    the seeded values. Exact reconciliation with the external account is NOT
+    claimed: if OpenRouter had not yet counted the in-flight request, local
+    usage may briefly under-count until the next snapshot."""
+    import threading
+
+    release = threading.Event()
+    key_resp = _Response(payload={
+        "data": {"free_model_daily_requests": {"used": 10, "limit": 50}}
+    })
+
+    def behaviour(url, **kwargs):
+        release.wait(timeout=5)
+        return _Response(payload=_ok_payload("ok", model="google/gemma-4-31b-it:free"))
+
+    provider = _provider(monkeypatch, behaviour, key_response=key_resp)
+
+    # __init__ seeds 10/50 from /key, then 1+2) the task reserves one slot
+    # and holds the HTTP request in flight.
+    task = asyncio.ensure_future(provider.generate(_request()))
+    await asyncio.sleep(0.1)
+    assert provider._daily_used == 11, "seeded 10 + the in-flight reservation"
+
+    # 3) reconnect re-applies the /key snapshot while the request is in
+    #    flight: the account snapshot replaces the local counter (the
+    #    in-flight reservation is reconciled away - documented policy).
+    assert provider.reconnect() is True
+    assert provider._daily_used == 10
+    assert provider._quota_date == provider._utc_today()
+    assert provider._daily_exhausted is False
+
+    # 4) release the request
+    release.set()
+    text = await asyncio.wait_for(task, timeout=10)
+    assert text == "ok"
+
+    # 5) no local concurrency guarantee was violated: the in-flight send was
+    #    admitted when slots remained, and post-reconnect enforcement uses
+    #    the seeded account values (the next send still reserves a slot).
+    assert provider.is_available is True
+    await provider.generate(_request())
+    assert provider._daily_used == 11

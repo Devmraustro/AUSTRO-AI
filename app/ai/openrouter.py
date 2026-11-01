@@ -113,10 +113,25 @@ class OpenRouterProvider(AIProvider):
         return time.strftime("%Y-%m-%d", time.gmtime())
 
     def _maybe_reset_daily(self) -> None:
-        """Roll the daily quota counter at UTC midnight.
+        """Roll the daily quota counter at UTC midnight (acquires the lock).
 
         Only usage resets: the account's daily limit is stable, so it is kept
         (and refreshed on the next /key health check) rather than forgotten.
+        """
+        with self._state_lock:
+            self._reset_daily_if_needed_locked()
+
+    def _reset_daily_if_needed_locked(self) -> None:
+        """UTC-midnight rollover. Caller MUST hold `_state_lock`.
+
+        Lock ownership contract for the daily-quota state (`_quota_date`,
+        `_daily_used`, `_daily_limit`, `_daily_exhausted`): every transition
+        and every compound snapshot happens under `_state_lock` —
+        `_parse_key_quota` (seeding), `_reserve_daily_slot` (reservation),
+        `is_available` / `daily_used` / `daily_limit` (reads), and this
+        rollover. Single unlocked reads exist only as advisory fast-fails in
+        `generate`; the authoritative decision is always the locked one. No
+        nested acquisition anywhere; the lock is never held across I/O.
         """
         today = self._utc_today()
         if today != self._quota_date:
@@ -134,14 +149,16 @@ class OpenRouterProvider(AIProvider):
     @property
     def daily_used(self) -> int:
         """Requests consumed today (conservative: includes in-flight sends)."""
-        self._maybe_reset_daily()
-        return self._daily_used
+        with self._state_lock:
+            self._reset_daily_if_needed_locked()
+            return self._daily_used
 
     @property
     def daily_limit(self) -> int:
         """Today's effective daily quota (account value or configured cap)."""
-        self._maybe_reset_daily()
-        return self._effective_daily_limit()
+        with self._state_lock:
+            self._reset_daily_if_needed_locked()
+            return self._effective_daily_limit()
 
     def _cooldown_active(self) -> bool:
         return time.monotonic() < self._cooldown_until
@@ -154,12 +171,12 @@ class OpenRouterProvider(AIProvider):
     def is_available(self) -> bool:
         if not self._available:
             return False
-        self._maybe_reset_daily()
-        if self._cooldown_active():
-            return False
-        if self._daily_exhausted:
-            return False
         with self._state_lock:
+            self._reset_daily_if_needed_locked()
+            if self._cooldown_active():
+                return False
+            if self._daily_exhausted:
+                return False
             return self._daily_used < self._effective_daily_limit()
 
     def _apply_rate_limit_headers(self, headers) -> None:
@@ -199,18 +216,24 @@ class OpenRouterProvider(AIProvider):
             f"reset={headers.get('X-RateLimit-Reset', '') if headers else ''})"
         )
 
-    def _parse_key_quota(self, payload: dict) -> None:
-        """Apply a GET /key quota snapshot atomically under `_state_lock`.
+    @staticmethod
+    def _quota_number(value) -> bool:
+        """True for a real quota number; booleans are never numbers here."""
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
 
-        A valid snapshot reflects the account's truth for the CURRENT UTC
-        day: the quota date is synchronized together with the usage, so a
-        reconnect that happens after a UTC rollover cannot have its seeding
-        wiped by a stale-date rollover check. `used < limit` explicitly
-        clears exhaustion (reconnect recovers a prematurely exhausted
-        provider); `used >= limit` sets it. Missing or malformed fields leave
-        the existing state untouched — a bad snapshot never resets valid
-        account state. The lock keeps this atomic against concurrent
-        reservations.
+    def _parse_key_quota(self, payload: dict) -> None:
+        """Apply a GET /key quota snapshot, atomically and all-or-nothing.
+
+        The COMPLETE snapshot (usage AND limit) is validated before any
+        state changes: a snapshot missing or malformed on either side, with
+        negative usage or a non-positive limit, or carrying booleans, is
+        rejected wholesale — the previous valid state survives untouched.
+        Legacy representations (a numeric block as the limit plus a
+        separate usage field) are honoured only when both parts validate.
+        The applied snapshot synchronizes `_quota_date` with the current
+        UTC date in the same critical section, so a reconnect after a UTC
+        rollover cannot have its seeding wiped by a stale-date rollover
+        check; `_daily_exhausted` is recomputed from the validated pair.
         """
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, dict):
@@ -220,28 +243,29 @@ class OpenRouterProvider(AIProvider):
         if isinstance(block, dict):
             used = block.get("used")
             limit = block.get("limit")
-        elif isinstance(block, (int, float)):
+        elif self._quota_number(block):
             limit = block
             used = data.get("free_model_daily_usage")
+        # All-or-nothing: both fields must validate, or nothing is applied.
+        if not (self._quota_number(used) and self._quota_number(limit)):
+            return
+        used_i, limit_i = int(used), int(limit)
+        if used_i < 0 or limit_i <= 0:
+            return
         with self._state_lock:
-            if isinstance(used, (int, float)) and used >= 0:
-                self._quota_date = self._utc_today()
-                self._daily_used = int(used)
-            if isinstance(limit, (int, float)) and limit > 0:
-                self._daily_limit = int(limit)
-            if self._daily_limit > 0:
-                if self._daily_used >= self._daily_limit:
-                    self._daily_exhausted = True
-                    logger.warning(
-                        "OpenRouter daily free quota exhausted "
-                        f"({self._daily_used}/{self._daily_limit}); local fallback"
-                    )
-                else:
-                    self._daily_exhausted = False
-                    logger.info(
-                        f"OpenRouter daily free quota: {self._daily_used}/"
-                        f"{self._daily_limit} used"
-                    )
+            self._quota_date = self._utc_today()
+            self._daily_used = used_i
+            self._daily_limit = limit_i
+            self._daily_exhausted = used_i >= limit_i
+            if self._daily_exhausted:
+                logger.warning(
+                    "OpenRouter daily free quota exhausted "
+                    f"({used_i}/{limit_i}); local fallback"
+                )
+            else:
+                logger.info(
+                    f"OpenRouter daily free quota: {used_i}/{limit_i} used"
+                )
 
     def health_check(self) -> bool:
         """Verify the key against GET /key (blocking; run in a thread).
@@ -326,7 +350,7 @@ class OpenRouterProvider(AIProvider):
         early cooldown. The lock is never held across the network call.
         """
         with self._state_lock:
-            self._maybe_reset_daily()
+            self._reset_daily_if_needed_locked()
             if not self._daily_exhausted and self._daily_used >= self._effective_daily_limit():
                 self._daily_exhausted = True
                 logger.warning(
