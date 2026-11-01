@@ -450,49 +450,53 @@ class OpenRouterProvider(AIProvider):
             )
             self._count_request()
 
-            if response.status_code == 200:
-                data = await asyncio.to_thread(self._bounded_payload, response)
-                text = self._extract_text(data)
-                # Attribute the run to the model that ACTUALLY answered
-                # (OpenRouter reports it on the response), scoped to this
-                # request object so concurrent runs never cross.
-                actual = data.get("model") if isinstance(data, dict) else None
-                if isinstance(actual, str) and actual.strip():
-                    request.data["_actual_model"] = actual.strip()
-                return text
+            try:
+                if response.status_code == 200:
+                    data = await asyncio.to_thread(self._bounded_payload, response)
+                    text = self._extract_text(data)
+                    # Attribute the run to the model that ACTUALLY answered
+                    # (OpenRouter reports it on the response), scoped to this
+                    # request object so concurrent runs never cross.
+                    actual = data.get("model") if isinstance(data, dict) else None
+                    if isinstance(actual, str) and actual.strip():
+                        request.data["_actual_model"] = actual.strip()
+                    return text
 
-            if response.status_code in (401, 403):
-                # Credentials are wrong/revoked: fail over, do not retry.
+                if response.status_code in (401, 403):
+                    # Credentials are wrong/revoked: fail over, do not retry.
+                    self._available = False
+                    raise AIAuthenticationError(
+                        f"OpenRouter rejected credentials (HTTP {response.status_code})"
+                    )
+
+                if response.status_code == 429:
+                    # NOT a permanent outage: start a bounded cooldown seeded
+                    # from Retry-After / rate-limit headers, then recover
+                    # automatically.
+                    headers_map = getattr(response, "headers", {}) or {}
+                    self._apply_rate_limit_headers(headers_map)
+                    retry_after = headers_map.get("Retry-After", "")
+                    detail = f"Retry-After={retry_after}" if retry_after else "no Retry-After"
+                    raise RateLimitError(
+                        _redact(f"OpenRouter rate limited ({detail})", key)
+                    )
+
+                if response.status_code == 400:
+                    message = self._error_message(response, key)
+                    raise AIProviderError(_redact(f"OpenRouter 400: {message}", key))
+
+                if response.status_code in _TRANSIENT_STATUS:
+                    raise AIProviderError(
+                        f"OpenRouter transient HTTP {response.status_code}"
+                    )
+
+                raise AIProviderError(f"OpenRouter HTTP {response.status_code}")
+            finally:
+                # The response is closed exactly once on EVERY path once it
+                # has been received: success after read/extract, JSON parse
+                # failure, stream read failure, size-cap refusal, 400,
+                # 401/403, 429, 5xx and any other exception.
                 response.close()
-                self._available = False
-                raise AIAuthenticationError(
-                    f"OpenRouter rejected credentials (HTTP {response.status_code})"
-                )
-
-            if response.status_code == 429:
-                # NOT a permanent outage: start a bounded cooldown seeded from
-                # Retry-After / rate-limit headers, then recover automatically.
-                headers_map = getattr(response, "headers", {}) or {}
-                response.close()
-                self._apply_rate_limit_headers(headers_map)
-                retry_after = headers_map.get("Retry-After", "")
-                detail = f"Retry-After={retry_after}" if retry_after else "no Retry-After"
-                raise RateLimitError(
-                    _redact(f"OpenRouter rate limited ({detail})", key)
-                )
-
-            if response.status_code == 400:
-                message = self._error_message(response, key)
-                raise AIProviderError(_redact(f"OpenRouter 400: {message}", key))
-
-            if response.status_code in _TRANSIENT_STATUS:
-                response.close()
-                raise AIProviderError(
-                    f"OpenRouter transient HTTP {response.status_code}"
-                )
-
-            response.close()
-            raise AIProviderError(f"OpenRouter HTTP {response.status_code}")
 
         except requests.exceptions.Timeout as exc:
             # Transient: the provider stays available (preserves availability on transient errors).
@@ -505,16 +509,32 @@ class OpenRouterProvider(AIProvider):
                 _redact(f"OpenRouter request failed: {type(exc).__name__}", key)
             ) from exc
 
-    def _extract_text(self, data: dict) -> str:
-        """Pull non-empty assistant text out of a chat-completions response."""
+    def _extract_text(self, data) -> str:
+        """Pull non-empty assistant text out of a chat-completions response.
+
+        The response schema is validated explicitly at every level (JSON
+        object, non-empty `choices` list, dict choice, dict message, string
+        non-empty `content`) so a malformed upstream body becomes a safe
+        `AIProviderError` — never an `AttributeError` or `TypeError` — and
+        no raw response content reaches the error messages.
+        """
+        if not isinstance(data, dict):
+            raise AIProviderError(
+                "OpenRouter returned a malformed response (not a JSON object)"
+            )
         choices = data.get("choices")
         if not isinstance(choices, list) or not choices:
             raise AIProviderError("OpenRouter returned no choices")
-        message = choices[0].get("message") or {}
-        text = (message.get("content") or "").strip()
-        if not text:
+        first = choices[0]
+        if not isinstance(first, dict):
+            raise AIProviderError("OpenRouter returned a malformed choice")
+        message = first.get("message")
+        if not isinstance(message, dict):
+            raise AIProviderError("OpenRouter returned a malformed message")
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
             raise AIProviderError("OpenRouter returned empty content")
-        return text
+        return content
 
     def _bounded_bytes(self, response) -> bytes:
         """Read a response body with a hard byte cap.

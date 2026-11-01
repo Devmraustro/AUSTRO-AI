@@ -21,6 +21,8 @@ import pytest
 import requests
 
 from app.ai.gateway import AIGateway
+from app.ai.local import LocalProvider
+from app.ai.telemetry import AITelemetry
 from app.ai.openrouter import OpenRouterProvider
 from app.config.settings import settings as base_settings
 from app.core.errors import AIAuthenticationError, AIProviderError, RateLimitError
@@ -71,7 +73,7 @@ class _Response:
         return self._payload
 
     def close(self):
-        pass
+        self.closed_count = getattr(self, "closed_count", 0) + 1
 
     def iter_content(self, chunk_size=None):
         for i in range(0, len(self._raw), max(1, chunk_size or 65536)):
@@ -272,6 +274,9 @@ async def test_oversized_content_length_is_refused_without_reading(monkeypatch):
         status_code = 200
         headers = {"Content-Length": str(50 * 1024 * 1024)}
 
+        def close(self):
+            pass
+
         def iter_content(self, chunk_size=None):  # must never be reached
             declared["n"] += 1
             raise AssertionError("oversized Content-Length must fail closed")
@@ -288,6 +293,9 @@ async def test_body_read_failure_is_provider_error(monkeypatch):
         class _Broken:
             status_code = 200
             headers = {}
+
+            def close(self):
+                pass
 
             def iter_content(self, chunk_size=None):
                 raise requests.exceptions.ConnectionError("reset mid-body")
@@ -481,3 +489,192 @@ async def test_pacing_spans_concurrent_calls(monkeypatch):
     assert len(timestamps) == 4
     span = max(timestamps) - min(timestamps)
     assert span >= 3 * 0.05 * 0.8, "paced slots must spread, not burst"
+
+
+
+# --------------------------------------------------------------------------- #
+# Guaranteed response close on every path (try/finally)                       #
+# --------------------------------------------------------------------------- #
+async def test_response_closed_exactly_once_on_success(monkeypatch):
+    holder = {}
+
+    def behaviour(url, **kwargs):
+        holder["response"] = _Response(payload=_or_payload("fine"))
+        return holder["response"]
+
+    provider = _provider(monkeypatch, behaviour)
+    request = _request()
+    assert await provider.generate(request) == "fine"
+    assert holder["response"].closed_count == 1
+
+
+async def test_response_closed_on_json_parse_failure(monkeypatch):
+    holder = {}
+
+    def behaviour(url, **kwargs):
+        holder["response"] = _Response(raise_json=True)
+        return holder["response"]
+
+    provider = _provider(monkeypatch, behaviour)
+    with pytest.raises(AIProviderError):
+        await provider.generate(_request())
+    assert holder["response"].closed_count == 1
+
+
+async def test_response_closed_on_stream_read_failure(monkeypatch):
+    holder = {}
+
+    def behaviour(url, **kwargs):
+        holder["response"] = _Response()
+
+        def broken_iter(chunk_size=None):
+            raise requests.exceptions.ConnectionError("reset mid-body")
+            yield  # pragma: no cover
+
+        holder["response"].iter_content = broken_iter
+        return holder["response"]
+
+    provider = _provider(monkeypatch, behaviour)
+    with pytest.raises(AIProviderError):
+        await provider.generate(_request())
+    assert holder["response"].closed_count == 1
+
+
+async def test_response_closed_on_oversized_body(monkeypatch):
+    from app.ai.openrouter import _MAX_RESPONSE_BYTES
+
+    holder = {}
+
+    def behaviour(url, **kwargs):
+        blob = b'{"choices": [{"message": {"content": "' + b"x" * _MAX_RESPONSE_BYTES
+        holder["response"] = _Response(raw=blob)
+        return holder["response"]
+
+    provider = _provider(monkeypatch, behaviour)
+    with pytest.raises(AIProviderError, match="exceeds the size limit"):
+        await provider.generate(_request())
+    assert holder["response"].closed_count == 1
+
+
+async def test_response_closed_on_http_400(monkeypatch):
+    holder = {}
+
+    def behaviour(url, **kwargs):
+        holder["response"] = _Response(status_code=400)
+        return holder["response"]
+
+    provider = _provider(monkeypatch, behaviour)
+    with pytest.raises(AIProviderError):
+        await provider.generate(_request())
+    assert holder["response"].closed_count == 1
+
+
+async def test_response_closed_on_http_429(monkeypatch):
+    holder = {}
+
+    def behaviour(url, **kwargs):
+        holder["response"] = _Response(
+            status_code=429, headers={"Retry-After": "1"}
+        )
+        return holder["response"]
+
+    provider = _provider(monkeypatch, behaviour)
+    with pytest.raises(RateLimitError):
+        await provider.generate(_request())
+    assert holder["response"].closed_count == 1
+
+
+async def test_response_closed_on_http_5xx(monkeypatch):
+    holder = {}
+
+    def behaviour(url, **kwargs):
+        holder["response"] = _Response(status_code=503)
+        return holder["response"]
+
+    provider = _provider(monkeypatch, behaviour)
+    with pytest.raises(AIProviderError):
+        await provider.generate(_request())
+    assert holder["response"].closed_count == 1
+
+
+async def test_response_closed_on_http_401(monkeypatch):
+    holder = {}
+
+    def behaviour(url, **kwargs):
+        holder["response"] = _Response(status_code=401)
+        return holder["response"]
+
+    provider = _provider(monkeypatch, behaviour)
+    with pytest.raises(AIAuthenticationError):
+        await provider.generate(_request())
+    assert holder["response"].closed_count == 1
+
+
+# --------------------------------------------------------------------------- #
+# Strict response-schema validation                                           #
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("kwargs", [
+    {"payload": {"choices": ["invalid"]}},
+    {"payload": {"choices": [{"message": "invalid"}]}},
+    {"payload": {"choices": [{"message": {"content": []}}]}},
+    {"payload": {"choices": [{"message": {"content": None}}]}},
+    {"payload": {"choices": []}},
+    {"payload": []},
+    {"raw": b"null"},   # top-level JSON null
+])
+async def test_malformed_response_schema_raises_provider_error(monkeypatch, kwargs):
+    """Every malformed upstream body must surface as AIProviderError - never
+    as an AttributeError or TypeError from response-structure access."""
+    def behaviour(url, **kw):
+        return _Response(**kwargs)
+
+    provider = _provider(monkeypatch, behaviour)
+    with pytest.raises(AIProviderError) as excinfo:
+        await provider.generate(_request())
+    assert not isinstance(excinfo.value, (AttributeError, TypeError))
+
+
+async def test_wellformed_response_still_extracts_text(monkeypatch):
+    """Regression: the ordinary valid response keeps extracting text."""
+    def behaviour(url, **kwargs):
+        return _Response(payload=_or_payload("still fine"))
+
+    provider = _provider(monkeypatch, behaviour)
+    request = _request()
+    assert await provider.generate(request) == "still fine"
+
+
+async def test_gateway_falls_back_on_malformed_response_schema(monkeypatch):
+    """A malformed upstream body routes the gateway to the local fallback
+    without crashing the chat pipeline."""
+    def behaviour(url, **kwargs):
+        return _Response(payload={"choices": ["invalid"]})
+
+    provider = _provider(
+        monkeypatch, behaviour,
+        ai_max_retries=0, ai_retry_backoff_base=0.0, min_request_interval=0.0,
+    )
+    gateway = AIGateway(
+        _cfg(**{"ai_max_retries": 0, "ai_retry_backoff_base": 0.0,
+                "min_request_interval": 0.0}),
+        provider=provider, local=LocalProvider(), telemetry=AITelemetry(),
+    )
+    response = await gateway.generate(_request())
+    assert response.metadata.provider == "local", "fallback path engaged"
+    assert response.text
+    assert response.metadata.success is True
+
+
+async def test_gateway_uses_openrouter_on_wellformed_response(monkeypatch):
+    """Regression: a well-formed response keeps the OpenRouter attribution."""
+    def behaviour(url, **kwargs):
+        return _Response(payload=_or_payload("direct answer"))
+
+    provider = _provider(monkeypatch, behaviour)
+    gateway = AIGateway(
+        _cfg(), provider=provider, local=LocalProvider(), telemetry=AITelemetry(),
+    )
+    response = await gateway.generate(_request())
+    assert response.metadata.provider == "openrouter"
+    assert response.text == "direct answer"
+    assert response.metadata.success is True
