@@ -1300,3 +1300,18 @@ async def test_still_exhausted_at_reservation_is_refused(monkeypatch):
         await provider.generate(_request())
     assert post_calls["n"] == 0
     assert _read_daily_used(provider) == 2, "no additional reservation happened"
+
+
+def test_live_provider_smoke_enforces_free_only_model_policy():
+    """The manual live smoke must not bypass the app's free-only model policy."""
+    from pathlib import Path
+
+    workflow = (
+        Path(__file__).resolve().parents[1]
+        / ".github"
+        / "workflows"
+        / "live-provider-smoke.yml"
+    ).read_text(encoding="utf-8")
+    assert 'model == "openrouter/free"' in workflow
+    assert r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*:free" in workflow
+    assert 're.fullmatch(r"[A-Za-z0-9._:/-]{1,200}", model)' not in workflow
