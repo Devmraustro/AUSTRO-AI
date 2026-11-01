@@ -18,6 +18,7 @@ os.environ.setdefault("BOT_TOKEN", "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyTo
 os.environ.setdefault("OPENROUTER_API_KEY", "")
 
 import pytest  # noqa: E402
+import requests  # noqa: E402
 
 from app.ai.gateway import AIGateway  # noqa: E402
 from app.ai.local import LocalProvider  # noqa: E402
@@ -118,13 +119,15 @@ def _request(**kw):
 # --------------------------------------------------------------------------- #
 def test_fallback_models_parse_dedupes_and_strips():
     assert _parse_free_fallback_models(
-        " a:free , a:free , b:free ,  , c:free ", 10
-    ) == ("a:free", "b:free", "c:free")
+        " vendor/a:free , vendor/a:free , vendor/b:free ,  , vendor/c:free ", 10
+    ) == ("vendor/a:free", "vendor/b:free", "vendor/c:free")
 
 
 def test_fallback_models_cap_is_enforced():
-    assert _parse_free_fallback_models("a:free,b:free,c:free", 2) == ("a:free", "b:free")
-    assert _parse_free_fallback_models("a:free,b:free", 0) == ()
+    assert _parse_free_fallback_models("vendor/a:free,vendor/b:free,vendor/c:free", 2) == (
+        "vendor/a:free", "vendor/b:free",
+    )
+    assert _parse_free_fallback_models("vendor/a:free,vendor/b:free", 0) == ()
 
 
 def test_paid_model_is_rejected_at_startup():
@@ -328,28 +331,44 @@ async def test_daily_quota_seeded_from_key_endpoint(monkeypatch):
 
     provider = _provider(monkeypatch, behaviour, key_response=key_resp)
     # health_check ran inside __init__ and seeded state from /key
-    assert provider._quota_limit == 50
-    assert provider._quota_used == 49
-    assert provider.request_count == 49, "restart must not reset real usage"
+    assert provider._daily_limit == 50
+    assert provider._daily_used == 49
+    assert provider.request_count == 0, "lifetime stats stay separate from quota"
     assert provider.is_available is True  # one request left
 
     await provider.generate(_request())
     assert provider._daily_exhausted is True  # 50/50 used
+    assert provider.request_count == 1, "lifetime stats counted the response"
     assert provider.is_available is False
     with pytest.raises(RateLimitError, match="Daily free quota exhausted"):
         await provider.generate(_request())
 
 
-def test_utc_midnight_resets_daily_state(monkeypatch):
-    provider = _provider(monkeypatch, lambda *a, **k: _Response())
-    provider._daily_exhausted = True
-    provider._quota_limit = 50
-    provider._quota_used = 50
-    # simulate the UTC day having rolled over
+async def test_utc_rollover_reopens_quota_and_requests_succeed(monkeypatch):
+    """Seed to the daily limit, roll the UTC day, and prove the provider
+    becomes available again, a new request succeeds, and yesterday's count
+    does not block the new day (while lifetime stats stay separate)."""
+    key_resp = _Response(payload={
+        "data": {"free_model_daily_requests": {"used": 49, "limit": 50}}
+    })
+
+    def behaviour(url, **kwargs):
+        return _Response(payload=_ok_payload("ok", model="google/gemma-4-31b-it:free"))
+
+    provider = _provider(monkeypatch, behaviour, key_response=key_resp)
+    await provider.generate(_request())
+    assert provider._daily_exhausted is True  # 50/50 used on day 1
+
+    # simulate the UTC day rolling over
     provider._quota_date = "2000-01-01"
     assert provider.is_available is True
     assert provider._daily_exhausted is False
-    assert provider._quota_used == 0 and provider._quota_limit == 0
+    assert provider._daily_used == 0
+
+    await provider.generate(_request())
+    assert provider._daily_used == 1, "only today's usage counts"
+    assert provider.request_count == 2, "lifetime stats are separate, not blocking"
+    assert provider.is_available is True
 
 
 async def test_quota_exhaustion_routes_gateway_to_local(monkeypatch):
@@ -455,3 +474,170 @@ def test_rate_limit_error_gets_static_message():
     message = public_message(RateLimitError("Daily free quota exhausted (50/50)"))
     assert "50/50" not in message
     assert "الحد المسموح" in message
+
+
+# --------------------------------------------------------------------------- #
+# Atomic daily-quota reservation                                              #
+# --------------------------------------------------------------------------- #
+async def test_concurrent_requests_cannot_exceed_remaining_quota(monkeypatch):
+    """More concurrent requests than remaining slots: only the available
+    slots are sent; the rest are refused before any HTTP I/O."""
+    key_resp = _Response(payload={
+        "data": {"free_model_daily_requests": {"used": 0, "limit": 2}}
+    })
+    post_calls = {"n": 0}
+
+    def behaviour(url, **kwargs):
+        post_calls["n"] += 1
+        time.sleep(0.05)  # widen the race window
+        return _Response(payload=_ok_payload("ok", model="google/gemma-4-31b-it:free"))
+
+    provider = _provider(
+        monkeypatch, behaviour, key_response=key_resp, min_request_interval=0.0,
+    )
+    results = await asyncio.gather(*[
+        provider.generate(_request(user_id=i)) for i in range(5)
+    ], return_exceptions=True)
+
+    ok = [r for r in results if not isinstance(r, BaseException)]
+    refused = [r for r in results if isinstance(r, RateLimitError)]
+    assert len(ok) == 2, "only the remaining slots may be sent"
+    assert len(refused) == 3, "everything beyond the quota is refused"
+    assert post_calls["n"] == 2, "no HTTP request may bypass the reservation"
+    assert provider._daily_used == 2
+
+
+async def test_uncertain_outcomes_consume_the_reserved_slot(monkeypatch):
+    """Conservative accounting: a connection failure that may or may not have
+    reached the provider keeps its reservation (no under-counting)."""
+    def behaviour(url, **kwargs):
+        raise requests.exceptions.ConnectionError("reset before response")
+
+    provider = _provider(monkeypatch, behaviour)
+    provider._daily_limit = 1
+    with pytest.raises(AIProviderError):
+        await provider.generate(_request())
+    assert provider._daily_used == 1, "uncertain outcome stays consumed"
+    with pytest.raises(RateLimitError, match="[Dd]aily.*quota"):
+        await provider.generate(_request())
+
+
+def test_status_text_uses_daily_counters(monkeypatch):
+    class _DailyProvider(AIProvider):
+        name = "openrouter"
+        request_count = 999  # lifetime noise must not leak into the view
+        daily_used = 10
+        daily_limit = 100
+
+        @property
+        def is_available(self):
+            return True
+
+        async def generate(self, request):
+            return "x"
+
+    gateway = AIGateway(
+        _cfg(), provider=_DailyProvider(), local=LocalProvider(),
+        telemetry=AITelemetry(),
+    )
+    text = gateway.status_text()
+    assert "10/100" in text, "daily counters drive the view"
+    assert "999" not in text, "lifetime statistics never leak into the quota view"
+
+
+def test_status_text_falls_back_for_duck_typed_providers(monkeypatch):
+    class _LegacyProvider(AIProvider):
+        name = "openrouter"
+        request_count = 7
+
+        @property
+        def is_available(self):
+            return True
+
+        async def generate(self, request):
+            return "x"
+
+    gateway = AIGateway(
+        _cfg(), provider=_LegacyProvider(), local=LocalProvider(),
+        telemetry=AITelemetry(),
+    )
+    assert "7/" in gateway.status_text()
+
+
+# --------------------------------------------------------------------------- #
+# Free-only primary model                                                     #
+# --------------------------------------------------------------------------- #
+def test_paid_primary_rejected_in_development(monkeypatch):
+    monkeypatch.setenv("BOT_TOKEN", "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken")
+    monkeypatch.setenv("AUSTRO_ENVIRONMENT", "development")
+    monkeypatch.setenv("OPENROUTER_MODEL", "openai/gpt-5-mini")
+    from app.config.settings import load_settings
+    with pytest.raises(ConfigurationError, match="OPENROUTER_MODEL"):
+        load_settings()
+
+
+def test_paid_primary_rejected_in_staging(monkeypatch):
+    monkeypatch.setenv("BOT_TOKEN", "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken")
+    monkeypatch.setenv("AUSTRO_ENVIRONMENT", "staging")
+    monkeypatch.setenv("OPENROUTER_MODEL", "anthropic/claude-sonnet")
+    from app.config.settings import load_settings
+    with pytest.raises(ConfigurationError, match="OPENROUTER_MODEL"):
+        load_settings()
+
+
+def test_paid_primary_rejected_in_production(monkeypatch):
+    monkeypatch.setenv("BOT_TOKEN", "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken")
+    monkeypatch.setenv("AUSTRO_ENVIRONMENT", "production")
+    monkeypatch.setenv("OPENROUTER_MODEL", "openai/gpt-5-mini")
+    from app.config.settings import load_settings
+    with pytest.raises(ConfigurationError, match="OPENROUTER_MODEL"):
+        load_settings()
+
+
+def test_free_primary_accepted_and_default_preserved(monkeypatch):
+    monkeypatch.setenv("BOT_TOKEN", "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken")
+    monkeypatch.delenv("OPENROUTER_MODEL", raising=False)
+    from app.config.settings import load_settings
+    settings = load_settings()
+    assert settings.openrouter_model == "google/gemma-4-31b-it:free"
+
+    monkeypatch.setenv("OPENROUTER_MODEL", "google/gemma-4-26b-a4b-it:free")
+    assert load_settings().openrouter_model == "google/gemma-4-26b-a4b-it:free"
+
+
+def test_openrouter_free_router_accepted_as_primary(monkeypatch):
+    monkeypatch.setenv("BOT_TOKEN", "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken")
+    monkeypatch.setenv("OPENROUTER_MODEL", "openrouter/free")
+    from app.config.settings import load_settings
+    assert load_settings().openrouter_model == "openrouter/free"
+
+
+def test_structural_free_id_validation_rejects_malformed_ids():
+    from app.config.settings import _is_free_model_id
+    for bad in (
+        ":free",              # no vendor/model
+        "vendor/:free",       # empty model segment
+        "vendor/model:paid",  # non-free suffix
+        "vendor/model",       # no free suffix at all
+        "vendor model:free",  # whitespace
+        "vendor/ model:free", # inner whitespace
+        "/model:free",        # empty vendor
+        "vendor//model:free", # empty middle segment
+        "Vendor/Model:FREE",  # suffix is case-sensitive
+    ):
+        assert not _is_free_model_id(bad), bad
+    for good in (
+        "google/gemma-4-31b-it:free",
+        "nvidia/nemotron-3.5-lightning:free",
+        "vendor.name/model.name-v2:free",
+        "openrouter/free",
+    ):
+        assert _is_free_model_id(good), good
+
+
+def test_malformed_primary_rejected_through_settings_loader(monkeypatch):
+    monkeypatch.setenv("BOT_TOKEN", "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken")
+    monkeypatch.setenv("OPENROUTER_MODEL", ":free")
+    from app.config.settings import load_settings
+    with pytest.raises(ConfigurationError, match="OPENROUTER_MODEL"):
+        load_settings()

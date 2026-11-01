@@ -70,22 +70,26 @@ class OpenRouterProvider(AIProvider):
     def __init__(self, settings_: Settings):
         self._settings = settings_
         self._available: bool = False
+        # Lifetime count of generation calls that reached a provider response
+        # (stats only — never used for daily quota enforcement).
         self.request_count: int = 0
         self.last_request_time: float = 0.0
         # 429 cooldown: seconds-since-monotonic-epoch until which the provider
         # refuses sends. Bounded by AI_RATE_LIMIT_COOLDOWN_SECONDS and seeded
         # from a provider Retry-After when one is supplied.
         self._cooldown_until: float = 0.0
-        # Daily free-quota state. `_quota_used`/`_quota_limit` come from the
-        # GET /key account response when available (so an app restart does not
-        # reset the provider-side quota); otherwise the local counter is checked
-        # against max_requests_per_day. UTC-date tracked for the midnight reset.
-        self._quota_used: int = 0
-        self._quota_limit: int = 0  # 0 = unknown -> fall back to settings cap
+        # Daily free-quota state. This counter is the ONLY one quota
+        # enforcement consults, and it rolls over at UTC midnight.
+        # `_daily_used`/`_daily_limit` are seeded from the GET /key account
+        # response when available (so an app restart does not reset the
+        # provider-side quota); otherwise the counter is checked against
+        # max_requests_per_day.
+        self._daily_used: int = 0
+        self._daily_limit: int = 0  # 0 = unknown -> fall back to settings cap
         self._quota_date: str = self._utc_today()
         self._daily_exhausted: bool = False
-        # Guards the pacing decision and the quota counter (never held across
-        # an await: the slot is reserved, then the caller sleeps outside).
+        # Guards quota reservation/checks and the pacing decision. Never held
+        # across network I/O.
         self._state_lock = threading.Lock()
         if not settings_.has_openrouter_key:
             logger.info(
@@ -109,20 +113,35 @@ class OpenRouterProvider(AIProvider):
         return time.strftime("%Y-%m-%d", time.gmtime())
 
     def _maybe_reset_daily(self) -> None:
-        """Roll the local daily counters at UTC midnight."""
+        """Roll the daily quota counter at UTC midnight.
+
+        Only usage resets: the account's daily limit is stable, so it is kept
+        (and refreshed on the next /key health check) rather than forgotten.
+        """
         today = self._utc_today()
         if today != self._quota_date:
             self._quota_date = today
             self._daily_exhausted = False
-            self._quota_used = 0
-            self._quota_limit = 0
-            logger.info("UTC day rolled over; OpenRouter daily quota state reset")
+            self._daily_used = 0
+            logger.info("UTC day rolled over; OpenRouter daily quota usage reset")
 
     def _effective_daily_limit(self) -> int:
         """Account quota from /key when known, else the configured ceiling."""
-        if self._quota_limit > 0:
-            return self._quota_limit
+        if self._daily_limit > 0:
+            return self._daily_limit
         return self._settings.max_requests_per_day
+
+    @property
+    def daily_used(self) -> int:
+        """Requests consumed today (conservative: includes in-flight sends)."""
+        self._maybe_reset_daily()
+        return self._daily_used
+
+    @property
+    def daily_limit(self) -> int:
+        """Today's effective daily quota (account value or configured cap)."""
+        self._maybe_reset_daily()
+        return self._effective_daily_limit()
 
     def _cooldown_active(self) -> bool:
         return time.monotonic() < self._cooldown_until
@@ -141,7 +160,7 @@ class OpenRouterProvider(AIProvider):
         if self._daily_exhausted:
             return False
         with self._state_lock:
-            return self.request_count < self._effective_daily_limit()
+            return self._daily_used < self._effective_daily_limit()
 
     def _apply_rate_limit_headers(self, headers) -> None:
         """Start a bounded cooldown from Retry-After / rate-limit headers.
@@ -181,11 +200,13 @@ class OpenRouterProvider(AIProvider):
         )
 
     def _parse_key_quota(self, payload: dict) -> None:
-        """Seed daily-quota state from the GET /key account response.
+        """Seed the daily-quota state from the GET /key account response.
 
         OpenRouter exposes the free-tier allowance on the key object; the
         schema is parsed defensively so a field rename degrades to the
-        configured ceiling instead of crashing startup.
+        configured ceiling instead of crashing startup. Seeding replaces the
+        local usage with the account's truth (startup and reconnect), so an
+        app restart can never reset real consumption.
         """
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, dict):
@@ -199,24 +220,21 @@ class OpenRouterProvider(AIProvider):
             limit = block
             used = data.get("free_model_daily_usage")
         if isinstance(used, (int, float)) and used >= 0:
-            self._quota_used = int(used)
+            self._daily_used = int(used)
         if isinstance(limit, (int, float)) and limit > 0:
-            self._quota_limit = int(limit)
-        if self._quota_limit > 0:
-            if self._quota_used >= self._quota_limit:
+            self._daily_limit = int(limit)
+        if self._daily_limit > 0:
+            if self._daily_used >= self._daily_limit:
                 self._daily_exhausted = True
                 logger.warning(
                     "OpenRouter daily free quota already exhausted "
-                    f"({self._quota_used}/{self._quota_limit}); local fallback"
+                    f"({self._daily_used}/{self._daily_limit}); local fallback"
                 )
             else:
                 logger.info(
-                    f"OpenRouter daily free quota: {self._quota_used}/"
-                    f"{self._quota_limit} used"
+                    f"OpenRouter daily free quota: {self._daily_used}/"
+                    f"{self._daily_limit} used"
                 )
-        # Seed the local counter so a restart does not reset the real usage.
-        if self._quota_used > 0 and self.request_count == 0:
-            self.request_count = self._quota_used
 
     def health_check(self) -> bool:
         """Verify the key against GET /key (blocking; run in a thread).
@@ -286,13 +304,35 @@ class OpenRouterProvider(AIProvider):
             await asyncio.sleep(delay)
 
     def _count_request(self) -> None:
+        """Lifetime stats: a generation that reached a provider response."""
         with self._state_lock:
             self.request_count += 1
-            # Keep the /key-seeded usage in step with in-process sends.
-            if self._quota_limit > 0:
-                self._quota_used += 1
-                if self._quota_used >= self._quota_limit:
-                    self._daily_exhausted = True
+
+    def _reserve_daily_slot(self) -> None:
+        """Atomically reserve one daily-quota slot before any network I/O.
+
+        Reservation happens under `_state_lock` so concurrent tasks cannot all
+        pass the check before any of them increments the counter. The slot is
+        consumed conservatively: if the HTTP request later fails or times out
+        and it is uncertain whether OpenRouter received (and billed) it, the
+        reservation stays — under-counting quota is worse than a slightly
+        early cooldown. The lock is never held across the network call.
+        """
+        with self._state_lock:
+            self._maybe_reset_daily()
+            if not self._daily_exhausted and self._daily_used >= self._effective_daily_limit():
+                self._daily_exhausted = True
+                logger.warning(
+                    "OpenRouter daily quota exhausted "
+                    f"({self._daily_used}/{self._effective_daily_limit()}); "
+                    "routing to local fallback until the UTC reset"
+                )
+            if self._daily_exhausted:
+                raise RateLimitError("Daily quota exceeded")
+            self._daily_used += 1
+            if self._daily_used >= self._effective_daily_limit():
+                # Eagerly flag: this send was the day's last allowed slot.
+                self._daily_exhausted = True
 
     # -- generation ---------------------------------------------------------- #
     def _build_payload(self, request: AIRequest) -> dict:
@@ -327,16 +367,9 @@ class OpenRouterProvider(AIProvider):
             )
         if self._daily_exhausted:
             raise RateLimitError("Daily free quota exhausted; resets at UTC midnight")
-        with self._state_lock:
-            if self.request_count >= self._effective_daily_limit():
-                self._daily_exhausted = True
-            if self._daily_exhausted:
-                logger.warning(
-                    "OpenRouter daily quota exhausted "
-                    f"({self.request_count}/{self._effective_daily_limit()}); "
-                    "routing to local fallback until the UTC reset"
-                )
-                raise RateLimitError("Daily quota exceeded")
+        # Atomic reservation: one daily slot, held even if the request later
+        # fails (conservative accounting when the provider may have billed it).
+        self._reserve_daily_slot()
 
         await self._rate_limit()
 

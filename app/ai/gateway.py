@@ -217,11 +217,19 @@ class AIGateway:
             if self._settings.use_local_fallback:
                 return "⚠️ OpenRouter غير متاح - الردود المحلية مفعلة"
             return "⚠️ OpenRouter غير متاح - الردود المحلية معطلة؛ سيتم إرجاع الرد الآمن الجاهز"
-        remaining = self._settings.max_requests_per_day - self.provider.request_count
-        percentage = (remaining / self._settings.max_requests_per_day) * 100
+        # Daily-quota view: prefer the provider's daily counters (account-
+        # seeded, UTC-rolled) and fall back to the lifetime counter for
+        # duck-typed providers that do not expose them.
+        used = getattr(self.provider, "daily_used", None)
+        limit = getattr(self.provider, "daily_limit", None)
+        if not isinstance(used, int) or not isinstance(limit, int) or limit <= 0:
+            used = self.provider.request_count
+            limit = self._settings.max_requests_per_day
+        remaining = max(0, limit - used)
+        percentage = (remaining / limit) * 100
         return (
-            f"📊 حالة الاستخدام: {self.provider.request_count}/"
-            f"{self._settings.max_requests_per_day} ({percentage:.0f}% متبقي)"
+            f"📊 حالة الاستخدام: {used}/"
+            f"{limit} ({percentage:.0f}% متبقي)"
         )
 
     async def reconnect(self) -> str:

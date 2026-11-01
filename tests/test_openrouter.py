@@ -336,7 +336,8 @@ async def test_error_messages_never_contain_the_key(monkeypatch):
 @pytest.mark.asyncio
 async def test_daily_quota_disables_and_raises_rate_limit(monkeypatch):
     provider = _provider(monkeypatch, lambda *a, **k: _Response())
-    provider.request_count = provider._settings.max_requests_per_day
+    # daily enforcement reads the daily counter, not lifetime statistics
+    provider._daily_used = provider._settings.max_requests_per_day
     with pytest.raises(RateLimitError, match="Daily quota"):
         await provider.generate(_request())
     assert provider.is_available is False

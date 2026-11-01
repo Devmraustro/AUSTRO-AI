@@ -9,6 +9,7 @@ removes hardcoded keys, URLs, models, quotas and timeouts from the code.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
@@ -169,28 +170,59 @@ def _load_dotenv() -> None:
         load_dotenv()
 
 
-#: The only non-`:free` identifier accepted in the fallback chain: OpenRouter's
+#: The only non-`:free` identifier accepted in the AI request chain: OpenRouter's
 #: official dynamic free router. Anything else must carry the `:free` suffix.
 _DYNAMIC_FREE_ROUTER = "openrouter/free"
+
+#: Structural shape of a free model id: `vendor/model:free` with URL-safe
+#: segments. A suffix check alone would accept `:free`, `vendor/:free` or
+#: arbitrary junk before the suffix. Offline and deterministic by design —
+#: startup must never depend on live catalog availability.
+_FREE_MODEL_ID_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*:free$"
+)
+
+
+def _is_free_model_id(model: str) -> bool:
+    """True when `model` is a structurally valid free-only OpenRouter id."""
+    model = (model or "").strip()
+    if model == _DYNAMIC_FREE_ROUTER:
+        return True
+    return bool(_FREE_MODEL_ID_RE.fullmatch(model))
+
+
+def _validated_openrouter_model(raw: str) -> str:
+    """Validate the PRIMARY model id; refuse paid or malformed values.
+
+    The free-only policy covers the entire request chain, primary included,
+    in every environment. Invalid ids raise instead of being replaced.
+    """
+    model = (raw or "").strip() or "google/gemma-4-31b-it:free"
+    if not _is_free_model_id(model):
+        raise ConfigurationError(
+            f"❌ OPENROUTER_MODEL accepts free models only "
+            f"(a valid 'vendor/model:free' identifier or "
+            f"'{_DYNAMIC_FREE_ROUTER}'); got '{model}'"
+        )
+    return model
 
 
 def _parse_free_fallback_models(raw: str, max_models: int) -> tuple:
     """Parse OPENROUTER_FALLBACK_MODELS; refuse paid or malformed entries.
 
     Empty/whitespace items are dropped, duplicates collapsed preserving first
-    occurrence order, and only `:free`-suffixed ids (or the official dynamic
-    free router) are accepted — a paid model in the chain is a startup error,
-    never a silent downgrade.
+    occurrence order, and only structurally valid free ids are accepted — a
+    paid model in the chain is a startup error, never a silent downgrade.
     """
     seen: list = []
     for item in (raw or "").split(","):
         model = item.strip()
         if not model:
             continue
-        if not (model.endswith(":free") or model == _DYNAMIC_FREE_ROUTER):
+        if not _is_free_model_id(model):
             raise ConfigurationError(
                 f"❌ OPENROUTER_FALLBACK_MODELS accepts free models only "
-                f"(identifier must end with ':free' or be "
+                f"(a valid 'vendor/model:free' identifier or "
                 f"'{_DYNAMIC_FREE_ROUTER}'); got '{model}'"
             )
         if model not in seen:
@@ -233,8 +265,8 @@ def load_settings() -> Settings:
         logs_path=str(logs_dir),
         backups_path=str(backups_dir),
         openrouter_api_key=os.getenv("OPENROUTER_API_KEY", ""),
-        openrouter_model=os.getenv(
-            "OPENROUTER_MODEL", "google/gemma-4-31b-it:free"
+        openrouter_model=_validated_openrouter_model(
+            os.getenv("OPENROUTER_MODEL", "google/gemma-4-31b-it:free")
         ),
         openrouter_api_url=os.getenv(
             "OPENROUTER_API_URL", "https://openrouter.ai/api/v1"
