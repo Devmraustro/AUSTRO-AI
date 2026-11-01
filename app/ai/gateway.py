@@ -149,10 +149,19 @@ class AIGateway:
         for provider in chain:
             text, error, attempts = await self._try_provider(provider, request)
             if text is not None:
+                # Attribute the run to the model that actually answered when
+                # the provider reported one (native `models` fallback makes
+                # the answering model differ from the requested primary).
+                actual_model = request.data.get("_actual_model")
+                model = (
+                    actual_model
+                    if isinstance(actual_model, str) and actual_model.strip()
+                    else getattr(provider, "model", "unknown")
+                )
                 return self._record(
                     run_id, request, category,
                     getattr(provider, "name", "provider"),
-                    getattr(provider, "model", "unknown"),
+                    model,
                     started, attempts, text, True, None,
                 )
             if error is not None:

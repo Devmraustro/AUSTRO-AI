@@ -76,6 +76,13 @@ class Settings:
     ai_healthcheck_timeout: float = 15.0
     ai_max_retries: int = 2
     ai_retry_backoff_base: float = 0.5
+    # Ceiling for a 429 cooldown in seconds; a provider Retry-After is honored
+    # inside this bound. The provider recovers automatically afterwards.
+    ai_rate_limit_cooldown_seconds: float = 120.0
+    # Ordered free-only fallback chain routed server-side by OpenRouter via
+    # the native `models` array. Validated at startup (see below).
+    openrouter_fallback_models: tuple = ()
+    openrouter_max_fallback_models: int = 2
 
     # Optional fields with defaults
     environment: str = "development"
@@ -160,6 +167,38 @@ def _load_dotenv() -> None:
         load_dotenv(dotenv_path=env_path)
     else:
         load_dotenv()
+
+
+#: The only non-`:free` identifier accepted in the fallback chain: OpenRouter's
+#: official dynamic free router. Anything else must carry the `:free` suffix.
+_DYNAMIC_FREE_ROUTER = "openrouter/free"
+
+
+def _parse_free_fallback_models(raw: str, max_models: int) -> tuple:
+    """Parse OPENROUTER_FALLBACK_MODELS; refuse paid or malformed entries.
+
+    Empty/whitespace items are dropped, duplicates collapsed preserving first
+    occurrence order, and only `:free`-suffixed ids (or the official dynamic
+    free router) are accepted — a paid model in the chain is a startup error,
+    never a silent downgrade.
+    """
+    seen: list = []
+    for item in (raw or "").split(","):
+        model = item.strip()
+        if not model:
+            continue
+        if not (model.endswith(":free") or model == _DYNAMIC_FREE_ROUTER):
+            raise ConfigurationError(
+                f"❌ OPENROUTER_FALLBACK_MODELS accepts free models only "
+                f"(identifier must end with ':free' or be "
+                f"'{_DYNAMIC_FREE_ROUTER}'); got '{model}'"
+            )
+        if model not in seen:
+            seen.append(model)
+    cap = max(0, int(max_models))
+    if len(seen) > cap:
+        seen = seen[:cap]
+    return tuple(seen)
 
 
 def load_settings() -> Settings:
@@ -251,6 +290,16 @@ def load_settings() -> Settings:
         ai_healthcheck_timeout=float(os.getenv("AI_HEALTHCHECK_TIMEOUT", "15")),
         ai_max_retries=int(os.getenv("AI_MAX_RETRIES", "2")),
         ai_retry_backoff_base=float(os.getenv("AI_RETRY_BACKOFF_BASE", "0.5")),
+        ai_rate_limit_cooldown_seconds=float(
+            os.getenv("AI_RATE_LIMIT_COOLDOWN_SECONDS", "120")
+        ),
+        openrouter_fallback_models=_parse_free_fallback_models(
+            os.getenv("OPENROUTER_FALLBACK_MODELS", ""),
+            int(os.getenv("OPENROUTER_MAX_FALLBACK_MODELS", "2")),
+        ),
+        openrouter_max_fallback_models=int(
+            os.getenv("OPENROUTER_MAX_FALLBACK_MODELS", "2")
+        ),
         environment=os.getenv("AUSTRO_ENVIRONMENT", "development"),
         log_level=os.getenv("AUSTRO_LOG_LEVEL", "INFO"),
         webhook_url=os.getenv("WEBHOOK_URL", ""),

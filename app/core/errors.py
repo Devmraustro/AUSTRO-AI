@@ -82,13 +82,14 @@ _GENERIC_MESSAGE = "❌ عذراً، حدث خطأ. الرجاء المحاول�
 def public_message(error: BaseException) -> str:
     """Map a caught exception to a safe, user-facing Arabic message.
 
-    Known AUSTRO errors get their fixed message; ValidationError and
-    AIProviderError may carry a specific safe message; anything else gets the
-    generic message. Raw exception details are never exposed to the user.
+    Known AUSTRO errors get their fixed message; ValidationError may carry a
+    specific safe message (it is authored for user display by the validation
+    layer). AI provider errors always map to their fixed static message:
+    their internal text can contain provider names, HTTP statuses or upstream
+    error bodies, which must stay in the logs only. Raw exception details are
+    never exposed to the user.
     """
     if isinstance(error, ValidationError) and str(error).strip():
-        return str(error)
-    if isinstance(error, AIProviderError) and str(error).strip():
         return str(error)
     for error_type, message in _PUBLIC_MESSAGES.items():
         if isinstance(error, error_type):
