@@ -114,6 +114,24 @@ def _request(**kw):
     return AIRequest(capability="chat", prompt="hi", **kw)
 
 
+def _arrange_quota_state(provider, *, date=None, used=None, limit=None,
+                         exhausted=None, cooldown_until=None):
+    """Test arrangement of quota state must respect the provider's lock
+    contract: every mutation of the daily-quota fields happens under
+    `_state_lock`, even in single-threaded setup."""
+    with provider._state_lock:
+        if date is not None:
+            provider._quota_date = date
+        if used is not None:
+            provider._daily_used = used
+        if limit is not None:
+            provider._daily_limit = limit
+        if exhausted is not None:
+            provider._daily_exhausted = exhausted
+        if cooldown_until is not None:
+            provider._cooldown_until = cooldown_until
+
+
 # --------------------------------------------------------------------------- #
 # Phase 2: free-only configuration                                            #
 # --------------------------------------------------------------------------- #
@@ -272,7 +290,7 @@ async def test_429_starts_bounded_cooldown_not_permanent_disable(monkeypatch):
     assert 0 < remaining <= 7.5, "Retry-After=7 honored inside the ceiling"
     assert calls["n"] == 1
     # cooldown expiry restores availability without a reconnect
-    provider._cooldown_until = time.monotonic() - 0.01
+    _arrange_quota_state(provider, cooldown_until=time.monotonic() - 0.01)
     assert provider.is_available is True
 
 
@@ -360,7 +378,7 @@ async def test_utc_rollover_reopens_quota_and_requests_succeed(monkeypatch):
     assert provider._daily_exhausted is True  # 50/50 used on day 1
 
     # simulate the UTC day rolling over
-    provider._quota_date = "2000-01-01"
+    _arrange_quota_state(provider, date="2000-01-01")
     assert provider.is_available is True
     assert provider._daily_exhausted is False
     assert provider._daily_used == 0
@@ -373,7 +391,7 @@ async def test_utc_rollover_reopens_quota_and_requests_succeed(monkeypatch):
 
 async def test_quota_exhaustion_routes_gateway_to_local(monkeypatch):
     provider = _provider(monkeypatch, lambda *a, **k: _Response())
-    provider._daily_exhausted = True
+    _arrange_quota_state(provider, exhausted=True)
     gateway = AIGateway(
         _cfg(), provider=provider, local=LocalProvider(), telemetry=AITelemetry(),
     )
@@ -514,7 +532,7 @@ async def test_uncertain_outcomes_consume_the_reserved_slot(monkeypatch):
         raise requests.exceptions.ConnectionError("reset before response")
 
     provider = _provider(monkeypatch, behaviour)
-    provider._daily_limit = 1
+    _arrange_quota_state(provider, limit=1)
     with pytest.raises(AIProviderError):
         await provider.generate(_request())
     assert provider._daily_used == 1, "uncertain outcome stays consumed"
@@ -654,10 +672,8 @@ async def test_midnight_rollover_then_reconnect_preserves_today_usage(monkeypatc
 
     provider = _provider(monkeypatch, behaviour)
     # 1) yesterday: quota exhausted
-    provider._quota_date = "2000-01-01"
-    provider._daily_used = 50
-    provider._daily_limit = 50
-    provider._daily_exhausted = True
+    _arrange_quota_state(provider, date="2000-01-01", used=50, limit=50,
+                         exhausted=True)
 
     # 2) the UTC date has advanced to today
     today = provider._utc_today()
@@ -693,10 +709,8 @@ async def test_reconnect_after_exhaustion_restores_availability(monkeypatch):
 
     provider = _provider(monkeypatch, behaviour)
     # 1) exhausted (e.g. conservative over-counting)
-    provider._daily_used = 50
-    provider._daily_limit = 50
-    provider._daily_exhausted = True
-    provider._cooldown_until = 0.0
+    _arrange_quota_state(provider, used=50, limit=50, exhausted=True,
+                         cooldown_until=0.0)
     assert provider.is_available is False
 
     # 2+3) reconnect with /key reporting 30/50
@@ -724,9 +738,7 @@ async def test_reconnect_keeps_exhaustion_when_key_confirms_it(monkeypatch):
         return _Response(payload=_ok_payload("ok", model="google/gemma-4-31b-it:free"))
 
     provider = _provider(monkeypatch, behaviour)
-    provider._daily_used = 50
-    provider._daily_limit = 50
-    provider._daily_exhausted = True
+    _arrange_quota_state(provider, used=50, limit=50, exhausted=True)
 
     key_resp = _Response(payload={
         "data": {"free_model_daily_requests": {"used": 50, "limit": 50}}
@@ -743,9 +755,7 @@ def test_malformed_key_snapshot_does_not_reset_valid_state(monkeypatch):
     """A /key response without usable quota fields must leave the existing
     account state exactly as it was."""
     provider = _provider(monkeypatch, lambda url, **k: _Response())
-    provider._daily_used = 17
-    provider._daily_limit = 50
-    provider._daily_exhausted = False
+    _arrange_quota_state(provider, used=17, limit=50, exhausted=False)
 
     for payload in (
         {"data": {}},                                    # block missing
@@ -833,9 +843,7 @@ def test_key_snapshot_partial_fields_preserve_existing_state(monkeypatch):
     """Incomplete snapshots (one field valid, the other missing/malformed)
     must not mix new usage with an old limit or vice versa."""
     provider = _provider(monkeypatch, lambda url, **k: _Response())
-    provider._daily_used = 17
-    provider._daily_limit = 50
-    provider._daily_exhausted = False
+    _arrange_quota_state(provider, used=17, limit=50, exhausted=False)
     before = (provider._quota_date, 17, 50, False)
 
     cases = [
@@ -856,9 +864,7 @@ def test_key_snapshot_partial_fields_preserve_existing_state(monkeypatch):
 
 def test_key_snapshot_complete_valid_replaces_previous_state(monkeypatch):
     provider = _provider(monkeypatch, lambda url, **k: _Response())
-    provider._daily_used = 17
-    provider._daily_limit = 20
-    provider._daily_exhausted = True
+    _arrange_quota_state(provider, used=17, limit=20, exhausted=True)
 
     today = provider._utc_today()
     provider._parse_key_quota({"data": {
@@ -886,9 +892,7 @@ def test_key_snapshot_legacy_numeric_representation_validated_as_a_pair(monkeypa
     """Legacy numeric block (limit) + separate usage field applies only
     when BOTH validate; otherwise the old state survives."""
     provider = _provider(monkeypatch, lambda url, **k: _Response())
-    provider._daily_used = 17
-    provider._daily_limit = 50
-    provider._daily_exhausted = False
+    _arrange_quota_state(provider, used=17, limit=50, exhausted=False)
 
     # both valid -> applied
     provider._parse_key_quota({"data": {
@@ -1049,46 +1053,84 @@ async def test_generate_racing_key_snapshot_is_arbitrated_by_reservation(monkeyp
 
 
 async def test_generate_racing_utc_rollover_is_arbitrated_by_reservation(monkeypatch):
-    """A UTC rollover landing in the race window re-opens the quota: the
-    reservation admits the request against the rolled-over (empty) counter."""
+    """A UTC rollover landing in the race window - specifically between the
+    advisory snapshot and the authoritative reservation - re-opens the quota.
+
+    The mocked clock says 2030-01-01 during `generate()`'s initial
+    `_maybe_reset_daily()` and `_daily_exhausted_snapshot()` (so neither may
+    perform the rollover), and flips to 2030-01-02 inside the `_rate_limit`
+    hook. The real `_reserve_daily_slot()` must then detect the new UTC date
+    under `_state_lock`, reset the previous day's usage, and reserve exactly
+    one slot. If the rollover happened any earlier, or the reservation
+    skipped its locked date recheck, the assertions below fail."""
+    clock = {"today": "2030-01-01"}
+    monkeypatch.setattr(
+        OpenRouterProvider, "_utc_today", staticmethod(lambda: clock["today"])
+    )
+
+    post_calls = {"n": 0}
+
     def behaviour(url, **kwargs):
+        post_calls["n"] += 1
         return _Response(payload=_ok_payload("ok", model="google/gemma-4-31b-it:free"))
 
-    provider = _provider(monkeypatch, behaviour)
-    provider._daily_used = provider._settings.max_requests_per_day
-    provider._daily_limit = provider._settings.max_requests_per_day
-    provider._daily_exhausted = True  # exhausted "today"...
-    yesterday = "2000-01-01"
-    provider._quota_date = yesterday  # ...but the counter belongs to yesterday
+    provider = _provider(
+        monkeypatch, behaviour, key_response=_Response(payload={"data": {}}),
+    )
+    # deterministic initial quota state, arranged under the state lock
+    with provider._state_lock:
+        provider._quota_date = "2030-01-01"
+        provider._daily_limit = 2
+        provider._daily_used = 1
+        provider._daily_exhausted = False
 
-    async def rolling_pacing():
-        # the date flips back in the race window: the rollover is applied
-        provider._quota_date = provider._utc_today()
+    async def rollover_pacing():
+        # the UTC day flips strictly inside the race window
+        clock["today"] = "2030-01-02"
 
-    monkeypatch.setattr(provider, "_rate_limit", rolling_pacing)
+    monkeypatch.setattr(provider, "_rate_limit", rollover_pacing)
+
     request = _request()
     assert await provider.generate(request) == "ok"
-    assert provider._daily_used == 1, "the rolled-over day starts fresh"
+    assert provider._quota_date == "2030-01-02", "the rollover applied in-window"
+    assert provider._daily_used == 1, "exactly one slot reserved on the new day"
+    assert provider._daily_exhausted is False
+    assert post_calls["n"] == 1, "exactly one HTTP request was sent"
 
 
 async def test_exhaustion_in_race_window_is_refused_by_reservation(monkeypatch):
     """Exhaustion appearing inside the race window must be caught by the
-    authoritative reservation, not only by the advisory fast-fail."""
+    authoritative reservation, not only by the advisory fast-fail. The state
+    transition follows the real production path: `_parse_key_quota()` with a
+    valid exhausted snapshot (used=2, limit=2), which acquires `_state_lock`
+    itself instead of bypassing it."""
+    post_calls = {"n": 0}
+
     def behaviour(url, **kwargs):
+        post_calls["n"] += 1
         return _Response(payload=_ok_payload("ok", model="google/gemma-4-31b-it:free"))
 
-    provider = _provider(monkeypatch, behaviour)
-    provider._daily_limit = 2
-    provider._daily_used = 2
-    provider._daily_exhausted = False  # advisory snapshot is still stale-healthy
+    # healthy at init and at advisory time (1/2 used)
+    provider = _provider(
+        monkeypatch, behaviour,
+        key_response=_Response(payload={
+            "data": {"free_model_daily_requests": {"used": 1, "limit": 2}}
+        }),
+    )
+    assert provider._daily_exhausted is False
 
     async def exhausting_pacing():
-        provider._daily_exhausted = True  # exhausts before the reservation
+        # the exhausting snapshot lands strictly inside the race window
+        provider._parse_key_quota({"data": {
+            "free_model_daily_requests": {"used": 2, "limit": 2}
+        }})
 
     monkeypatch.setattr(provider, "_rate_limit", exhausting_pacing)
-    with pytest.raises(RateLimitError):
+    with pytest.raises(RateLimitError, match="Daily quota"):
         await provider.generate(_request())
-    assert provider._daily_used == 2, "no slot may be reserved past the limit"
+    assert post_calls["n"] == 0, "no HTTP request may bypass the reservation"
+    assert provider._daily_exhausted is True, "the quota remains exhausted"
+    assert provider._daily_used == 2, "no additional slot was reserved"
 
 
 # --------------------------------------------------------------------------- #
@@ -1111,9 +1153,7 @@ def test_snapshot_fractional_and_nonfinite_are_rejected_wholesale(monkeypatch):
     """Fractional usage/limit and NaN/Infinity snapshots are rejected as a
     pair: (date, used, limit, exhausted) must remain exactly as before."""
     provider = _provider(monkeypatch, lambda url, **k: _Response())
-    provider._daily_used = 17
-    provider._daily_limit = 50
-    provider._daily_exhausted = False
+    _arrange_quota_state(provider, used=17, limit=50, exhausted=False)
     before = (provider._quota_date, 17, 50, False)
 
     cases = [
@@ -1137,9 +1177,7 @@ def test_snapshot_fractional_and_nonfinite_are_rejected_wholesale(monkeypatch):
 
 def test_snapshot_negative_usage_and_zero_limit_rejected(monkeypatch):
     provider = _provider(monkeypatch, lambda url, **k: _Response())
-    provider._daily_used = 17
-    provider._daily_limit = 50
-    provider._daily_exhausted = False
+    _arrange_quota_state(provider, used=17, limit=50, exhausted=False)
     before = (provider._quota_date, 17, 50, False)
 
     for payload in (
