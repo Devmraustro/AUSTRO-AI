@@ -102,8 +102,12 @@ def test_public_message_passes_safe_validation_text():
     assert public_message(ValidationError("❌ الرجاء إدخال رقم صحيح:")) == "❌ الرجاء إدخال رقم صحيح:"
 
 
-def test_public_message_passes_safe_provider_text():
-    assert public_message(AIProviderError("سيتم المحاولة لاحقاً")) == "سيتم المحاولة لاحقاً"
+def test_public_message_maps_provider_errors_to_safe_static_text():
+    """AI provider error internals (HTTP statuses, provider bodies, keys)
+    must stay in the logs; users get the fixed safe message only."""
+    message = public_message(AIProviderError("OpenRouter 400: upstream body"))
+    assert message == "🤖 تعذر الوصول إلى الذكاء الاصطناعي حالياً. حاول لاحقاً."
+    assert "OpenRouter" not in message and "400" not in message
 
 
 # ============================ DI CONTAINER ============================
