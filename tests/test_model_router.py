@@ -132,6 +132,35 @@ def _arrange_quota_state(provider, *, date=None, used=None, limit=None,
             provider._cooldown_until = cooldown_until
 
 
+def _read_quota_state(provider):
+    """Atomic quota-state snapshot for assertions (acquires `_state_lock`)."""
+    with provider._state_lock:
+        return {
+            "date": provider._quota_date,
+            "used": provider._daily_used,
+            "limit": provider._daily_limit,
+            "exhausted": provider._daily_exhausted,
+        }
+
+
+def _read_daily_used(provider):
+    """Locked single-field read (acquires `_state_lock`)."""
+    with provider._state_lock:
+        return provider._daily_used
+
+
+def _read_daily_exhausted(provider):
+    """Locked single-field read (acquires `_state_lock`)."""
+    with provider._state_lock:
+        return provider._daily_exhausted
+
+
+def _read_daily_limit(provider):
+    """Locked single-field read (acquires `_state_lock`)."""
+    with provider._state_lock:
+        return provider._daily_limit
+
+
 # --------------------------------------------------------------------------- #
 # Phase 2: free-only configuration                                            #
 # --------------------------------------------------------------------------- #
@@ -349,13 +378,13 @@ async def test_daily_quota_seeded_from_key_endpoint(monkeypatch):
 
     provider = _provider(monkeypatch, behaviour, key_response=key_resp)
     # health_check ran inside __init__ and seeded state from /key
-    assert provider._daily_limit == 50
-    assert provider._daily_used == 49
+    assert _read_daily_limit(provider) == 50
+    assert _read_daily_used(provider) == 49
     assert provider.request_count == 0, "lifetime stats stay separate from quota"
     assert provider.is_available is True  # one request left
 
     await provider.generate(_request())
-    assert provider._daily_exhausted is True  # 50/50 used
+    assert _read_daily_exhausted(provider) is True  # 50/50 used
     assert provider.request_count == 1, "lifetime stats counted the response"
     assert provider.is_available is False
     with pytest.raises(RateLimitError, match="Daily quota exceeded"):
@@ -375,16 +404,16 @@ async def test_utc_rollover_reopens_quota_and_requests_succeed(monkeypatch):
 
     provider = _provider(monkeypatch, behaviour, key_response=key_resp)
     await provider.generate(_request())
-    assert provider._daily_exhausted is True  # 50/50 used on day 1
+    assert _read_daily_exhausted(provider) is True  # 50/50 used on day 1
 
     # simulate the UTC day rolling over
     _arrange_quota_state(provider, date="2000-01-01")
     assert provider.is_available is True
-    assert provider._daily_exhausted is False
-    assert provider._daily_used == 0
+    assert _read_daily_exhausted(provider) is False
+    assert _read_daily_used(provider) == 0
 
     await provider.generate(_request())
-    assert provider._daily_used == 1, "only today's usage counts"
+    assert _read_daily_used(provider) == 1, "only today's usage counts"
     assert provider.request_count == 2, "lifetime stats are separate, not blocking"
     assert provider.is_available is True
 
@@ -522,7 +551,7 @@ async def test_concurrent_requests_cannot_exceed_remaining_quota(monkeypatch):
     assert len(ok) == 2, "only the remaining slots may be sent"
     assert len(refused) == 3, "everything beyond the quota is refused"
     assert post_calls["n"] == 2, "no HTTP request may bypass the reservation"
-    assert provider._daily_used == 2
+    assert _read_daily_used(provider) == 2
 
 
 async def test_uncertain_outcomes_consume_the_reserved_slot(monkeypatch):
@@ -535,7 +564,7 @@ async def test_uncertain_outcomes_consume_the_reserved_slot(monkeypatch):
     _arrange_quota_state(provider, limit=1)
     with pytest.raises(AIProviderError):
         await provider.generate(_request())
-    assert provider._daily_used == 1, "uncertain outcome stays consumed"
+    assert _read_daily_used(provider) == 1, "uncertain outcome stays consumed"
     with pytest.raises(RateLimitError, match="[Dd]aily.*quota"):
         await provider.generate(_request())
 
@@ -690,15 +719,14 @@ async def test_midnight_rollover_then_reconnect_preserves_today_usage(monkeypatc
 
     # 4+5) today's usage is preserved (not reset by the stale date) and
     # quota enforcement uses the newly seeded values
-    assert provider._quota_date == today
-    assert provider._daily_used == 3
-    assert provider._daily_limit == 50
-    assert provider._daily_exhausted is False
+    state = _read_quota_state(provider)
+    assert state["date"] == today
+    assert (state["used"], state["limit"], state["exhausted"]) == (3, 50, False)
     assert provider.is_available is True
 
     # 6) the next generation bills against the seeded counter
     await provider.generate(_request())
-    assert provider._daily_used == 4
+    assert _read_daily_used(provider) == 4
 
 
 async def test_reconnect_after_exhaustion_restores_availability(monkeypatch):
@@ -722,12 +750,12 @@ async def test_reconnect_after_exhaustion_restores_availability(monkeypatch):
 
     # 4) available again (no cooldown, quota below the limit)
     assert provider.is_available is True
-    assert provider._daily_exhausted is False
-    assert provider._daily_used == 30
+    assert _read_daily_exhausted(provider) is False
+    assert _read_daily_used(provider) == 30
 
     # 5) the next request succeeds and the daily counter increments
     await provider.generate(_request())
-    assert provider._daily_used == 31
+    assert _read_daily_used(provider) == 31
     assert provider.request_count == 1
 
 
@@ -745,7 +773,7 @@ async def test_reconnect_keeps_exhaustion_when_key_confirms_it(monkeypatch):
     })
     monkeypatch.setattr("app.ai.openrouter.requests.get", lambda url, **k: key_resp)
     assert provider.reconnect() is True  # key itself is healthy
-    assert provider._daily_exhausted is True
+    assert _read_daily_exhausted(provider) is True
     assert provider.is_available is False
     with pytest.raises(RateLimitError):
         await provider.generate(_request())
@@ -764,9 +792,9 @@ def test_malformed_key_snapshot_does_not_reset_valid_state(monkeypatch):
         {"error": {"message": "server hiccup"}},          # no data at all
     ):
         provider._parse_key_quota(payload)
-        assert provider._daily_used == 17, payload
-        assert provider._daily_limit == 50, payload
-        assert provider._daily_exhausted is False, payload
+        assert _read_daily_used(provider) == 17, payload
+        assert _read_daily_limit(provider) == 50, payload
+        assert _read_daily_exhausted(provider) is False, payload
 
 
 # --------------------------------------------------------------------------- #
@@ -790,16 +818,16 @@ async def test_cancellation_during_pacing_consumes_no_slot(monkeypatch):
     # a first send stamps last_request_time, so the NEXT request parks in
     # the pacing sleep (min_request_interval=30s)
     await provider.generate(_request())
-    assert provider._daily_used == 1 and post_calls["n"] == 1
+    assert _read_daily_used(provider) == 1 and post_calls["n"] == 1
 
     task = asyncio.ensure_future(provider.generate(_request()))
     await asyncio.sleep(0.05)  # the task is now parked inside the pacing sleep
-    assert provider._daily_used == 1, "no reservation while parked in pacing"
+    assert _read_daily_used(provider) == 1, "no reservation while parked in pacing"
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert provider._daily_used == 1, "cancellation during pacing frees the slot"
+    assert _read_daily_used(provider) == 1, "cancellation during pacing frees the slot"
     assert post_calls["n"] == 1
 
     # the slot is intact: a normal request (pacing disabled) still goes through
@@ -808,7 +836,7 @@ async def test_cancellation_during_pacing_consumes_no_slot(monkeypatch):
     )
     await provider.generate(_request())
     assert post_calls["n"] == 2
-    assert provider._daily_used == 2
+    assert _read_daily_used(provider) == 2
 
 
 async def test_concurrent_requests_stay_capped_after_pacing(monkeypatch):
@@ -833,7 +861,7 @@ async def test_concurrent_requests_stay_capped_after_pacing(monkeypatch):
     refused = [r for r in results if isinstance(r, RateLimitError)]
     assert len(ok) == 2 and len(refused) == 2
     assert post_calls["n"] == 2
-    assert provider._daily_used == 2
+    assert _read_daily_used(provider) == 2
 
 
 # --------------------------------------------------------------------------- #
@@ -844,7 +872,7 @@ def test_key_snapshot_partial_fields_preserve_existing_state(monkeypatch):
     must not mix new usage with an old limit or vice versa."""
     provider = _provider(monkeypatch, lambda url, **k: _Response())
     _arrange_quota_state(provider, used=17, limit=50, exhausted=False)
-    before = (provider._quota_date, 17, 50, False)
+    before = _read_quota_state(provider)
 
     cases = [
         {"data": {"free_model_daily_requests": {"used": 5}}},                 # valid used, missing limit
@@ -858,28 +886,25 @@ def test_key_snapshot_partial_fields_preserve_existing_state(monkeypatch):
     ]
     for payload in cases:
         provider._parse_key_quota(payload)
-        assert (provider._quota_date, provider._daily_used,
-                provider._daily_limit, provider._daily_exhausted) == before, payload
+        assert _read_quota_state(provider) == before, payload
 
 
 def test_key_snapshot_complete_valid_replaces_previous_state(monkeypatch):
     provider = _provider(monkeypatch, lambda url, **k: _Response())
     _arrange_quota_state(provider, used=17, limit=20, exhausted=True)
 
-    today = provider._utc_today()
     provider._parse_key_quota({"data": {
         "free_model_daily_requests": {"used": 4, "limit": 50}
     }})
-    assert provider._quota_date == today
-    assert provider._daily_used == 4
-    assert provider._daily_limit == 50
-    assert provider._daily_exhausted is False
+    state = _read_quota_state(provider)
+    assert state["date"] == provider._utc_today()
+    assert (state["used"], state["limit"], state["exhausted"]) == (4, 50, False)
 
     # and an exhausting complete snapshot flips the flag
     provider._parse_key_quota({"data": {
         "free_model_daily_requests": {"used": 50, "limit": 50}
     }})
-    assert provider._daily_exhausted is True
+    assert _read_quota_state(provider)["exhausted"] is True
 
 
 def test_key_snapshot_booleans_are_never_numbers(monkeypatch):
@@ -898,17 +923,20 @@ def test_key_snapshot_legacy_numeric_representation_validated_as_a_pair(monkeypa
     provider._parse_key_quota({"data": {
         "free_model_daily_requests": 80, "free_model_daily_usage": 9,
     }})
-    assert (provider._daily_used, provider._daily_limit) == (9, 80)
+    state = _read_quota_state(provider)
+    assert (state["used"], state["limit"]) == (9, 80)
 
     # legacy limit without a usable usage -> whole snapshot rejected
     provider._parse_key_quota({"data": {"free_model_daily_requests": 60}})
-    assert (provider._daily_used, provider._daily_limit) == (9, 80)
+    state = _read_quota_state(provider)
+    assert (state["used"], state["limit"]) == (9, 80)
 
     # boolean legacy usage -> rejected
     provider._parse_key_quota({"data": {
         "free_model_daily_requests": 60, "free_model_daily_usage": True,
     }})
-    assert (provider._daily_used, provider._daily_limit) == (9, 80)
+    state = _read_quota_state(provider)
+    assert (state["used"], state["limit"]) == (9, 80)
 
 
 # --------------------------------------------------------------------------- #
@@ -967,12 +995,10 @@ async def test_rollover_racing_snapshot_and_reservation_stays_consistent(monkeyp
 
     # the quota date must be one the mocked clock actually produced, and
     # the exhausted flag must be consistent with the usage it governs
-    assert provider._quota_date in ("2000-01-01", "2000-01-02")
-    with provider._state_lock:
-        if provider._daily_limit > 0:
-            assert provider._daily_exhausted == (
-                provider._daily_used >= provider._daily_limit
-            )
+    state = _read_quota_state(provider)
+    assert state["date"] in ("2000-01-01", "2000-01-02")
+    if state["limit"] > 0:
+        assert state["exhausted"] == (state["used"] >= state["limit"])
 
 
 # --------------------------------------------------------------------------- #
@@ -1002,15 +1028,15 @@ async def test_reconnect_during_inflight_request_documents_reconciliation(monkey
     # and holds the HTTP request in flight.
     task = asyncio.ensure_future(provider.generate(_request()))
     await asyncio.sleep(0.1)
-    assert provider._daily_used == 11, "seeded 10 + the in-flight reservation"
+    assert _read_daily_used(provider) == 11, "seeded 10 + the in-flight reservation"
 
     # 3) reconnect re-applies the /key snapshot while the request is in
     #    flight: the account snapshot replaces the local counter (the
     #    in-flight reservation is reconciled away - documented policy).
     assert provider.reconnect() is True
-    assert provider._daily_used == 10
-    assert provider._quota_date == provider._utc_today()
-    assert provider._daily_exhausted is False
+    assert _read_daily_used(provider) == 10
+    assert _read_quota_state(provider)["date"] == provider._utc_today()
+    assert _read_daily_exhausted(provider) is False
 
     # 4) release the request
     release.set()
@@ -1022,7 +1048,7 @@ async def test_reconnect_during_inflight_request_documents_reconciliation(monkey
     #    the seeded account values (the next send still reserves a slot).
     assert provider.is_available is True
     await provider.generate(_request())
-    assert provider._daily_used == 11
+    assert _read_daily_used(provider) == 11
 
 
 # --------------------------------------------------------------------------- #
@@ -1091,9 +1117,9 @@ async def test_generate_racing_utc_rollover_is_arbitrated_by_reservation(monkeyp
 
     request = _request()
     assert await provider.generate(request) == "ok"
-    assert provider._quota_date == "2030-01-02", "the rollover applied in-window"
-    assert provider._daily_used == 1, "exactly one slot reserved on the new day"
-    assert provider._daily_exhausted is False
+    assert _read_quota_state(provider)["date"] == "2030-01-02", "the rollover applied in-window"
+    assert _read_daily_used(provider) == 1, "exactly one slot reserved on the new day"
+    assert _read_daily_exhausted(provider) is False
     assert post_calls["n"] == 1, "exactly one HTTP request was sent"
 
 
@@ -1116,7 +1142,7 @@ async def test_exhaustion_in_race_window_is_refused_by_reservation(monkeypatch):
             "data": {"free_model_daily_requests": {"used": 1, "limit": 2}}
         }),
     )
-    assert provider._daily_exhausted is False
+    assert _read_daily_exhausted(provider) is False
 
     async def exhausting_pacing():
         # the exhausting snapshot lands strictly inside the race window
@@ -1128,8 +1154,8 @@ async def test_exhaustion_in_race_window_is_refused_by_reservation(monkeypatch):
     with pytest.raises(RateLimitError, match="Daily quota"):
         await provider.generate(_request())
     assert post_calls["n"] == 0, "no HTTP request may bypass the reservation"
-    assert provider._daily_exhausted is True, "the quota remains exhausted"
-    assert provider._daily_used == 2, "no additional slot was reserved"
+    assert _read_daily_exhausted(provider) is True, "the quota remains exhausted"
+    assert _read_daily_used(provider) == 2, "no additional slot was reserved"
 
 
 # --------------------------------------------------------------------------- #
@@ -1153,7 +1179,7 @@ def test_snapshot_fractional_and_nonfinite_are_rejected_wholesale(monkeypatch):
     pair: (date, used, limit, exhausted) must remain exactly as before."""
     provider = _provider(monkeypatch, lambda url, **k: _Response())
     _arrange_quota_state(provider, used=17, limit=50, exhausted=False)
-    before = (provider._quota_date, 17, 50, False)
+    before = _read_quota_state(provider)
 
     cases = [
         {"data": {"free_model_daily_requests": {"used": 5.9, "limit": 80}}},
@@ -1166,18 +1192,18 @@ def test_snapshot_fractional_and_nonfinite_are_rejected_wholesale(monkeypatch):
     ]
     for payload in cases[:-1]:
         provider._parse_key_quota(payload)
-        assert (provider._quota_date, provider._daily_used,
-                provider._daily_limit, provider._daily_exhausted) == before, payload
+        assert _read_quota_state(provider) == before, payload
 
     # the valid integral-float snapshot IS applied (intentional support)
     provider._parse_key_quota(cases[-1])
-    assert (provider._daily_used, provider._daily_limit, provider._daily_exhausted) == (5, 80, False)
+    state = _read_quota_state(provider)
+    assert (state["used"], state["limit"], state["exhausted"]) == (5, 80, False)
 
 
 def test_snapshot_negative_usage_and_zero_limit_rejected(monkeypatch):
     provider = _provider(monkeypatch, lambda url, **k: _Response())
     _arrange_quota_state(provider, used=17, limit=50, exhausted=False)
-    before = (provider._quota_date, 17, 50, False)
+    before = _read_quota_state(provider)
 
     for payload in (
         {"data": {"free_model_daily_requests": {"used": -1, "limit": 80}}},
@@ -1185,8 +1211,7 @@ def test_snapshot_negative_usage_and_zero_limit_rejected(monkeypatch):
         {"data": {"free_model_daily_requests": {"used": 5, "limit": 0}}},
     ):
         provider._parse_key_quota(payload)
-        assert (provider._quota_date, provider._daily_used,
-                provider._daily_limit, provider._daily_exhausted) == before, payload
+        assert _read_quota_state(provider) == before, payload
 
 
 # --------------------------------------------------------------------------- #
@@ -1223,9 +1248,9 @@ async def test_exhausted_snapshot_then_utc_rollover_admits(monkeypatch):
 
     request = _request()
     assert await provider.generate(request) == "ok"
-    assert provider._quota_date == "2030-01-02"
-    assert provider._daily_used == 1, "exactly one slot reserved on the new day"
-    assert provider._daily_exhausted is False
+    assert _read_quota_state(provider)["date"] == "2030-01-02"
+    assert _read_daily_used(provider) == 1, "exactly one slot reserved on the new day"
+    assert _read_daily_exhausted(provider) is False
     assert post_calls["n"] == 1
 
 
@@ -1249,9 +1274,9 @@ async def test_exhausted_snapshot_then_key_update_admits(monkeypatch):
 
     request = _request()
     assert await provider.generate(request) == "ok"
-    assert provider._daily_used == 2, "seeded 1 + exactly one reserved slot"
-    assert provider._daily_exhausted is False
-    assert provider._daily_limit == 5
+    assert _read_daily_used(provider) == 2, "seeded 1 + exactly one reserved slot"
+    assert _read_daily_exhausted(provider) is False
+    assert _read_daily_limit(provider) == 5
 
 
 async def test_still_exhausted_at_reservation_is_refused(monkeypatch):
@@ -1274,4 +1299,4 @@ async def test_still_exhausted_at_reservation_is_refused(monkeypatch):
     with pytest.raises(RateLimitError, match="Daily quota"):
         await provider.generate(_request())
     assert post_calls["n"] == 0
-    assert provider._daily_used == 2, "no additional reservation happened"
+    assert _read_daily_used(provider) == 2, "no additional reservation happened"

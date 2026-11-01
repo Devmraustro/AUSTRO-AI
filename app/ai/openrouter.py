@@ -126,13 +126,13 @@ class OpenRouterProvider(AIProvider):
         """UTC-midnight rollover. Caller MUST hold `_state_lock`.
 
         Lock ownership contract for the daily-quota state (`_quota_date`,
-        `_daily_used`, `_daily_limit`, `_daily_exhausted`): every transition
-        and every compound snapshot happens under `_state_lock` —
-        `_parse_key_quota` (seeding), `_reserve_daily_slot` (reservation),
+        `_daily_used`, `_daily_limit`, `_daily_exhausted`): EVERY read and
+        write happens under `_state_lock` — `_parse_key_quota` (seeding),
+        `_reserve_daily_slot` (the sole authoritative admission decision),
         `is_available` / `daily_used` / `daily_limit` (reads), and this
-        rollover. Single unlocked reads exist only as advisory fast-fails in
-        `generate`; the authoritative decision is always the locked one. No
-        nested acquisition anywhere; the lock is never held across I/O.
+        rollover. `generate()` touches no quota state before the
+        reservation. No nested acquisition anywhere; the lock is never held
+        across I/O.
         """
         today = self._utc_today()
         if today != self._quota_date:
