@@ -200,13 +200,17 @@ class OpenRouterProvider(AIProvider):
         )
 
     def _parse_key_quota(self, payload: dict) -> None:
-        """Seed the daily-quota state from the GET /key account response.
+        """Apply a GET /key quota snapshot atomically under `_state_lock`.
 
-        OpenRouter exposes the free-tier allowance on the key object; the
-        schema is parsed defensively so a field rename degrades to the
-        configured ceiling instead of crashing startup. Seeding replaces the
-        local usage with the account's truth (startup and reconnect), so an
-        app restart can never reset real consumption.
+        A valid snapshot reflects the account's truth for the CURRENT UTC
+        day: the quota date is synchronized together with the usage, so a
+        reconnect that happens after a UTC rollover cannot have its seeding
+        wiped by a stale-date rollover check. `used < limit` explicitly
+        clears exhaustion (reconnect recovers a prematurely exhausted
+        provider); `used >= limit` sets it. Missing or malformed fields leave
+        the existing state untouched — a bad snapshot never resets valid
+        account state. The lock keeps this atomic against concurrent
+        reservations.
         """
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, dict):
@@ -219,22 +223,25 @@ class OpenRouterProvider(AIProvider):
         elif isinstance(block, (int, float)):
             limit = block
             used = data.get("free_model_daily_usage")
-        if isinstance(used, (int, float)) and used >= 0:
-            self._daily_used = int(used)
-        if isinstance(limit, (int, float)) and limit > 0:
-            self._daily_limit = int(limit)
-        if self._daily_limit > 0:
-            if self._daily_used >= self._daily_limit:
-                self._daily_exhausted = True
-                logger.warning(
-                    "OpenRouter daily free quota already exhausted "
-                    f"({self._daily_used}/{self._daily_limit}); local fallback"
-                )
-            else:
-                logger.info(
-                    f"OpenRouter daily free quota: {self._daily_used}/"
-                    f"{self._daily_limit} used"
-                )
+        with self._state_lock:
+            if isinstance(used, (int, float)) and used >= 0:
+                self._quota_date = self._utc_today()
+                self._daily_used = int(used)
+            if isinstance(limit, (int, float)) and limit > 0:
+                self._daily_limit = int(limit)
+            if self._daily_limit > 0:
+                if self._daily_used >= self._daily_limit:
+                    self._daily_exhausted = True
+                    logger.warning(
+                        "OpenRouter daily free quota exhausted "
+                        f"({self._daily_used}/{self._daily_limit}); local fallback"
+                    )
+                else:
+                    self._daily_exhausted = False
+                    logger.info(
+                        f"OpenRouter daily free quota: {self._daily_used}/"
+                        f"{self._daily_limit} used"
+                    )
 
     def health_check(self) -> bool:
         """Verify the key against GET /key (blocking; run in a thread).
@@ -367,11 +374,17 @@ class OpenRouterProvider(AIProvider):
             )
         if self._daily_exhausted:
             raise RateLimitError("Daily free quota exhausted; resets at UTC midnight")
-        # Atomic reservation: one daily slot, held even if the request later
-        # fails (conservative accounting when the provider may have billed it).
-        self._reserve_daily_slot()
 
+        # Pacing happens BEFORE the quota reservation: a task cancelled while
+        # waiting to send must not burn a daily slot it never used.
         await self._rate_limit()
+
+        # Atomic reservation: one daily slot, reserved as the last step
+        # before the HTTP call (no await in between, so concurrent tasks
+        # can never exceed the remaining slots). The slot is held even if
+        # the request later fails — conservative accounting when the
+        # provider may have billed it.
+        self._reserve_daily_slot()
 
         key = self._settings.openrouter_api_key
         url = f"{self._settings.openrouter_api_url}/chat/completions"

@@ -641,3 +641,186 @@ def test_malformed_primary_rejected_through_settings_loader(monkeypatch):
     from app.config.settings import load_settings
     with pytest.raises(ConfigurationError, match="OPENROUTER_MODEL"):
         load_settings()
+
+
+# --------------------------------------------------------------------------- #
+# Quota synchronization across rollovers and reconnects                       #
+# --------------------------------------------------------------------------- #
+async def test_midnight_rollover_then_reconnect_preserves_today_usage(monkeypatch):
+    """Yesterday's exhausted state must not wipe a reconnect's /key snapshot
+    of TODAY's usage: the quota date is synchronized with the seeding."""
+    def behaviour(url, **kwargs):
+        return _Response(payload=_ok_payload("ok", model="google/gemma-4-31b-it:free"))
+
+    provider = _provider(monkeypatch, behaviour)
+    # 1) yesterday: quota exhausted
+    provider._quota_date = "2000-01-01"
+    provider._daily_used = 50
+    provider._daily_limit = 50
+    provider._daily_exhausted = True
+
+    # 2) the UTC date has advanced to today
+    today = provider._utc_today()
+    monkeypatch.setattr(
+        OpenRouterProvider, "_utc_today", staticmethod(lambda: today)
+    )
+
+    # 3) reconnect: /key reports today's non-zero usage
+    key_resp = _Response(payload={
+        "data": {"free_model_daily_requests": {"used": 3, "limit": 50}}
+    })
+    monkeypatch.setattr("app.ai.openrouter.requests.get", lambda url, **k: key_resp)
+    assert provider.reconnect() is True
+
+    # 4+5) today's usage is preserved (not reset by the stale date) and
+    # quota enforcement uses the newly seeded values
+    assert provider._quota_date == today
+    assert provider._daily_used == 3
+    assert provider._daily_limit == 50
+    assert provider._daily_exhausted is False
+    assert provider.is_available is True
+
+    # 6) the next generation bills against the seeded counter
+    await provider.generate(_request())
+    assert provider._daily_used == 4
+
+
+async def test_reconnect_after_exhaustion_restores_availability(monkeypatch):
+    """A prematurely exhausted provider recovers when /key reports usage
+    below the daily limit; the next request succeeds and counts."""
+    def behaviour(url, **kwargs):
+        return _Response(payload=_ok_payload("ok", model="google/gemma-4-31b-it:free"))
+
+    provider = _provider(monkeypatch, behaviour)
+    # 1) exhausted (e.g. conservative over-counting)
+    provider._daily_used = 50
+    provider._daily_limit = 50
+    provider._daily_exhausted = True
+    provider._cooldown_until = 0.0
+    assert provider.is_available is False
+
+    # 2+3) reconnect with /key reporting 30/50
+    key_resp = _Response(payload={
+        "data": {"free_model_daily_requests": {"used": 30, "limit": 50}}
+    })
+    monkeypatch.setattr("app.ai.openrouter.requests.get", lambda url, **k: key_resp)
+    assert provider.reconnect() is True
+
+    # 4) available again (no cooldown, quota below the limit)
+    assert provider.is_available is True
+    assert provider._daily_exhausted is False
+    assert provider._daily_used == 30
+
+    # 5) the next request succeeds and the daily counter increments
+    await provider.generate(_request())
+    assert provider._daily_used == 31
+    assert provider.request_count == 1
+
+
+async def test_reconnect_keeps_exhaustion_when_key_confirms_it(monkeypatch):
+    """When /key confirms the quota remains exhausted, reconnect must not
+    resurrect the provider."""
+    def behaviour(url, **kwargs):
+        return _Response(payload=_ok_payload("ok", model="google/gemma-4-31b-it:free"))
+
+    provider = _provider(monkeypatch, behaviour)
+    provider._daily_used = 50
+    provider._daily_limit = 50
+    provider._daily_exhausted = True
+
+    key_resp = _Response(payload={
+        "data": {"free_model_daily_requests": {"used": 50, "limit": 50}}
+    })
+    monkeypatch.setattr("app.ai.openrouter.requests.get", lambda url, **k: key_resp)
+    assert provider.reconnect() is True  # key itself is healthy
+    assert provider._daily_exhausted is True
+    assert provider.is_available is False
+    with pytest.raises(RateLimitError):
+        await provider.generate(_request())
+
+
+def test_malformed_key_snapshot_does_not_reset_valid_state(monkeypatch):
+    """A /key response without usable quota fields must leave the existing
+    account state exactly as it was."""
+    provider = _provider(monkeypatch, lambda url, **k: _Response())
+    provider._daily_used = 17
+    provider._daily_limit = 50
+    provider._daily_exhausted = False
+
+    for payload in (
+        {"data": {}},                                    # block missing
+        {"data": {"free_model_daily_requests": "junk"}},  # wrong shape
+        {"data": {"free_model_daily_requests": {"used": "x", "limit": None}}},
+        {"error": {"message": "server hiccup"}},          # no data at all
+    ):
+        provider._parse_key_quota(payload)
+        assert provider._daily_used == 17, payload
+        assert provider._daily_limit == 50, payload
+        assert provider._daily_exhausted is False, payload
+
+
+# --------------------------------------------------------------------------- #
+# Reservation placement: after pacing, immediately before HTTP                #
+# --------------------------------------------------------------------------- #
+async def test_cancellation_during_pacing_consumes_no_slot(monkeypatch):
+    """A task cancelled while waiting in the pacing sleep must not burn a
+    daily slot it never used."""
+    key_resp = _Response(payload={
+        "data": {"free_model_daily_requests": {"used": 0, "limit": 5}}
+    })
+    post_calls = {"n": 0}
+
+    def behaviour(url, **kwargs):
+        post_calls["n"] += 1
+        return _Response(payload=_ok_payload("ok", model="google/gemma-4-31b-it:free"))
+
+    provider = _provider(
+        monkeypatch, behaviour, key_response=key_resp, min_request_interval=30.0,
+    )
+    # a first send stamps last_request_time, so the NEXT request parks in
+    # the pacing sleep (min_request_interval=30s)
+    await provider.generate(_request())
+    assert provider._daily_used == 1 and post_calls["n"] == 1
+
+    task = asyncio.ensure_future(provider.generate(_request()))
+    await asyncio.sleep(0.05)  # the task is now parked inside the pacing sleep
+    assert provider._daily_used == 1, "no reservation while parked in pacing"
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert provider._daily_used == 1, "cancellation during pacing frees the slot"
+    assert post_calls["n"] == 1
+
+    # the slot is intact: a normal request (pacing disabled) still goes through
+    provider._settings = dataclasses.replace(
+        provider._settings, min_request_interval=0.0
+    )
+    await provider.generate(_request())
+    assert post_calls["n"] == 2
+    assert provider._daily_used == 2
+
+
+async def test_concurrent_requests_stay_capped_after_pacing(monkeypatch):
+    """With pacing enabled, reservations still serialize under the lock:
+    concurrent tasks can never send more than the remaining slots."""
+    key_resp = _Response(payload={
+        "data": {"free_model_daily_requests": {"used": 0, "limit": 2}}
+    })
+    post_calls = {"n": 0}
+
+    def behaviour(url, **kwargs):
+        post_calls["n"] += 1
+        return _Response(payload=_ok_payload("ok", model="google/gemma-4-31b-it:free"))
+
+    provider = _provider(
+        monkeypatch, behaviour, key_response=key_resp, min_request_interval=0.02,
+    )
+    results = await asyncio.gather(*[
+        provider.generate(_request(user_id=i)) for i in range(4)
+    ], return_exceptions=True)
+    ok = [r for r in results if not isinstance(r, BaseException)]
+    refused = [r for r in results if isinstance(r, RateLimitError)]
+    assert len(ok) == 2 and len(refused) == 2
+    assert post_calls["n"] == 2
+    assert provider._daily_used == 2
