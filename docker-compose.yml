@@ -103,8 +103,6 @@ services:
       BACKUP_ENCRYPTION_ENABLED: "true"
       BACKUP_ENCRYPTION_KEY_FILE: /run/secrets/backup_encryption_key
       BACKUP_WORKDIR: /var/tmp/austro-backup-work
-    secrets:
-      - backup_encryption_key
     read_only: true
     security_opt:
       - no-new-privileges:true
@@ -116,6 +114,13 @@ services:
         tmpfs:
           size: ${BACKUP_WORKDIR_TMPFS_BYTES:-4294967296}
           mode: 1777
+      # Read-only bind mount: a file secret would be 0444 by default and
+      # Compose ignores mode/uid/gid outside Swarm, so the host file must carry
+      # 0400 ownership itself (`chown 10001:10001`, `chmod 0400`).
+      - type: bind
+        source: ${BACKUP_ENCRYPTION_KEY_FILE_HOST:-./secrets/backup_encryption_key}
+        target: /run/secrets/backup_encryption_key
+        read_only: true
       - backups:/app/backups
     restart: unless-stopped
 
@@ -146,10 +151,6 @@ volumes:
   logs:
   backups:
   postgres_data:
-
-secrets:
-  backup_encryption_key:
-    file: ${BACKUP_ENCRYPTION_KEY_FILE_HOST:-./secrets/backup_encryption_key}
 
 networks:
   default:

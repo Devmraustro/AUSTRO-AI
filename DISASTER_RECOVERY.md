@@ -23,7 +23,7 @@ safety gates described in §3.
 | Backup tool | PostgreSQL `pg_dump` (logical, plain SQL, `--clean --if-exists --no-owner --no-acl`), piped through gzip into an AES-256-GCM container. The plain SQL dump lives only in a private 0700 work directory and is deleted on success, failure and stale-run recovery. It never reaches the shared backup volume. |
 | pg_dump client | `postgresql-client-16` in `Dockerfile.backup` (must match the server major version) |
 | Authentication | `0600` `.pgpass` via `PGPASSFILE` + `--no-password`; the password never appears in argv, logs, or the manifest |
-| Encryption | **Always on in the worker** (`BACKUP_ENCRYPTION_ENABLED=true`). AES-256-GCM, key = raw 32-byte file at `BACKUP_ENCRYPTION_KEY_FILE` (a Compose secret). A missing or wrong-sized key stops the run before any dump. Container layout: `0x01 \|\| nonce(12) \|\| ciphertext \|\| tag(16)`. The scheduler refuses to start with the flag off. |
+| Encryption | **Always on in the worker** (`BACKUP_ENCRYPTION_ENABLED=true`). AES-256-GCM, key = raw 32-byte file at `BACKUP_ENCRYPTION_KEY_FILE` (bind-mounted read-only; the host file must be `0400`, owned by UID/GID 10001). A missing, wrong-sized, group-readable or world-readable key stops the run before any dump. Container layout: `0x01 \|\| nonce(12) \|\| ciphertext \|\| tag(16)`. The scheduler refuses to start with the flag off. |
 | Compression | gzip (level 6), streamed so memory stays flat on large dumps |
 | Integrity | SHA-256 recorded in a JSON manifest next to each archive: `checksum_sha256` (decompressed SQL) and `archive_sha256` (the published, encrypted file). The manifest also records `encryption.enabled` and `encryption.algo = aes-256-gcm`. |
 | Row-count manifest | per-table row counts captured at backup time |

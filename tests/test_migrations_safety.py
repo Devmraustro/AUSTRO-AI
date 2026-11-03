@@ -92,6 +92,32 @@ def test_core_v1_rejects_unique_index_with_wrong_table_or_columns(monkeypatch):
     conn.close()
 
 
+def test_core_v1_rejects_unique_index_with_wrong_columns(monkeypatch):
+    """A unique index can still be wrong: the validator must compare columns.
+
+    This is distinct from the wrong-table case (where the table check already
+    fails) and from the non-unique case (where the index-type check already
+    fails), so it exercises the column-comparison branch directly.
+    """
+    conn = _core_db()
+    # Unique, but on the primary key instead of (user_id, date).
+    conn.execute(
+        "CREATE UNIQUE INDEX uq_daily_reviews_user_date ON daily_reviews(review_id)"
+    )
+    conn.commit()
+    monkeypatch.setattr(migrations, "_DB_ENGINE", "sqlite")
+    monkeypatch.setattr(migrations, "MIGRATIONS", [migrations.CORE_V1])
+
+    with pytest.raises(RuntimeError, match="conflicting index definition"):
+        migrations.apply_migrations(conn)
+
+    assert conn.execute("SELECT COUNT(*) FROM daily_reviews").fetchone() == (4,)
+    assert conn.execute(
+        "SELECT version FROM schema_migrations WHERE schema_name = 'core'"
+    ).fetchone() is None
+    conn.close()
+
+
 def test_core_v1_verification_failure_is_not_recorded(monkeypatch):
     conn = _core_db()
     monkeypatch.setattr(migrations, "_DB_ENGINE", "sqlite")

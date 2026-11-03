@@ -44,12 +44,21 @@ def test_backup_worker_enables_encryption_from_a_read_only_secret(
     assert str(env["BACKUP_ENCRYPTION_ENABLED"]).lower() == "true"
     key_path = env["BACKUP_ENCRYPTION_KEY_FILE"]
     assert key_path == f"/run/secrets/{secret}"
-    assert secret in backup["secrets"]
+    # A file secret would be mounted 0444 by default and Compose ignores
+    # mode/uid/gid outside Swarm, so the key is a read-only bind mount whose
+    # host file itself is 0400 (checked by the loader at run time).
+    mounts = backup["volumes"]
+    mount = next(
+        m for m in mounts
+        if isinstance(m, dict) and m.get("target") == f"/run/secrets/{secret}"
+    )
+    assert mount["type"] == "bind"
+    assert mount["read_only"] is True
+    assert mount["source"]  # host path defined, never inline content
+    assert "content" not in mount
     # the key itself must never be an environment value
     for value in env.values():
         assert "BEGIN" not in str(value)
-    assert doc["secrets"][secret]["file"]  # host path defined, never inline content
-    assert "content" not in doc["secrets"][secret]
 
 
 @pytest.mark.parametrize("fixture_name", ["prod", "staging"])
@@ -60,8 +69,12 @@ def test_backup_plaintext_work_dir_is_tmpfs_not_the_backup_volume(request, fixtu
     mounts = backup["volumes"]
     tmpfs = [m for m in mounts if isinstance(m, dict) and m.get("type") == "tmpfs"]
     assert tmpfs and tmpfs[0]["target"] == "/var/tmp/austro-backup-work"
-    # the only persistent mount is the archive directory
-    persistent = [m for m in mounts if not (isinstance(m, dict) and m.get("type") == "tmpfs")]
+    # the only persistent writable mount is the archive directory (the key is a
+    # separate read-only bind mount)
+    persistent = [
+        m for m in mounts
+        if not (isinstance(m, dict) and m.get("type") in ("tmpfs", "bind"))
+    ]
     assert persistent == ["backups:/app/backups"]
     assert backup.get("read_only") is True
 

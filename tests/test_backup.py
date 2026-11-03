@@ -503,6 +503,9 @@ def _write_raw(tmp_path: Path, body: bytes = None) -> Path:
 def _key_file(tmp_path: Path, key: bytes) -> Path:
     path = tmp_path / "backup.key"
     path.write_bytes(key)
+    # Secret files are 0600 in production; the loader rejects group/world
+    # readable keys on POSIX, so match that here.
+    path.chmod(0o600)
     return path
 
 
@@ -759,6 +762,7 @@ def test_plaintext_dump_never_lands_in_the_backup_directory(env, tmp_path, monke
     dump_target = Path(runner.calls[0]["argv"][runner.calls[0]["argv"].index("-f") + 1])
     assert outdir.resolve() not in dump_target.resolve().parents
     assert work.resolve() in dump_target.resolve().parents
+    assert dump_target.name.endswith(pg_backup.RAW_SUFFIX)
     # nothing plaintext-like survives in the persistent directory
     assert not [p for p in outdir.iterdir() if p.suffix == ".part" or p.suffix == ".sql"]
 
@@ -805,6 +809,11 @@ def test_stale_plaintext_from_killed_run_is_purged(env, tmp_path, monkeypatch):
     work = _workdir(tmp_path, monkeypatch)
     legacy = outdir / f".{BACKUP_PREFIX}20251201_020000.sql.part"
     legacy.write_text("PLAINTEXT SECRET DUMP", encoding="utf-8")
+    visible = outdir / f"leftover{pg_backup.RAW_SUFFIX}"
+    visible.write_text("PLAINTEXT SECRET DUMP", encoding="utf-8")
+    abandoned_tmp = outdir / pg_backup.PRIVATE_WORKDIR_NAME
+    abandoned_tmp.mkdir()
+    (abandoned_tmp / "dump.sql").write_text("PLAINTEXT SECRET DUMP", encoding="utf-8")
     old_work = work / f"{pg_backup.WORK_PREFIX}abandoned"
     old_work.mkdir(parents=True)
     (old_work / "dump.sql").write_text("PLAINTEXT SECRET DUMP", encoding="utf-8")
@@ -813,6 +822,8 @@ def test_stale_plaintext_from_killed_run_is_purged(env, tmp_path, monkeypatch):
     assert run_backup(outdir, now=_moment(10), connect=_fake_connect,
                       dump_runner=_DumpRunner(), tool=Path("pg_dump")) == 0
     assert not legacy.exists()
+    assert not visible.exists()
+    assert not abandoned_tmp.exists()
     assert not old_work.exists()
     assert list(work.iterdir()) == []
 
@@ -851,6 +862,7 @@ def test_encryption_required_with_invalid_key_fails_before_dump(env, tmp_path, m
     monkeypatch.setenv("BACKUP_ENCRYPTION_ENABLED", "true")
     key_file = tmp_path / "short.key"
     key_file.write_bytes(b"too-short")
+    key_file.chmod(0o600)
     monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", str(key_file))
     _workdir(tmp_path, monkeypatch)
     runner = _DumpRunner()
@@ -864,6 +876,7 @@ def test_encrypted_run_publishes_no_plaintext_and_declares_encryption(env, tmp_p
     key = bytes(range(32))
     key_file = tmp_path / "backup.key"
     key_file.write_bytes(key)
+    key_file.chmod(0o600)
     monkeypatch.setenv("BACKUP_ENCRYPTION_ENABLED", "true")
     monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", str(key_file))
     _workdir(tmp_path, monkeypatch)
@@ -886,10 +899,90 @@ def test_key_with_leading_and_trailing_whitespace_bytes_is_not_corrupted(tmp_pat
     assert len(key) == 32
     path = tmp_path / "ws.key"
     path.write_bytes(key + b"\n")
+    path.chmod(0o600)
     monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", str(path))
     assert pg_backup._load_encryption_key() == key
     path.write_bytes(key)  # and the bare key is accepted as-is
     assert pg_backup._load_encryption_key() == key
+
+
+class _FakeStat:
+    def __init__(self, mode: int) -> None:
+        self.st_mode = mode
+
+
+def _force_posix_mode(monkeypatch, mode: int) -> None:
+    """Make the POSIX-only permission check see `mode`, on every platform."""
+    monkeypatch.setattr(pg_backup.os, "name", "posix", raising=False)
+    monkeypatch.setattr(
+        pg_backup.os, "stat", lambda path, *a, **kw: _FakeStat(mode)
+    )
+
+
+@pytest.mark.parametrize("mode", [0o600, 0o400])
+def test_key_permissions_accept_owner_only_files(monkeypatch, tmp_path, mode):
+    path = tmp_path / "backup.key"
+    path.write_bytes(bytes(32))
+    _force_posix_mode(monkeypatch, stat.S_IFREG | mode)
+    pg_backup._validate_key_file_permissions(path)  # must not raise
+
+
+def test_key_permissions_reject_group_readable_files(monkeypatch, tmp_path):
+    path = tmp_path / "backup.key"
+    path.write_bytes(bytes(32))
+    _force_posix_mode(monkeypatch, stat.S_IFREG | 0o640)
+    with pytest.raises(RuntimeError, match="group-readable or world-readable"):
+        pg_backup._validate_key_file_permissions(path)
+
+
+def test_key_permissions_reject_world_readable_files(monkeypatch, tmp_path):
+    path = tmp_path / "backup.key"
+    path.write_bytes(bytes(32))
+    _force_posix_mode(monkeypatch, stat.S_IFREG | 0o644)
+    with pytest.raises(RuntimeError, match="world-readable"):
+        pg_backup._validate_key_file_permissions(path)
+
+
+def test_key_permissions_reject_non_regular_files(monkeypatch, tmp_path):
+    path = tmp_path / "backup.key"
+    path.write_bytes(bytes(32))
+    _force_posix_mode(monkeypatch, stat.S_IFDIR | 0o600)
+    with pytest.raises(RuntimeError, match="not a regular file"):
+        pg_backup._validate_key_file_permissions(path)
+
+
+def test_key_permissions_fail_closed_when_stat_fails(monkeypatch, tmp_path):
+    path = tmp_path / "backup.key"
+    path.write_bytes(bytes(32))
+
+    def _boom(*args, **kwargs):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(pg_backup.os, "name", "posix", raising=False)
+    monkeypatch.setattr(pg_backup.os, "stat", _boom)
+    with pytest.raises(RuntimeError, match="could not inspect"):
+        pg_backup._validate_key_file_permissions(path)
+
+
+def test_key_permissions_are_a_noop_on_windows(monkeypatch, tmp_path):
+    path = tmp_path / "backup.key"
+    path.write_bytes(bytes(32))
+
+    def _must_not_run(*args, **kwargs):  # pragma: no cover - asserted by not running
+        raise AssertionError("POSIX permission check ran on Windows")
+
+    monkeypatch.setattr(pg_backup.os, "name", "nt", raising=False)
+    monkeypatch.setattr(pg_backup.os, "stat", _must_not_run)
+    pg_backup._validate_key_file_permissions(path)  # must not raise
+
+
+def test_group_readable_key_makes_the_loader_fail_closed(monkeypatch, tmp_path):
+    key_path = tmp_path / "backup.key"
+    key_path.write_bytes(bytes(32))
+    monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", str(key_path))
+    _force_posix_mode(monkeypatch, stat.S_IFREG | 0o644)
+    with pytest.raises(RuntimeError, match="world-readable"):
+        pg_backup._load_encryption_key(required=True)
 
 
 def test_scheduler_refuses_to_start_without_encryption(monkeypatch, tmp_path):
