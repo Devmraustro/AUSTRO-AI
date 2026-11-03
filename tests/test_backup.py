@@ -1061,3 +1061,116 @@ def test_restore_drill_resolves_psql_from_path_without_pg_bin(monkeypatch, tmp_p
     monkeypatch.delenv("PG_BIN", raising=False)
     monkeypatch.setenv("PATH", str(tool.parent))
     assert pg_restore_drill.find_tool("psql") == tool
+
+
+# ==================== PostgreSQL TLS propagation ==================== #
+
+
+def test_postgres_tls_kwargs_reads_env(monkeypatch):
+    monkeypatch.setenv("DB_SSLMODE", "verify-full")
+    monkeypatch.setenv("DB_SSL_ROOT_CERT", "/ca.pem")
+    monkeypatch.setenv("DB_SSL_CERT", "/client.crt")
+    monkeypatch.setenv("DB_SSL_KEY", "/client.key")
+    assert pg_backup.postgres_tls_kwargs() == {
+        "sslmode": "verify-full",
+        "sslrootcert": "/ca.pem",
+        "sslcert": "/client.crt",
+        "sslkey": "/client.key",
+    }
+
+
+def test_postgres_tls_env_overrides_inherited(monkeypatch):
+    monkeypatch.setenv("DB_SSLMODE", "require")
+    monkeypatch.setenv("DB_SSL_ROOT_CERT", "/ca.pem")
+    monkeypatch.setenv("PGSSLMODE", "disable")  # inherited, must be overridden
+    env = pg_backup.postgres_tls_env()
+    assert env["PGSSLMODE"] == "require"
+    assert env["PGSSLROOTCERT"] == "/ca.pem"
+
+
+def test_assert_remote_tls_rejects_prefer_for_remote(monkeypatch):
+    monkeypatch.delenv("DB_ALLOW_INSECURE", raising=False)
+    monkeypatch.setenv("DB_SSLMODE", "prefer")
+    with pytest.raises(RuntimeError, match="DB_SSLMODE"):
+        pg_backup._assert_remote_tls("db.example.test")
+
+
+def test_assert_remote_tls_accepts_require_for_remote(monkeypatch):
+    monkeypatch.delenv("DB_ALLOW_INSECURE", raising=False)
+    monkeypatch.setenv("DB_SSLMODE", "require")
+    pg_backup._assert_remote_tls("db.example.test")  # must not raise
+
+
+def test_assert_remote_tls_allows_local_prefer(monkeypatch):
+    monkeypatch.setenv("DB_SSLMODE", "prefer")
+    pg_backup._assert_remote_tls("127.0.0.1")  # must not raise
+
+
+def test_snapshot_row_counts_propagates_tls(monkeypatch, tmp_path):
+    monkeypatch.setenv("DB_HOST", "db.example.test")
+    monkeypatch.setenv("DB_SSLMODE", "require")
+    monkeypatch.setenv("DB_SSL_ROOT_CERT", "/ca.pem")
+    monkeypatch.setenv("DB_PASSWORD", "secret")
+    captured = {}
+
+    def connect(**kwargs):
+        captured.update(kwargs)
+        return _fake_connect(**kwargs)
+
+    dsn = {"PGHOST": "db.example.test", "PGPORT": "5432",
+           "PGDATABASE": "austro_ai", "PGUSER": "austro"}
+    pg_backup.snapshot_row_counts(dsn, connect)
+    assert captured["sslmode"] == "require"
+    assert captured["sslrootcert"] == "/ca.pem"
+    assert "password" in captured
+
+
+def test_snapshot_row_counts_fails_closed_for_remote_prefer(monkeypatch, tmp_path):
+    monkeypatch.setenv("DB_HOST", "db.example.test")
+    monkeypatch.setenv("DB_SSLMODE", "prefer")
+    monkeypatch.delenv("DB_ALLOW_INSECURE", raising=False)
+    called = {"n": 0}
+
+    def connect(**kwargs):
+        called["n"] += 1
+        return _fake_connect(**kwargs)
+
+    dsn = {"PGHOST": "db.example.test", "PGPORT": "5432",
+           "PGDATABASE": "austro_ai", "PGUSER": "austro"}
+    with pytest.raises(RuntimeError, match="DB_SSLMODE"):
+        pg_backup.snapshot_row_counts(dsn, connect)
+    assert called["n"] == 0
+
+
+def test_run_pg_dump_propagates_tls_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("DB_HOST", "db.example.test")
+    monkeypatch.setenv("DB_SSLMODE", "verify-full")
+    monkeypatch.setenv("DB_SSL_ROOT_CERT", "/ca.pem")
+    monkeypatch.setenv("DB_PASSWORD", "secret")
+    runner = _DumpRunner()
+    dsn = {"PGHOST": "db.example.test", "PGPORT": "5432",
+           "PGDATABASE": "austro_ai", "PGUSER": "austro"}
+    raw = tmp_path / "dump.sql.part"
+    pg_backup.run_pg_dump(raw, dsn=dsn, password="secret", runner=runner,
+                          tool=Path("pg_dump"))
+    assert runner.calls, "pg_dump was not invoked"
+    env = runner.calls[0]["env"]
+    assert env["PGSSLMODE"] == "verify-full"
+    assert env["PGSSLROOTCERT"] == "/ca.pem"
+    assert "PGPASSWORD" not in env
+    assert "secret" not in " ".join(runner.calls[0]["argv"])
+    # PGPASSFILE mechanism remains intact.
+    assert env.get("PGPASSFILE")
+
+
+def test_run_pg_dump_fails_closed_for_remote_disable(monkeypatch, tmp_path):
+    monkeypatch.setenv("DB_HOST", "db.example.test")
+    monkeypatch.setenv("DB_SSLMODE", "disable")
+    monkeypatch.delenv("DB_ALLOW_INSECURE", raising=False)
+    runner = _DumpRunner()
+    dsn = {"PGHOST": "db.example.test", "PGPORT": "5432",
+           "PGDATABASE": "austro_ai", "PGUSER": "austro"}
+    raw = tmp_path / "dump.sql.part"
+    with pytest.raises(RuntimeError, match="DB_SSLMODE"):
+        pg_backup.run_pg_dump(raw, dsn=dsn, password="secret", runner=runner)
+    assert runner.calls == []

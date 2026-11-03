@@ -45,6 +45,7 @@ def _good_env(**overrides):
         "DB_PASSWORD": APP_PW,
         "DB_HOST": "db.example.test",
         "DB_PORT": "5432",
+        "DB_SSLMODE": "require",
         "RESTORE_TARGET_DB": TARGET,
         "RESTORE_CONFIRM_DESTRUCTIVE": required_confirmation(TARGET),
         "RESTORE_ADMIN_USER": ADMIN,
@@ -411,3 +412,38 @@ def test_restore_drill_source_has_no_default_target_or_superuser():
     assert '"postgres" if superuser' not in source
     assert 'os.environ.get("DB_NAME", "austro_ai")' not in source
     assert "RESTORE_TARGET_DB" in source and "RESTORE_ADMIN_USER" in source
+
+
+def test_restore_drill_fails_closed_for_remote_prefer(tmp_path):
+    archive, manifest = _make_archive(tmp_path, key=None)
+    env = _good_env()
+    env["DB_SSLMODE"] = "prefer"
+    env["DB_HOST"] = "db.example.test"
+    rec = _Recorder()
+    rc = pg_restore_drill.run_restore_drill(
+        archive, manifest, env=env, connect=rec.connect,
+        psql_runner=_psql_ok(rec.events),
+    )
+    assert rc == 1  # EXIT_FAILED, before any database work
+
+
+def test_restore_drill_propagates_tls_to_connections(tmp_path):
+    archive, manifest = _make_archive(tmp_path, key=None)
+    env = _good_env()
+    env["DB_SSL_ROOT_CERT"] = "/ca.pem"
+    rec = _Recorder()
+    recorded = []
+
+    def connect(**kwargs):
+        recorded.append(dict(kwargs))
+        return rec.connect(**kwargs)
+
+    rc = pg_restore_drill.run_restore_drill(
+        archive, manifest, env=env, connect=connect,
+        psql_runner=_psql_ok(rec.events),
+    )
+    assert rc == 0
+    assert recorded, "no database connection was opened"
+    for kwargs in recorded:
+        assert kwargs.get("sslmode") == "require"
+        assert kwargs.get("sslrootcert") == "/ca.pem"

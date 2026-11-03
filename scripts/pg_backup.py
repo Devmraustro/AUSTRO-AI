@@ -57,7 +57,7 @@ import tempfile
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 BACKUP_PREFIX = "austro_ai_backup_"
 ARCHIVE_SUFFIX = ".sql.gz"
@@ -131,6 +131,72 @@ def dsn_env() -> Dict[str, str]:
         "PGDATABASE": os.environ.get("DB_NAME", "austro_ai"),
         "PGUSER": os.environ.get("DB_USER", "austro"),
     }
+
+
+_LOCAL_DB_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "postgres", "db"})
+
+
+def _db_allow_insecure() -> bool:
+    return os.environ.get("DB_ALLOW_INSECURE", "").strip().lower() in {
+        "1", "true", "yes"
+    }
+
+
+def _assert_remote_tls(host: str, env: Optional[Mapping[str, str]] = None) -> None:
+    """Fail closed before any remote PostgreSQL connection is opened.
+
+    Mirrors `app.database.connection._assert_tls_for_remote_host`: a remote host
+    must not use an sslmode that permits plaintext (disable/allow/prefer). Local
+    hosts keep working for development and CI.
+    """
+    source = os.environ if env is None else env
+    host_norm = (host or "localhost").strip().lower()
+    if host_norm in _LOCAL_DB_HOSTS:
+        return
+    mode = (source.get("DB_SSLMODE", "prefer") or "prefer").strip().lower() or "prefer"
+    if mode in {"disable", "allow", "prefer"} and not (
+        (source.get("DB_ALLOW_INSECURE", "") or "").strip().lower()
+        in {"1", "true", "yes"}
+    ):
+        raise RuntimeError(
+            f"DB_SSLMODE={mode!r} would allow an unencrypted connection to the "
+            f"remote PostgreSQL host {host_norm!r}. Set DB_SSLMODE=require (or "
+            f"verify-full with DB_SSL_ROOT_CERT) to encrypt the connection."
+        )
+
+
+def postgres_tls_kwargs(env: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
+    """TLS kwargs for psycopg2, derived from the same env vars as the app."""
+    source = os.environ if env is None else env
+    kwargs: Dict[str, str] = {
+        "sslmode": (source.get("DB_SSLMODE", "prefer") or "prefer").strip().lower() or "prefer"
+    }
+    for env_name, key in (
+        ("DB_SSL_ROOT_CERT", "sslrootcert"),
+        ("DB_SSL_CERT", "sslcert"),
+        ("DB_SSL_KEY", "sslkey"),
+    ):
+        value = (source.get(env_name, "") or "").strip()
+        if value:
+            kwargs[key] = value
+    return kwargs
+
+
+def postgres_tls_env(env: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
+    """TLS variables for libpq/pg_dump, overriding any inherited value."""
+    source = os.environ if env is None else env
+    result: Dict[str, str] = {
+        "PGSSLMODE": (source.get("DB_SSLMODE", "prefer") or "prefer").strip().lower() or "prefer"
+    }
+    for env_name, key in (
+        ("DB_SSL_ROOT_CERT", "PGSSLROOTCERT"),
+        ("DB_SSL_CERT", "PGSSLCERT"),
+        ("DB_SSL_KEY", "PGSSLKEY"),
+    ):
+        value = (source.get(env_name, "") or "").strip()
+        if value:
+            result[key] = value
+    return result
 
 
 def _first_lines(text: Optional[str], limit: int = 400) -> str:
@@ -301,12 +367,15 @@ def snapshot_row_counts(
     dsn: Dict[str, str], connect: Callable[..., object]
 ) -> Tuple[List[str], Dict[str, int]]:
     """Per-table row counts at backup time (feeds the restore-drill manifest)."""
+    _assert_remote_tls(dsn["PGHOST"])
+    tls_kwargs = postgres_tls_kwargs()
     conn = connect(
         host=dsn["PGHOST"],
         port=dsn["PGPORT"],
         dbname=dsn["PGDATABASE"],
         user=dsn["PGUSER"],
         password=os.environ.get("DB_PASSWORD", ""),
+        **tls_kwargs,
     )
     conn.autocommit = True
     try:
@@ -362,6 +431,7 @@ def run_pg_dump(
     timeout: int = PGDUMP_TIMEOUT,
 ) -> subprocess.CompletedProcess:
     """Run pg_dump. The password reaches libpq through PGPASSFILE only."""
+    _assert_remote_tls(dsn["PGHOST"])
     tool = tool or find_tool("pg_dump")
     runner = runner or subprocess.run
     with tempfile.TemporaryDirectory(prefix="austro-pgpass-") as tmp:
@@ -372,6 +442,12 @@ def run_pg_dump(
         env = {**os.environ, **dsn, "PGPASSFILE": str(pgpass),
                "PGCLIENTENCODING": "UTF8"}
         env.pop("PGPASSWORD", None)
+        # Propagate TLS explicitly so libpq cannot inherit a contradictory or
+        # insecure PGSSLMODE from the surrounding environment.
+        env.update(postgres_tls_env())
+        for key in ("PGSSLMODE", "PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY"):
+            if key in env and not env[key]:
+                env.pop(key, None)
         argv = [
             str(tool), "-h", dsn["PGHOST"], "-p", dsn["PGPORT"],
             "-U", dsn["PGUSER"], "-d", dsn["PGDATABASE"],

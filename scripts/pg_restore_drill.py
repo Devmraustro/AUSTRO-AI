@@ -46,10 +46,12 @@ if REPO_ROOT not in sys.path:
 from scripts.pg_backup import (  # noqa: E402
     ARCHIVE_SUFFIX,
     MANIFEST_SUFFIX,
+    _assert_remote_tls,
     archive_is_encrypted,
     file_sha256,
     find_tool,
     open_archive_sql,
+    postgres_tls_kwargs,
     write_pgpass,
 )
 from scripts.restore_safety import (  # noqa: E402
@@ -75,10 +77,12 @@ def _psycopg2_connect(**kwargs):
 
 
 def _pg_conn_args(env: Mapping[str, str]) -> Dict[str, str]:
-    return {
+    args = {
         "host": env.get("DB_HOST", "127.0.0.1"),
         "port": env.get("DB_PORT", "5432"),
     }
+    args.update(postgres_tls_kwargs(env))
+    return args
 
 
 def _run_psql(
@@ -248,6 +252,12 @@ def run_restore_drill(
                         "The target database was NOT modified.")
         return EXIT_FAILED
     _say("1/5", "archive, key, decompression and content checksum verified")
+
+    try:
+        _assert_remote_tls(env.get("DB_HOST", "127.0.0.1"), env)
+    except RuntimeError as exc:
+        _say("refused", f"TLS FAILED: {exc}. The target database was NOT modified.")
+        return EXIT_FAILED
 
     def conn_factory(dbname: str, *, user: str = admin_user, password: str = admin_password):
         args = _pg_conn_args(env)
