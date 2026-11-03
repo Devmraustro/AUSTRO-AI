@@ -65,7 +65,7 @@ def test_cross_user_update_forget_delete_clear_are_no_ops(memory):
 
 
 def test_cross_user_export_does_not_leak(memory):
-    mid = _make(memory, 1)
+    _make(memory, 1)
     payload = memory.export(2)
     # No active memories for B -> export is None (no leak).
     assert payload is None
