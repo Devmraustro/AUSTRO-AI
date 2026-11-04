@@ -51,6 +51,7 @@ from scripts.pg_backup import (  # noqa: E402
     file_sha256,
     find_tool,
     open_archive_sql,
+    postgres_tls_env,
     postgres_tls_kwargs,
     write_pgpass,
 )
@@ -98,15 +99,26 @@ def _run_psql(
     if runner is not None:
         return runner(dbname, stream)
     conn = _pg_conn_args(env)
+    # Start from a scrubbed copy of the environment so an inherited insecure
+    # PGSSLMODE (or stale certificate paths) cannot override the policy derived
+    # from DB_SSLMODE / DB_SSL_*.
     psql_env = {
-        **{k: v for k, v in os.environ.items() if k not in ("PGPASSWORD",)},
+        k: v for k, v in os.environ.items()
+        if k not in ("PGPASSWORD", "PGSSLMODE", "PGSSLROOTCERT",
+                     "PGSSLCERT", "PGSSLKEY")
+    }
+    psql_env.update({
         "PGHOST": conn["host"],
         "PGPORT": conn["port"],
         "PGDATABASE": dbname,
         "PGUSER": user,
         "PGPASSFILE": str(pgpass),
         "PGCLIENTENCODING": "UTF8",
-    }
+    })
+    psql_env.update(postgres_tls_env(env))
+    for key in ("PGSSLMODE", "PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY"):
+        if not psql_env.get(key):
+            psql_env.pop(key, None)
     # psql reads the verified SQL from its stdin pipe. The decrypted stream is a
     # Python object without a file descriptor, so it is copied in bounded
     # chunks. stderr goes to a temp file so a noisy psql cannot deadlock on a

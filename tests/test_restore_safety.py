@@ -7,6 +7,7 @@ without a PostgreSQL server.
 """
 
 from __future__ import annotations
+import io
 
 import gzip
 import hashlib
@@ -412,6 +413,101 @@ def test_restore_drill_source_has_no_default_target_or_superuser():
     assert '"postgres" if superuser' not in source
     assert 'os.environ.get("DB_NAME", "austro_ai")' not in source
     assert "RESTORE_TARGET_DB" in source and "RESTORE_ADMIN_USER" in source
+
+
+class _FakePopen:
+    def __init__(self, args, stdin=None, stdout=None, stderr=None, env=None, **kwargs):
+        self.args = list(args)
+        self.env = dict(env or {})
+        self.stdin = io.BytesIO()
+        self.returncode = 0
+        _FakePopen.last_env = self.env
+        _FakePopen.last_args = self.args
+
+    def wait(self, timeout=None):
+        return 0
+
+
+def test_run_psql_propagates_tls_and_scrubs_inherited(monkeypatch, tmp_path):
+    import io
+    import scripts.pg_restore_drill as drill
+
+    monkeypatch.setenv("PGSSLMODE", "disable")
+    monkeypatch.setenv("PGSSLROOTCERT", "/stale-ca.pem")
+    monkeypatch.setenv("PGSSLCERT", "/stale.crt")
+    monkeypatch.setenv("PGSSLKEY", "/stale.key")
+    monkeypatch.setattr(drill, "find_tool", lambda name: Path("psql"))
+    monkeypatch.setattr(drill.subprocess, "Popen", _FakePopen)
+
+    env = _good_env()
+    env["DB_SSLMODE"] = "require"
+    env["DB_SSL_ROOT_CERT"] = "/ca.pem"
+    env["DB_SSL_CERT"] = "/client.crt"
+    env["DB_SSL_KEY"] = "/client.key"
+    pgpass = tmp_path / ".pgpass"
+    pgpass.write_text("x\n", encoding="utf-8")
+
+    stream = io.BytesIO(b"SELECT 1;")
+    result = drill._run_psql(
+        "db", stream, env=env, user="u", pgpass=pgpass
+    )
+    assert result.returncode == 0
+    captured = _FakePopen.last_env
+    assert captured["PGSSLMODE"] == "require"
+    assert captured["PGSSLROOTCERT"] == "/ca.pem"
+    assert captured["PGSSLCERT"] == "/client.crt"
+    assert captured["PGSSLKEY"] == "/client.key"
+    assert "PGPASSWORD" not in captured
+    assert captured["PGPASSFILE"] == str(pgpass)
+
+
+def test_run_psql_verify_full_and_missing_certs(monkeypatch, tmp_path):
+    import io
+    import scripts.pg_restore_drill as drill
+
+    monkeypatch.setenv("PGSSLMODE", "disable")
+    monkeypatch.setenv("PGSSLROOTCERT", "/stale-ca.pem")
+    monkeypatch.setattr(drill, "find_tool", lambda name: Path("psql"))
+    monkeypatch.setattr(drill.subprocess, "Popen", _FakePopen)
+
+    env = _good_env()
+    env["DB_SSLMODE"] = "verify-full"
+    env.pop("DB_SSL_ROOT_CERT", None)
+    env.pop("DB_SSL_CERT", None)
+    env.pop("DB_SSL_KEY", None)
+    pgpass = tmp_path / ".pgpass"
+    pgpass.write_text("x\n", encoding="utf-8")
+
+    stream = io.BytesIO(b"SELECT 1;")
+    result = drill._run_psql(
+        "db", stream, env=env, user="u", pgpass=pgpass
+    )
+    assert result.returncode == 0
+    captured = _FakePopen.last_env
+    assert captured["PGSSLMODE"] == "verify-full"
+    assert "PGSSLROOTCERT" not in captured
+    assert "PGSSLCERT" not in captured
+    assert "PGSSLKEY" not in captured
+    assert "PGPASSWORD" not in captured
+
+
+def test_restore_drill_local_prefer_compatible(tmp_path):
+    archive, manifest = _make_archive(tmp_path, key=None)
+    env = _good_env()
+    env["DB_HOST"] = "127.0.0.1"
+    env["DB_SSLMODE"] = "prefer"
+    rec = _Recorder()
+    recorded = []
+
+    def connect(**kwargs):
+        recorded.append(dict(kwargs))
+        return rec.connect(**kwargs)
+
+    rc = pg_restore_drill.run_restore_drill(
+        archive, manifest, env=env, connect=connect,
+        psql_runner=_psql_ok(rec.events),
+    )
+    assert rc == 0
 
 
 def test_restore_drill_fails_closed_for_remote_prefer(tmp_path):
