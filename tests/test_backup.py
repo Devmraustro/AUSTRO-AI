@@ -125,6 +125,8 @@ def env(monkeypatch):
     monkeypatch.setenv("DB_NAME", "austro_ai")
     monkeypatch.setenv("DB_USER", "austro")
     monkeypatch.setenv("DB_PASSWORD", PASSWORD)
+    # Remote host in tests follows the production TLS policy.
+    monkeypatch.setenv("DB_SSLMODE", "require")
     monkeypatch.delenv("PGPASSWORD", raising=False)
     monkeypatch.delenv("PG_BIN", raising=False)
     return monkeypatch
