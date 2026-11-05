@@ -23,6 +23,11 @@ logger = logging.getLogger(__name__)
 _JSON_EMPTY = "[]"
 _OBJECT_EMPTY = "{}"
 
+# Legacy name of an in-outdir plaintext work directory. New runs create their
+# private 0700 workdir OUTSIDE the persistent backup directory, but a run from
+# an older release may have left this behind, so it is swept on start.
+PRIVATE_WORKDIR_NAME = ".backup_tmp"
+
 
 class _LearningBase:
     def __init__(self, manager: DatabaseManager):
@@ -43,6 +48,13 @@ class _LearningBase:
         try:
             self._manager._get_connection().rollback()
         except Exception:  # noqa: BLE001 - never mask the original error
+            pass
+
+    def _remove_workdir(self, work_dir: Path) -> None:
+        """Delete the private workdir and any plaintext dump still inside it."""
+        try:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        except OSError:  # pragma: no cover - best-effort cleanup
             pass
 
     def _now(self) -> str:
