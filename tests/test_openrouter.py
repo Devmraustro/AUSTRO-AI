@@ -678,3 +678,40 @@ async def test_gateway_uses_openrouter_on_wellformed_response(monkeypatch):
     assert response.metadata.provider == "openrouter"
     assert response.text == "direct answer"
     assert response.metadata.success is True
+
+
+@pytest.mark.asyncio
+async def test_cooldown_is_rechecked_after_pacing_before_quota_reservation(monkeypatch):
+    """A 429 from another in-flight request blocks tasks still waiting to send."""
+    waiting = asyncio.Event()
+    release = asyncio.Event()
+    sends = {"count": 0}
+
+    def behaviour(*args, **kwargs):
+        sends["count"] += 1
+        return _Response()
+
+    provider = _provider(
+        monkeypatch,
+        behaviour,
+        min_request_interval=0.0,
+        ai_rate_limit_cooldown_seconds=5.0,
+    )
+
+    async def paused_rate_limit():
+        waiting.set()
+        await release.wait()
+
+    provider._rate_limit = paused_rate_limit
+    task = asyncio.create_task(provider.generate(_request()))
+    await waiting.wait()
+
+    # Simulate a parallel request receiving 429 while this request is paced.
+    provider._apply_rate_limit_headers({"Retry-After": "5"})
+    release.set()
+
+    with pytest.raises(RateLimitError, match="cooling down"):
+        await task
+
+    assert sends["count"] == 0, "no request may be sent during the newly applied cooldown"
+    assert provider.daily_used == 0, "a request rejected before send must not reserve quota"
