@@ -53,7 +53,13 @@ MAIN_COMMAND_RATELIMITS = {
 }
 
 # Internal lifecycle callbacks, not user-facing entry points.
-NOT_USER_ENTRY_POINTS = {"error_handler", "scheduler_post_init", "scheduler_post_stop"}
+NOT_USER_ENTRY_POINTS = {
+    "error_handler",
+    "scheduler_post_init",
+    "scheduler_post_stop",
+    "_post_init",
+    "_register_telegram_commands",
+}
 
 
 def _main_coroutines():

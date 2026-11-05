@@ -31,7 +31,6 @@ class Settings:
     bot_token: str
     bot_name: str
     bot_username: str
-
     db_path: str
     logs_path: str
     backups_path: str
@@ -93,7 +92,7 @@ class Settings:
     webhook_secret: str = ""
     telegram_transport: str = "polling"  # "polling" | "webhook"
     staging_id: str = ""
-
+    support_username: str = "Mr_Austro"
     # Database settings
     db_engine: str = "sqlite"  # "sqlite" | "postgresql"
     db_host: str = "localhost"
@@ -261,6 +260,7 @@ def load_settings() -> Settings:
         bot_token=bot_token,
         bot_name="AUSTRO AI",
         bot_username="austro_ai_bot",
+        support_username=os.getenv("SUPPORT_USERNAME", "Mr_Austro").strip().lstrip("@") or "Mr_Austro",
         db_path=db_path,
         logs_path=str(logs_dir),
         backups_path=str(backups_dir),

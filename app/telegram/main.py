@@ -12,7 +12,8 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import NetworkError, TelegramError, TimedOut
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -115,8 +116,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """Handle /help command"""
     if not await guard_command_action(update, context):
         return
+    support = settings.support_username.strip().lstrip("@") or "Mr_Austro"
+    support_escaped = support.replace("_", "\\_")
     help_text = (
-        "🆘 **المساعدة**\n\n"
+        "🆘 *المساعدة*\n\n"
         "الأوامر المتاحة:\n"
         "/start - بدء البوت\n"
         "/help - المساعدة\n"
@@ -128,7 +131,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/coach - المدرب الذكي\n"
         "/dashboard - لوحة التحكم\n"
         "/settings - الإعدادات\n\n"
-        "للمساعدة: تواصل مع @your_support"
+        f"للمساعدة: تواصل مع @{support_escaped}"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
@@ -391,13 +394,54 @@ async def scheduler_post_stop(app: Application) -> None:
         scheduler.stop()
 
 
+TELEGRAM_COMMANDS = [
+    BotCommand("start", "بدء البوت"),
+    BotCommand("help", "المساعدة"),
+    BotCommand("plan", "خطة اليوم"),
+    BotCommand("goals", "\u0623\u0647\u062f\u0627\u064a"),
+    BotCommand("habits", "عاداتي"),
+    BotCommand("progress", "تقدمي"),
+    BotCommand("review", "المحاسبة اليومية"),
+    BotCommand("coach", "المدرب الذكي"),
+    BotCommand("dashboard", "لوحة التحكم"),
+    BotCommand("settings", "الإعدادات"),
+    BotCommand("knowledge", "المعرفة"),
+    BotCommand("cancel", "إلغاء"),
+]
+
+
+async def _register_telegram_commands(application: Application) -> None:
+    """Register Telegram native command suggestions.
+
+    Registration is best-effort: a failure must never prevent the bot from
+    starting or polling.
+    """
+    try:
+        commands = []
+        seen = set()
+        for command in TELEGRAM_COMMANDS:
+            if command.command in seen:
+                continue
+            seen.add(command.command)
+            commands.append(command)
+        await application.bot.set_my_commands(commands)
+        logger.info("Registered %d Telegram native commands", len(commands))
+    except Exception as exc:  # noqa: BLE001 - startup must survive API failure
+        logger.warning("Could not register Telegram native commands: %s", type(exc).__name__)
+
+
+async def _post_init(application: Application) -> None:
+    await scheduler_post_init(application)
+    await _register_telegram_commands(application)
+
+
 def build_application() -> Application:
     """Build the fully-wired bot application."""
     application = (
         Application.builder()
         .token(settings.bot_token)
         .job_queue(JobQueue())
-        .post_init(scheduler_post_init)
+        .post_init(_post_init)
         .post_stop(scheduler_post_stop)
         .build()
     )
@@ -478,8 +522,17 @@ def main() -> None:
     logger.info("Bot is running! Press Ctrl+C to stop.")
     logger.info("=" * 50)
 
-    # Run the bot
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Run the bot. Transient network/Telegram API errors are logged cleanly
+    # instead of crashing the process; process-level restart (supervisor or
+    # restart policy) is responsible for bringing the bot back after a
+    # persistent failure. PTB retries transient errors internally while
+    # polling, so this handler only sees errors PTB could not recover from.
+    try:
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    except (NetworkError, TimedOut) as exc:  # noqa: BLE001 - log and stop cleanly
+        logger.error("Polling network error: %s; stopping", type(exc).__name__)
+    except TelegramError as exc:  # noqa: BLE001 - log and stop cleanly
+        logger.error("Polling Telegram error: %s; stopping", type(exc).__name__)
 
 
 if __name__ == "__main__":
