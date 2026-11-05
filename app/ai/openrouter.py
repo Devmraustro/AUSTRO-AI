@@ -208,7 +208,8 @@ class OpenRouterProvider(AIProvider):
                 except Exception:  # noqa: BLE001 - unparsable date -> ceiling
                     delay = ceiling
         delay = min(max(delay, 1.0), ceiling)
-        self._cooldown_until = time.monotonic() + delay
+        with self._state_lock:
+            self._cooldown_until = time.monotonic() + delay
         logger.info(
             f"OpenRouter cooldown started for {delay:.0f}s "
             f"(Retry-After={raw or 'not given'}; "
@@ -361,6 +362,14 @@ class OpenRouterProvider(AIProvider):
         """
         with self._state_lock:
             self._reset_daily_if_needed_locked()
+            # Re-check cooldown at the atomic admission point. A concurrent
+            # request may receive HTTP 429 while this task is waiting for its
+            # pacing slot; the early generate() check alone is not sufficient.
+            if self._cooldown_active():
+                remaining = max(0.0, self._cooldown_until - time.monotonic())
+                raise RateLimitError(
+                    f"OpenRouter cooling down for another {remaining:.0f}s after rate limiting"
+                )
             if not self._daily_exhausted and self._daily_used >= self._effective_daily_limit():
                 self._daily_exhausted = True
                 logger.warning(
