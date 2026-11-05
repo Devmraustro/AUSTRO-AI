@@ -398,7 +398,7 @@ TELEGRAM_COMMANDS = [
     BotCommand("start", "بدء البوت"),
     BotCommand("help", "المساعدة"),
     BotCommand("plan", "خطة اليوم"),
-    BotCommand("goals", "\u0623\u0647\u062f\u0627\u064a"),
+    BotCommand("goals", "أهدافي"),
     BotCommand("habits", "عاداتي"),
     BotCommand("progress", "تقدمي"),
     BotCommand("review", "المحاسبة اليومية"),

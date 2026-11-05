@@ -8,6 +8,8 @@ def test_telegram_commands_include_required_entries():
     commands = {command.command for command in TELEGRAM_COMMANDS}
     assert "start" in commands
     assert "help" in commands
+    descriptions = {command.command: command.description for command in TELEGRAM_COMMANDS}
+    assert descriptions["goals"] == "أهدافي"
 
 
 def test_telegram_commands_have_no_duplicates():
