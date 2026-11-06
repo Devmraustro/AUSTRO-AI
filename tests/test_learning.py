@@ -403,8 +403,6 @@ def test_export_learning_empty_owner(engine):
 
 def test_export_learning_no_db_changes(engine):
     goal_id, objective_ids, curriculum_id = _seed_goal(engine)
-    outcome = _start_lesson(engine, curriculum_id)
-    session_id = outcome["session"]["session_id"]
 
     # Capture state before export
     before_goals = len(engine._store.goals.list(OWNER))

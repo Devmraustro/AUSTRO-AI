@@ -41,3 +41,6 @@ baseline-results.json
 # Local secret material (backup encryption key, etc.). Never commit.
 secrets/
 *.key
+
+# Nested clone - not a submodule
+austro ai/
