@@ -23,7 +23,7 @@ Operational guide for the AUSTRO AI Telegram bot. Pairs with `DISASTER_RECOVERY.
 
 ```
 BOT_TOKEN=                # Telegram bot token (real, required)
-GEMINI_API_KEY=           # Google Gemini key (required in production)
+OPENROUTER_API_KEY=       # OpenRouter key (required in production)
 AUSTRO_ENVIRONMENT=production
 AUSTRO_LOG_LEVEL=WARNING  # WARNING or ERROR required by the prod validator
 WEBHOOK_URL=https://yourdomain.com/webhook
@@ -199,11 +199,25 @@ level only. Do not claim PostgreSQL production readiness for the app layer.
 
 ## 8. Known polish items
 
-- `app/ai/gemini.py` logs "Using local fallback." on ANY provider error even when
-  `USE_LOCAL_FALLBACK=0` (the gateway still honors the flag — the message is
-  misleading). Re-word provider warning lines to avoid implying fallback occurs.
+- (resolved 2026-10-30) The old "Using local fallback." warning no longer
+  exists; the gateway logs the configured fallback state (`_fallback_status`)
+  without claiming a fallback already ran.
 
-## 9. Incident response
+## 9. Live provider smoke (manual, no bot startup)
+
+`.github/workflows/live-provider-smoke.yml` is a `workflow_dispatch` check
+that verifies both external identities without sending a Telegram message or
+touching any data: Telegram `getMe` (identity suppressed) and one minimal
+OpenRouter chat completion (`max_tokens=8`, output suppressed).
+
+To run it, the repository needs the Actions secret `OPENROUTER_API_KEY`
+(Repository → Settings → Secrets and variables → Actions). `OPENROUTER_MODEL`
+is an optional Actions *variable*; the workflow defaults to
+`google/gemma-4-31b-it:free`. Trigger via Actions → "Live Provider Smoke
+(manual)" → Run workflow. The job fails closed with a clear per-credential
+message when a secret is missing, and never prints any credential value.
+
+## 10. Incident response
 
 - Structured errors are typed (`app/core/errors.py`); `public_message()` gives
   safe user text; `error_handler` in `app/telegram/main.py` logs full detail.

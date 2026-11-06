@@ -10,14 +10,12 @@ from __future__ import annotations
 
 import abc
 import hashlib
-import importlib
 import logging
 import math
 import re
 from typing import List, Optional
 
 from app.config.settings import Settings
-from app.core.errors import AIProviderError
 
 logger = logging.getLogger(__name__)
 
@@ -111,69 +109,6 @@ def cosine_similarity(left: List[float], right: List[float]) -> float:
     return sum(a * b for a, b in zip(left, right))
 
 
-class GeminiEmbedder(EmbeddingProvider):
-    """Remote embedder used only when a Gemini key is configured.
-
-    Kept fully separate from the chat gateway: RAG embeddings call the
-    `:embedContent` endpoint directly and degrade to the local embedder when
-    unavailable.
-    """
-
-    def __init__(self, settings_: Settings, model: str = "gemini-embedding-001", version: str = "1"):
-        self._settings = settings_
-        self._model = model
-        self._version = version
-
-    @property
-    def model(self) -> str:
-        return self._model
-
-    @property
-    def version(self) -> str:
-        return self._version
-
-    @property
-    def dimensions(self) -> int:
-        return 768
-
-    @property
-    def is_available(self) -> bool:
-        return self._settings.has_gemini_key
-
-    def embed(self, text: str) -> List[float]:
-        vectors = self.embed_many([text])
-        return vectors[0]
-
-    def embed_many(self, texts: List[str]) -> List[List[float]]:
-        if not texts:
-            return []
-        requests = importlib.import_module("requests")
-        url = (
-            f"{self._settings.gemini_api_url}/{self._model}:embedContent"
-            f"?key={self._settings.gemini_api_key}"
-        )
-        vectors: List[List[float]] = []
-        try:
-            for text in texts:
-                response = requests.post(
-                    url,
-                    json={
-                        "content": {"parts": [{"text": text}]},
-                        "taskType": "RETRIEVAL_DOCUMENT",
-                    },
-                    timeout=self._settings.ai_request_timeout,
-                )
-                if response.status_code != 200:
-                    raise AIProviderError(f"embedContent returned {response.status_code}")
-                payload = response.json()
-                vector = payload["embedding"]["values"]
-                vectors.append(_l2([float(v) for v in vector]))
-        except Exception as e:  # noqa: BLE001 - degrade to fallback upstream
-            logger.warning(f"Gemini embedContent failed: {e}")
-            raise AIProviderError("embedding provider unavailable") from e
-        return vectors
-
-
 class EmbeddingService:
     """Selects the active provider and caches vectors it produced."""
 
@@ -181,7 +116,6 @@ class EmbeddingService:
                  providers: Optional[List[EmbeddingProvider]] = None):
         self._settings = settings_
         self._providers = providers or [
-            GeminiEmbedder(settings_),
             LocalHashEmbedder(
                 dimensions=settings_.knowledge_embedding_dimensions,
                 version=settings_.knowledge_embedding_version,
@@ -226,7 +160,6 @@ class EmbeddingService:
 __all__ = [
     "EmbeddingProvider",
     "EmbeddingService",
-    "GeminiEmbedder",
     "LocalHashEmbedder",
     "cosine_similarity",
 ]

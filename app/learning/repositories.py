@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import sqlite3
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from app.database.connection import DatabaseManager
@@ -22,6 +24,11 @@ logger = logging.getLogger(__name__)
 
 _JSON_EMPTY = "[]"
 _OBJECT_EMPTY = "{}"
+
+# Legacy name of an in-outdir plaintext work directory. New runs create their
+# private 0700 workdir OUTSIDE the persistent backup directory, but a run from
+# an older release may have left this behind, so it is swept on start.
+PRIVATE_WORKDIR_NAME = ".backup_tmp"
 
 
 class _LearningBase:
@@ -43,6 +50,13 @@ class _LearningBase:
         try:
             self._manager._get_connection().rollback()
         except Exception:  # noqa: BLE001 - never mask the original error
+            pass
+
+    def _remove_workdir(self, work_dir: Path) -> None:
+        """Delete the private workdir and any plaintext dump still inside it."""
+        try:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        except OSError:  # pragma: no cover - best-effort cleanup
             pass
 
     def _now(self) -> str:
@@ -467,6 +481,27 @@ class LessonsRepository(_LearningBase):
             logger.error(f"Database error in lesson count: {e}")
             return 0
 
+    def list_for_owner(self, owner_user_id: int) -> List[Dict[str, Any]]:
+        try:
+            with self._manager._lock:
+                cursor = self._connection().cursor()
+                cursor.execute(
+                    "SELECT * FROM learning_lessons WHERE owner_user_id = ? "
+                    "ORDER BY lesson_id",
+                    (owner_user_id,),
+                )
+                rows = []
+                for row in cursor.fetchall():
+                    data = dict(row)
+                    data["content"] = self._unjson(data.pop("content_json"), {})
+                    data["sources"] = self._unjson(data.pop("sources_json"))
+                    rows.append(data)
+                return rows
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in lesson list: {e}")
+            return []
+
 
 class SessionsRepository(_LearningBase):
     def create(self, *, owner_user_id: int, goal_id: Optional[int],
@@ -584,6 +619,26 @@ class SessionsRepository(_LearningBase):
             self._rollback()
             logger.error(f"Database error in session complete: {e}")
             return False
+
+    def list_for_owner(self, owner_user_id: int) -> List[Dict[str, Any]]:
+        try:
+            with self._manager._lock:
+                cursor = self._connection().cursor()
+                cursor.execute(
+                    "SELECT * FROM learning_sessions WHERE owner_user_id = ? "
+                    "ORDER BY last_activity_at DESC",
+                    (owner_user_id,),
+                )
+                rows = []
+                for row in cursor.fetchall():
+                    data = dict(row)
+                    data["result"] = self._unjson(data.pop("result_json"), {})
+                    rows.append(data)
+                return rows
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in session list: {e}")
+            return []
 
 
 class MasteryRepository(_LearningBase):
@@ -819,23 +874,38 @@ class AssessmentsRepository(_LearningBase):
             return None
 
     def list(self, owner_user_id: int, objective_id: Optional[int] = None,
-             limit: int = 50) -> List[Dict[str, Any]]:
+             limit: Optional[int] = None) -> List[Dict[str, Any]]:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
                 if objective_id is not None:
-                    cursor.execute(
-                        "SELECT * FROM learning_assessments "
-                        "WHERE owner_user_id = ? AND objective_id = ? "
-                        "ORDER BY created_at DESC LIMIT ?",
-                        (owner_user_id, objective_id, limit),
-                    )
+                    if limit is None:
+                        cursor.execute(
+                            "SELECT * FROM learning_assessments "
+                            "WHERE owner_user_id = ? AND objective_id = ? "
+                            "ORDER BY created_at DESC",
+                            (owner_user_id, objective_id),
+                        )
+                    else:
+                        cursor.execute(
+                            "SELECT * FROM learning_assessments "
+                            "WHERE owner_user_id = ? AND objective_id = ? "
+                            "ORDER BY created_at DESC LIMIT ?",
+                            (owner_user_id, objective_id, limit),
+                        )
                 else:
-                    cursor.execute(
-                        "SELECT * FROM learning_assessments "
-                        "WHERE owner_user_id = ? ORDER BY created_at DESC LIMIT ?",
-                        (owner_user_id, limit),
-                    )
+                    if limit is None:
+                        cursor.execute(
+                            "SELECT * FROM learning_assessments "
+                            "WHERE owner_user_id = ? ORDER BY created_at DESC",
+                            (owner_user_id,),
+                        )
+                    else:
+                        cursor.execute(
+                            "SELECT * FROM learning_assessments "
+                            "WHERE owner_user_id = ? ORDER BY created_at DESC LIMIT ?",
+                            (owner_user_id, limit),
+                        )
                 rows = []
                 for row in cursor.fetchall():
                     data = dict(row)
@@ -1001,15 +1071,23 @@ class PlansRepository(_LearningBase):
             logger.error(f"Database error in plan get: {e}")
             return None
 
-    def recent(self, owner_user_id: int, days: int = 7) -> List[Dict[str, Any]]:
+    def recent(self, owner_user_id: int, limit: Optional[int] = None
+               ) -> List[Dict[str, Any]]:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
-                cursor.execute(
-                    "SELECT * FROM learning_plans WHERE owner_user_id = ? "
-                    "ORDER BY plan_date DESC LIMIT ?",
-                    (owner_user_id, days),
-                )
+                if limit is None:
+                    cursor.execute(
+                        "SELECT * FROM learning_plans WHERE owner_user_id = ? "
+                        "ORDER BY plan_date DESC",
+                        (owner_user_id,),
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT * FROM learning_plans WHERE owner_user_id = ? "
+                        "ORDER BY plan_date DESC LIMIT ?",
+                        (owner_user_id, limit),
+                    )
                 rows = []
                 for row in cursor.fetchall():
                     data = dict(row)
@@ -1111,15 +1189,23 @@ class LearningEventsRepository(_LearningBase):
             logger.error(f"Database error in learning event log: {e}")
             return False
 
-    def list(self, owner_user_id: int, limit: int = 100) -> List[Dict[str, Any]]:
+    def list(self, owner_user_id: int, limit: Optional[int] = None
+             ) -> List[Dict[str, Any]]:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
-                cursor.execute(
-                    "SELECT * FROM learning_events WHERE owner_user_id = ? "
-                    "ORDER BY created_at DESC LIMIT ?",
-                    (owner_user_id, limit),
-                )
+                if limit is None:
+                    cursor.execute(
+                        "SELECT * FROM learning_events WHERE owner_user_id = ? "
+                        "ORDER BY created_at DESC",
+                        (owner_user_id,),
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT * FROM learning_events WHERE owner_user_id = ? "
+                        "ORDER BY created_at DESC LIMIT ?",
+                        (owner_user_id, limit),
+                    )
                 return [dict(r) for r in cursor.fetchall()]
         except DB_ERROR as e:
             self._rollback()

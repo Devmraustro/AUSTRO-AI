@@ -47,7 +47,7 @@ environment variables.
 | Learning         | `app.learning`              | Tutoring use cases (explain, test generation, corrections, review). |
 | Coaching         | `app.coaching`              | AI coach advice + performance analysis. |
 | Memory           | `app.memory`                | Personal memory engine: typed candidates (deterministic extraction), write-gate (consent/confidence/conflict rules), owner-scoped persistence (thread-safe, process-lifetime), bounded retrieval + memory-aware context packs. See `MEMORY_ARCHITECTURE.md`. |
-| AI               | `app.ai`                    | `AIGateway` routes by capability; `GeminiProvider` + `LocalProvider` (fallback); `AITelemetry` ring buffer. |
+| AI               | `app.ai`                    | `AIGateway` routes by capability; `OpenRouterProvider` + `LocalProvider` (fallback); `AITelemetry` ring buffer. |
 | Infrastructure   | `app.infrastructure`        | PTB job-queue reminder scheduler (DI-friendly). |
 | Database         | `app.database`              | `Database` aggregate facade → repositories → `DatabaseManager` (path, thread-local connections, DDL). No queries in the manager. |
 | Core             | `app.core`                  | Error taxonomy + `public_message()`, pluggable interfaces, DI `ServiceContainer`. |
@@ -71,7 +71,7 @@ environment variables.
 
 - `AIGateway.generate(AIRequest)` routes by `request.capability` → category,
   never by provider (`OPERATOR_CATEGORIES`).
-- Bounded async: `asyncio.to_thread` for the blocking Gemini call +
+- Bounded async: `asyncio.to_thread` for the blocking OpenRouter call +
   `asyncio.wait_for` with `settings.ai_request_timeout`.
 - Retries every AI/network failure with exponential backoff
   (`ai_retry_backoff_base * 2**attempt`, up to `ai_max_retries`);
@@ -103,7 +103,7 @@ environment variables.
 - **Extraction:** PDF (`pypdf`), DOCX/EPUB (stdlib `zipfile` + `xml.etree`),
   TXT/MD built-in — text is always DATA, never executed.
 - **Deterministic embeddings:** `LocalHashEmbedder` (offline, 128-d,
-  `local-hash`/`1`) by default; `GeminiEmbedder` optional when the key is set.
+  `local-hash`/`1`) by default; remote embeddings are not configured; deterministic local embeddings are used.
   Embeddings stay separate from the chat AI gateway.
 - **Hybrid retrieval:** keyword (0.55) + semantic cosine (0.35) + title/section
   bonus (≤0.20), filtered to the owner and READY sources, deduped by chunk key,
@@ -176,7 +176,7 @@ environment variables.
   timeouts or keys anywhere else.
 - Site-paths (`database/`, `logs/`, `backups/`) are auto-created and absolute.
 - `app/config/prompts.py` holds all canned Arabic/local responses, mode maps
-  and Gemini system prompts.
+  and legacy system prompts.
 
 ## Backward Compatibility Shims
 
@@ -186,7 +186,7 @@ Top-level modules still importable unchanged:
   `scheduler_post_stop`, `main`.
 - `handlers.py` → re-exports all `get_*_handlers` factories + `REVIEW_ACCOMPLISHED`.
 - `config.py` → re-exports all legacy constants (e.g. `BOT_TOKEN`, `LOGS_PATH`,
-  `ARABIC_RESPONSES`, `GEMINI_*_PROMPT`, `REMINDER_TIMES`).
+  `ARABIC_RESPONSES`, legacy prompt constants, `REMINDER_TIMES`).
 - `database.py` → re-exports the shared `db`.
 - `reminder_scheduler.py` → re-exports `ReminderScheduler`.
 - `redaction.py` → re-exports `redact`, `RedactingFormatter`.

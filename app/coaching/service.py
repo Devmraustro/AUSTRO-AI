@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from app.ai.gateway import AIGateway
-from app.config.prompts import GEMINI_COACH_PROMPT
+from app.config.prompts import AUSTRO_COACH_PROMPT
 from app.domain.ai import AIRequest
 
 
@@ -36,7 +36,7 @@ class CoachingService:
         request = AIRequest(
             capability="coach_advice",
             prompt=prompt,
-            system_prompt=GEMINI_COACH_PROMPT,
+            system_prompt=AUSTRO_COACH_PROMPT,
             max_tokens=1024,
             user_id=user_id,
             data={"stats": stats},
@@ -56,7 +56,7 @@ class CoachingService:
         request = AIRequest(
             capability="performance_analysis",
             prompt=prompt,
-            system_prompt=GEMINI_COACH_PROMPT,
+            system_prompt=AUSTRO_COACH_PROMPT,
             max_tokens=2048,
             data={"stats": stats},
         )

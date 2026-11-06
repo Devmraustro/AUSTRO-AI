@@ -55,7 +55,7 @@ def main() -> int:
     os.environ.setdefault("WEBHOOK_SECRET", "smoke-webhook-secret-0000000")
     # production forbids local fallback; must be explicitly disabled (default is true)
     os.environ["USE_LOCAL_FALLBACK"] = "0"
-    os.environ.setdefault("GEMINI_API_KEY", "smoke-gemini-key-0000000000")
+    os.environ.setdefault("OPENROUTER_API_KEY", "smoke-openrouter-key-0000000000")
     # The same battery is reused for staging; it must assert the environment it
     # was asked to validate (production by default - unchanged behaviour).
     expected_environment = os.environ["AUSTRO_ENVIRONMENT"]

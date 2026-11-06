@@ -7,10 +7,10 @@ A personal AI accountability and productivity Telegram bot. It combines goal tra
 - 🎯 Goal tracking with progress updates
 - 📅 Daily plan builder and checklists
 - ⚡ Discipline mode with streaks
-- 📚 Study, 🇬🇧 English, 💻 Programming modes (Gemini-powered)
+- 📚 Study, 🇬🇧 English, 💻 Programming modes (OpenRouter-powered)
 - 🔄 Habit building with frequency tracking
 - 🌙 Nightly review (المحاسبة) conversation
-- 🤖 AI coaching via Google Gemini Flash (free tier) with a local fallback
+- 🤖 AI coaching via OpenRouter with a local fallback
 - 🔔 Custom reminders restored from the database (daily or one-shot), plus fixed morning/noon/evening/night reminders
 - 📊 Life dashboard with statistics
 - 📖 Knowledge engine with book ingestion and RAG
@@ -22,7 +22,7 @@ A personal AI accountability and productivity Telegram bot. It combines goal tra
 
 - Python 3.10+ (tested with 3.14 on Windows)
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
-- (Optional) A Google Gemini API key — without one the bot uses built-in local fallbacks
+- An OpenRouter API key (recommended; local fallback is available when configured)
 
 ## Quick start
 
@@ -60,7 +60,7 @@ Create a `.env` file in the project root (copy from `.env.example`):
 
 ```
 BOT_TOKEN=123456:your_telegram_bot_token
-GEMINI_API_KEY=your_gemini_api_key_optional
+OPENROUTER_API_KEY=your_openrouter_api_key
 ```
 
 Full configuration options are documented in `.env.example` including:
@@ -86,7 +86,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-Tests run offline: they set a dummy `BOT_TOKEN`, use a temporary SQLite database, and leave `GEMINI_API_KEY` unset so nothing hits the network.
+Tests run offline: they set a dummy `BOT_TOKEN`, use a temporary SQLite database, and leave `OPENROUTER_API_KEY` unset so nothing hits the network.
 
 Test counts are measured, not targets: run `pytest -q` for the current number.
 Skipped tests locally are the PostgreSQL and Docker integration modules, which
@@ -140,7 +140,7 @@ main.py                Application entry point + wiring
 handlers.py            All command/callback/conversation handlers
 config.py              Env loading + prompts + responses
 database.py            Thread-safe SQLite layer
-ai_engine.py           Gemini client + local fallback
+ai_engine.py           Legacy compatibility module + local fallback
 reminder_scheduler.py  Job-queue based reminders
 redaction.py           Secret redaction for log output
 debug_getme.py         Token/no-network diagnostic helpers

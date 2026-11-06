@@ -26,7 +26,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 os.environ.setdefault("BOT_TOKEN", "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken")
-os.environ["GEMINI_API_KEY"] = ""
+os.environ["OPENROUTER_API_KEY"] = ""
 
 from app.security.rate_limiter import (  # noqa: E402
     RateLimitConfig,

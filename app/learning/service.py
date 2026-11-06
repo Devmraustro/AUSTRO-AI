@@ -9,10 +9,10 @@ from __future__ import annotations
 
 from app.ai.gateway import AIGateway
 from app.config.prompts import (
-    GEMINI_CYBER_PROMPT,
-    GEMINI_ENGLISH_PROMPT,
-    GEMINI_PROGRAMMING_PROMPT,
-    GEMINI_STUDY_PROMPT,
+    AUSTRO_CYBER_PROMPT,
+    AUSTRO_ENGLISH_PROMPT,
+    AUSTRO_PROGRAMMING_PROMPT,
+    AUSTRO_STUDY_PROMPT,
 )
 from app.domain.ai import AIRequest
 
@@ -37,7 +37,7 @@ class LearningService:
         request = AIRequest(
             capability="explain_concept",
             prompt=prompt,
-            system_prompt=GEMINI_STUDY_PROMPT,
+            system_prompt=AUSTRO_STUDY_PROMPT,
             max_tokens=2048,
             data={"concept": concept, "subject": subject},
         )
@@ -55,7 +55,7 @@ class LearningService:
         request = AIRequest(
             capability="generate_test",
             prompt=prompt,
-            system_prompt=GEMINI_STUDY_PROMPT,
+            system_prompt=AUSTRO_STUDY_PROMPT,
             max_tokens=2048,
             data={"topic": topic, "difficulty": difficulty},
         )
@@ -74,7 +74,7 @@ class LearningService:
         request = AIRequest(
             capability="correct_english",
             prompt=prompt,
-            system_prompt=GEMINI_ENGLISH_PROMPT,
+            system_prompt=AUSTRO_ENGLISH_PROMPT,
             max_tokens=2048,
             data={"text": text},
         )
@@ -96,7 +96,7 @@ class LearningService:
         request = AIRequest(
             capability="review_code",
             prompt=prompt,
-            system_prompt=GEMINI_PROGRAMMING_PROMPT,
+            system_prompt=AUSTRO_PROGRAMMING_PROMPT,
             max_tokens=2048,
             data={"code": code, "language": language},
         )
@@ -116,7 +116,7 @@ class LearningService:
         request = AIRequest(
             capability="english_lesson",
             prompt=prompt,
-            system_prompt=GEMINI_ENGLISH_PROMPT,
+            system_prompt=AUSTRO_ENGLISH_PROMPT,
             max_tokens=2048,
             data={"level": level},
         )
@@ -136,7 +136,7 @@ class LearningService:
         request = AIRequest(
             capability="cyber_lesson",
             prompt=prompt,
-            system_prompt=GEMINI_CYBER_PROMPT,
+            system_prompt=AUSTRO_CYBER_PROMPT,
             max_tokens=2048,
             data={"topic": topic},
         )

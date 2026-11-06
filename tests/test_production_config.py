@@ -60,7 +60,7 @@ TESTS = [
         "name": "Development config",
         "env": {
             "BOT_TOKEN": "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken",
-            "GEMINI_API_KEY": "",
+            "OPENROUTER_API_KEY": "",
             "AUSTRO_ENVIRONMENT": "development",
             "AUSTRO_LOG_LEVEL": "DEBUG",
             "USE_LOCAL_FALLBACK": "true",
@@ -71,7 +71,7 @@ s = load_settings()
 assert s.environment == "development"
 assert s.log_level == "DEBUG"
 assert s.use_local_fallback is True
-assert s.has_gemini_key is False
+assert s.has_openrouter_key is False
 print("PASS")
 """,
     },
@@ -79,26 +79,6 @@ print("PASS")
         "name": "Production config valid",
         "env": {
             "BOT_TOKEN": "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken",
-            "GEMINI_API_KEY": "real-gemini-api-key-here",
-            "AUSTRO_ENVIRONMENT": "production",
-            "AUSTRO_LOG_LEVEL": "WARNING",
-            "USE_LOCAL_FALLBACK": "false",
-        },
-        "code": """
-from app.config.settings import load_settings
-s = load_settings()
-assert s.environment == "production"
-assert s.log_level == "WARNING"
-assert s.use_local_fallback is False
-assert s.has_gemini_key is True
-print("PASS")
-""",
-    },
-    {
-        "name": "Production config valid with OpenRouter key only",
-        "env": {
-            "BOT_TOKEN": "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken",
-            "GEMINI_API_KEY": "",
             "OPENROUTER_API_KEY": "sk-or-test-key-0000000000",
             "AUSTRO_ENVIRONMENT": "production",
             "AUSTRO_LOG_LEVEL": "WARNING",
@@ -110,16 +90,31 @@ s = load_settings()
 assert s.environment == "production"
 assert s.log_level == "WARNING"
 assert s.use_local_fallback is False
-assert s.has_gemini_key is False
 assert s.has_openrouter_key is True
 print("PASS")
+""",
+    },
+    {
+        "name": "Production config rejected without OpenRouter key",
+        "env": {
+            "BOT_TOKEN": "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken",
+            "OPENROUTER_API_KEY": "",
+            "AUSTRO_ENVIRONMENT": "production",
+            "AUSTRO_LOG_LEVEL": "WARNING",
+            "USE_LOCAL_FALLBACK": "false",
+        },
+        "expected_exit": 1,
+        "expected_output": "production environment requires OPENROUTER_API_KEY",
+        "code": """
+from app.config.settings import load_settings
+s = load_settings()
 """,
     },
     {
         "name": "Production config invalid log_level",
         "env": {
             "BOT_TOKEN": "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken",
-            "GEMINI_API_KEY": "real-gemini-api-key-here",
+            "OPENROUTER_API_KEY": "sk-or-test-key-0000000000",
             "AUSTRO_ENVIRONMENT": "production",
             "AUSTRO_LOG_LEVEL": "INFO",
             "USE_LOCAL_FALLBACK": "false",
@@ -135,7 +130,7 @@ s = load_settings()
         "name": "Missing BOT_TOKEN",
         "env": {
             "BOT_TOKEN": "",
-            "GEMINI_API_KEY": "",
+            "OPENROUTER_API_KEY": "",
             "AUSTRO_ENVIRONMENT": "development",
         },
         "expected_exit": 1,
@@ -149,7 +144,7 @@ s = load_settings()
         "name": "Placeholder BOT_TOKEN",
         "env": {
             "BOT_TOKEN": "your_bot_token_here",
-            "GEMINI_API_KEY": "",
+            "OPENROUTER_API_KEY": "",
             "AUSTRO_ENVIRONMENT": "development",
         },
         "expected_exit": 1,
@@ -163,7 +158,7 @@ s = load_settings()
         "name": "Invalid log_level",
         "env": {
             "BOT_TOKEN": "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken",
-            "GEMINI_API_KEY": "",
+            "OPENROUTER_API_KEY": "",
             "AUSTRO_ENVIRONMENT": "development",
             "AUSTRO_LOG_LEVEL": "INVALID",
         },
@@ -178,13 +173,13 @@ s = load_settings()
         "name": "Defaults",
         "env": {
             "BOT_TOKEN": "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken",
-            "GEMINI_API_KEY": "",
+            "OPENROUTER_API_KEY": "",
             "AUSTRO_ENVIRONMENT": "development",
         },
         "code": """
 from app.config.settings import load_settings
 s = load_settings()
-assert s.gemini_model == "gemini-2.5-flash"
+assert s.openrouter_model == "google/gemma-4-31b-it:free"
 assert s.max_requests_per_day == 1500
 assert s.knowledge_chunk_size == 900
 assert s.memory_max_retrieved == 12
@@ -196,7 +191,7 @@ print("PASS")
         "name": "Settings immutability",
         "env": {
             "BOT_TOKEN": "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken",
-            "GEMINI_API_KEY": "",
+            "OPENROUTER_API_KEY": "",
             "AUSTRO_ENVIRONMENT": "development",
         },
         "code": """

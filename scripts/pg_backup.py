@@ -49,23 +49,30 @@ import hashlib
 import io
 import json
 import os
-import subprocess
 import shutil
+import stat
+import subprocess
 import sys
 import tempfile
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 BACKUP_PREFIX = "austro_ai_backup_"
 ARCHIVE_SUFFIX = ".sql.gz"
 MANIFEST_SUFFIX = ".manifest.json"
+RAW_SUFFIX = ".sql.part"
 DAILY_KEEP = 7
 MONTHLY_KEEP = 30
+#: Legacy name of an in-outdir plaintext work directory. New runs create their
+#: private 0700 workdir OUTSIDE the persistent backup directory, but a run from
+#: an older release may have left this behind, so it is swept on start.
+PRIVATE_WORKDIR_NAME = ".backup_tmp"
 LOCK_NAME = ".backup.lock"
 # Plaintext SQL dumps live ONLY in a private work directory created with
-# mkdtemp (mode 0700). It is never inside the persistent backup directory.
+# mkdtemp (mode 0700). It is never inside the persistent backup directory, so a
+# replicated/archived backup directory can never contain plaintext.
 WORK_PREFIX = "austro-backup-work-"
 STALE_LOCK_SECONDS = 3600
 PGDUMP_TIMEOUT = 1800
@@ -126,6 +133,72 @@ def dsn_env() -> Dict[str, str]:
     }
 
 
+_LOCAL_DB_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "postgres", "db"})
+
+
+def _db_allow_insecure() -> bool:
+    return os.environ.get("DB_ALLOW_INSECURE", "").strip().lower() in {
+        "1", "true", "yes"
+    }
+
+
+def _assert_remote_tls(host: str, env: Optional[Mapping[str, str]] = None) -> None:
+    """Fail closed before any remote PostgreSQL connection is opened.
+
+    Mirrors `app.database.connection._assert_tls_for_remote_host`: a remote host
+    must not use an sslmode that permits plaintext (disable/allow/prefer). Local
+    hosts keep working for development and CI.
+    """
+    source = os.environ if env is None else env
+    host_norm = (host or "localhost").strip().lower()
+    if host_norm in _LOCAL_DB_HOSTS:
+        return
+    mode = (source.get("DB_SSLMODE", "prefer") or "prefer").strip().lower() or "prefer"
+    if mode in {"disable", "allow", "prefer"} and not (
+        (source.get("DB_ALLOW_INSECURE", "") or "").strip().lower()
+        in {"1", "true", "yes"}
+    ):
+        raise RuntimeError(
+            f"DB_SSLMODE={mode!r} would allow an unencrypted connection to the "
+            f"remote PostgreSQL host {host_norm!r}. Set DB_SSLMODE=require (or "
+            f"verify-full with DB_SSL_ROOT_CERT) to encrypt the connection."
+        )
+
+
+def postgres_tls_kwargs(env: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
+    """TLS kwargs for psycopg2, derived from the same env vars as the app."""
+    source = os.environ if env is None else env
+    kwargs: Dict[str, str] = {
+        "sslmode": (source.get("DB_SSLMODE", "prefer") or "prefer").strip().lower() or "prefer"
+    }
+    for env_name, key in (
+        ("DB_SSL_ROOT_CERT", "sslrootcert"),
+        ("DB_SSL_CERT", "sslcert"),
+        ("DB_SSL_KEY", "sslkey"),
+    ):
+        value = (source.get(env_name, "") or "").strip()
+        if value:
+            kwargs[key] = value
+    return kwargs
+
+
+def postgres_tls_env(env: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
+    """TLS variables for libpq/pg_dump, overriding any inherited value."""
+    source = os.environ if env is None else env
+    result: Dict[str, str] = {
+        "PGSSLMODE": (source.get("DB_SSLMODE", "prefer") or "prefer").strip().lower() or "prefer"
+    }
+    for env_name, key in (
+        ("DB_SSL_ROOT_CERT", "PGSSLROOTCERT"),
+        ("DB_SSL_CERT", "PGSSLCERT"),
+        ("DB_SSL_KEY", "PGSSLKEY"),
+    ):
+        value = (source.get(env_name, "") or "").strip()
+        if value:
+            result[key] = value
+    return result
+
+
 def _first_lines(text: Optional[str], limit: int = 400) -> str:
     """Sanitised, truncated diagnostic for logs (never includes credentials)."""
     if not text:
@@ -159,29 +232,49 @@ def make_work_dir() -> Path:
     return Path(tempfile.mkdtemp(prefix=WORK_PREFIX, dir=str(root)))
 
 
-def purge_stale_plaintext(
+def _remove_workdir(work_dir: Path) -> None:
+    """Delete the private workdir and any plaintext dump still inside it."""
+    try:
+        shutil.rmtree(work_dir, ignore_errors=True)
+    except OSError:  # pragma: no cover - best-effort cleanup
+        pass
+
+
+def cleanup_stale_dumps(
     outdir: Path,
     *,
     now: Optional[dt.datetime] = None,
     stale_seconds: int = STALE_LOCK_SECONDS,
 ) -> List[Path]:
-    """Remove plaintext left behind by killed runs. Call only while holding the lock.
+    """Remove plaintext left behind by a run that was killed mid-backup.
 
-    * `.austro_ai_backup_*.sql.part` in the backup directory (legacy layout, or a
-      run killed between dump and gzip) is always removed: the lock guarantees no
-      live run owns it.
-    * Work directories in the scratch root older than `stale_seconds` are removed.
-      Fresh ones are left alone in case another run uses the same scratch root.
+    Call only while holding the duplicate-run lock: the lock guarantees that any
+    plaintext artifact belonging to this outdir is stale.
+
+    * `.sql.part` files in the backup directory are always removed. This covers
+      the legacy in-outdir layout and a run killed between dump and gzip.
+    * A legacy `.backup_tmp` work directory inside the outdir is removed whole.
+    * Per-run work directories in the scratch root older than `stale_seconds`
+      are removed. Fresh ones are left alone because a run for a different
+      outdir may share the same scratch root.
     """
     removed: List[Path] = []
     outdir = Path(outdir)
     if outdir.is_dir():
-        for path in outdir.glob(f".{BACKUP_PREFIX}*.sql.part"):
-            try:
-                path.unlink()
-                removed.append(path)
-            except OSError:
-                pass
+        for pattern in (f"*{RAW_SUFFIX}", f".*{RAW_SUFFIX}"):
+            for path in outdir.glob(pattern):
+                try:
+                    path.unlink()
+                    removed.append(path)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    continue
+        legacy = outdir / PRIVATE_WORKDIR_NAME
+        if legacy.is_dir():
+            _remove_workdir(legacy)
+            if not legacy.exists():
+                removed.append(legacy)
     root = work_root()
     if root.is_dir():
         current = (now or utcnow()).timestamp()
@@ -191,7 +284,7 @@ def purge_stale_plaintext(
                     shutil.rmtree(path, ignore_errors=True)
                     removed.append(path)
             except OSError:
-                pass
+                continue
     return removed
 
 
@@ -274,12 +367,15 @@ def snapshot_row_counts(
     dsn: Dict[str, str], connect: Callable[..., object]
 ) -> Tuple[List[str], Dict[str, int]]:
     """Per-table row counts at backup time (feeds the restore-drill manifest)."""
+    _assert_remote_tls(dsn["PGHOST"])
+    tls_kwargs = postgres_tls_kwargs()
     conn = connect(
         host=dsn["PGHOST"],
         port=dsn["PGPORT"],
         dbname=dsn["PGDATABASE"],
         user=dsn["PGUSER"],
         password=os.environ.get("DB_PASSWORD", ""),
+        **tls_kwargs,
     )
     conn.autocommit = True
     try:
@@ -335,6 +431,7 @@ def run_pg_dump(
     timeout: int = PGDUMP_TIMEOUT,
 ) -> subprocess.CompletedProcess:
     """Run pg_dump. The password reaches libpq through PGPASSFILE only."""
+    _assert_remote_tls(dsn["PGHOST"])
     tool = tool or find_tool("pg_dump")
     runner = runner or subprocess.run
     with tempfile.TemporaryDirectory(prefix="austro-pgpass-") as tmp:
@@ -345,6 +442,12 @@ def run_pg_dump(
         env = {**os.environ, **dsn, "PGPASSFILE": str(pgpass),
                "PGCLIENTENCODING": "UTF8"}
         env.pop("PGPASSWORD", None)
+        # Propagate TLS explicitly so libpq cannot inherit a contradictory or
+        # insecure PGSSLMODE from the surrounding environment.
+        env.update(postgres_tls_env())
+        for key in ("PGSSLMODE", "PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY"):
+            if key in env and not env[key]:
+                env.pop(key, None)
         argv = [
             str(tool), "-h", dsn["PGHOST"], "-p", dsn["PGPORT"],
             "-U", dsn["PGUSER"], "-d", dsn["PGDATABASE"],
@@ -411,6 +514,9 @@ def _load_encryption_key(required: bool = False) -> Optional[bytes]:
             raise RuntimeError(f"encryption key file not found: {key_file}")
         log("warn", f"encryption key file not found: {key_file}")
         return None
+    # Refuse to use a key that other local users can read. This is a no-op on
+    # Windows, where POSIX permission bits are not meaningful (ACLs apply).
+    _validate_key_file_permissions(key_path)
     try:
         raw = key_path.read_bytes()
     except OSError as exc:
@@ -441,6 +547,47 @@ def _load_encryption_key(required: bool = False) -> Optional[bytes]:
         raise RuntimeError(message)
     log("warn", message)
     return None
+
+
+def _validate_key_file_permissions(key_path: Path) -> None:
+    """Reject AES-256-GCM key files that other local users can read (POSIX).
+
+    The key is the single secret that protects every encrypted backup, so a
+    group-readable or world-readable key file is treated as a hard error rather
+    than a warning. On Windows POSIX permission bits are not meaningful and the
+    check is skipped; key secrecy then relies on the host filesystem ACLs.
+
+    Fail closed: an unreadable mode, a non-regular file, or an insecure mode
+    raises ``RuntimeError`` so the backup aborts instead of exposing the key.
+    """
+    if os.name == "nt":
+        return
+
+    try:
+        file_stat = os.stat(key_path)
+    except OSError as exc:
+        raise RuntimeError(
+            f"could not inspect encryption key file {key_path}: {exc}"
+        ) from exc
+
+    mode = file_stat.st_mode
+    # Only a regular file has enforceable permission bits. A symlink target is
+    # resolved by os.stat(); a socket/pipe/device must never hold a key.
+    if not stat.S_ISREG(mode):
+        raise RuntimeError(
+            f"encryption key file {key_path} is not a regular file "
+            f"(mode {oct(mode)}); refusing to use insecure key storage"
+        )
+
+    group_readable = bool(mode & stat.S_IRGRP)
+    world_readable = bool(mode & stat.S_IROTH)
+    if group_readable or world_readable:
+        raise RuntimeError(
+            f"encryption key file {key_path} has group-readable or "
+            f"world-readable permissions (mode {oct(stat.S_IMODE(mode))}); the "
+            f"AES-256-GCM key must only be readable by the backup process "
+            f"owner. Fix with: chmod 0600 {key_path}"
+        )
 
 
 def _gcm(key: bytes, nonce: bytes, tag: Optional[bytes] = None):
@@ -881,7 +1028,8 @@ def run_backup(
         log("start", f"backup run for {dsn['PGHOST']}:{dsn['PGPORT']}/{dsn['PGDATABASE']}"
                       f" -> {outdir}")
 
-        purged = purge_stale_plaintext(outdir, now=moment, stale_seconds=stale_lock_seconds)
+        purged = cleanup_stale_dumps(outdir, now=moment,
+                                     stale_seconds=stale_lock_seconds)
         if purged:
             log("start", f"removed {len(purged)} stale plaintext/work artifact(s) "
                          "left by an interrupted run")
@@ -893,7 +1041,7 @@ def run_backup(
                                       "DISABLED (no key configured)"))
 
         work_dir = make_work_dir()
-        raw = work_dir / "dump.sql"
+        raw = work_dir / f"{base}{RAW_SUFFIX}"
 
         log("1/6", "row-count snapshot")
         tables, counts = snapshot_row_counts(dsn, connect)
@@ -915,6 +1063,10 @@ def run_backup(
         if not raw.exists() or raw.stat().st_size == 0:
             log("2/6", "FAILED pg_dump produced an empty dump file")
             return 1
+        try:
+            os.chmod(raw, 0o600)  # dir is already 0700; belt and braces
+        except OSError:  # pragma: no cover - no-op on some filesystems
+            pass
         dump_version = pg_dump_version(tool, dump_runner)
         log("2/6", f"dump exit=0 size={raw.stat().st_size} bytes"
                     f"{' (' + dump_version + ')' if dump_version else ''}")
@@ -983,7 +1135,7 @@ def run_backup(
     finally:
         if work_dir is not None:
             # Plaintext never outlives the run: success, failure and exceptions.
-            shutil.rmtree(work_dir, ignore_errors=True)
+            _remove_workdir(work_dir)
             if work_dir.exists():
                 log("error", "could not remove plaintext work directory; "
                              "it will be purged by the next run")

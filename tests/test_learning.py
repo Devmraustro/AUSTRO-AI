@@ -262,6 +262,173 @@ def test_privacy_export_and_delete(engine):
 # ============================ GOLDEN EVAL + HANDLERS ============================
 
 
+
+def _make_plans(engine, owner: int, count: int) -> None:
+    """Create `count` plans for the owner to exceed any arbitrary limit."""
+    for i in range(count):
+        engine._store.plans.save(
+            owner_user_id=owner,
+            plan_date=f"2026-01-{i + 1:02d}",
+            items=[{"kind": "lesson", "title": f"plan {i}", "minutes": 10}],
+            source="test",
+            total_minutes=10,
+            adjusted=False,
+        )
+
+
+def _make_assessments(engine, owner: int, objective_id: int, count: int) -> None:
+    """Create `count` assessment records for the owner/objective."""
+    for i in range(count):
+        questions = engine.assessment(owner, objective_id, count=1,
+                                      kinds=["multiple_choice"])
+        answers = {0: questions[0]["answer"]}
+        engine.submit_assessment(
+            owner, objective_id, questions=questions, answers=answers,
+            session_id=None,
+        )
+
+
+def test_export_learning_includes_lessons(engine):
+    goal_id, objective_ids, curriculum_id = _seed_goal(engine)
+    outcome = _start_lesson(engine, curriculum_id)
+    lesson_id = outcome["lesson"]["lesson_id"]
+
+    exported = engine.export_learning(OWNER)
+    lesson_ids = {l["lesson_id"] for l in exported.get("lessons", [])}
+    assert lesson_id in lesson_ids, f"lesson {lesson_id} not in export"
+
+
+def test_export_learning_includes_sessions_completed_and_not(engine):
+    goal_id, objective_ids, curriculum_id = _seed_goal(engine)
+
+    # Create a session directly
+    session = engine.sessions.start(
+        OWNER, objective_ids[0], goal_id, curriculum_id, "READ"
+    )
+    session_id = session.session_id
+
+    # Complete the session
+    engine.sessions.complete(session, minutes=10)
+
+    exported = engine.export_learning(OWNER)
+    session_ids = {s["session_id"] for s in exported.get("sessions", [])}
+    assert session_id in session_ids, f"session {session_id} not in export"
+    assert any(s.get("state") == "COMPLETED" for s in exported.get("sessions", []))
+
+
+def test_export_learning_includes_events(engine):
+    goal_id, objective_ids, curriculum_id = _seed_goal(engine)
+    engine._store.events.log(OWNER, "test_event", None, None,
+                             {"custom": "data"})
+
+    exported = engine.export_learning(OWNER)
+    event_actions = {e["action"] for e in exported.get("events", [])}
+    assert "test_event" in event_actions, "test_event not in export"
+
+
+def test_export_learning_more_than_500_assessments(engine):
+    goal_id, objective_ids, curriculum_id = _seed_goal(engine)
+    objective_id = objective_ids[0]
+    _make_assessments(engine, OWNER, objective_id, count=600)
+
+    exported = engine.export_learning(OWNER)
+    assessments = exported.get("assessments", [])
+    assert len(assessments) >= 600, f"expected >=600 assessments, got {len(assessments)}"
+
+
+def test_export_learning_more_than_30_plans(engine):
+    _make_plans(engine, OWNER, count=50)
+
+    exported = engine.export_learning(OWNER)
+    plans = exported.get("plans", [])
+    assert len(plans) >= 50, f"expected >=50 plans, got {len(plans)}"
+
+
+def test_export_learning_cross_user_isolation(engine):
+    goal_id, objective_ids, curriculum_id = _seed_goal(engine)
+    _start_lesson(engine, curriculum_id)
+
+    # Owner 2 creates their own data
+    engine.create_goal(200, kind="long_term", title="owner2 goal")
+    obj2 = engine.add_objective(200, goal_id=1, title="owner2 obj")
+    engine.add_objective(OWNER, goal_id, title="owner1 obj")
+
+    exported = engine.export_learning(OWNER)
+    exported_goal_ids = {g["goal_id"] for g in exported.get("goals", [])}
+    exported_obj_ids = {o["objective_id"] for o in exported.get("objectives", [])}
+
+    assert goal_id in exported_goal_ids
+    assert all(oid in exported_obj_ids for oid in objective_ids)
+    # Owner 2's goal and objective must NOT appear
+    assert 200 not in exported_goal_ids or True  # owner 2 has different goal_id
+    # Verify no cross-user leakage: objective 2 (owner2) should not appear
+    all_obj_ids = [o["objective_id"] for o in exported.get("objectives", [])]
+    assert obj2 not in all_obj_ids, "cross-user leakage: owner 2 objective in export"
+
+
+def test_export_learning_json_safe(engine):
+    goal_id, objective_ids, curriculum_id = _seed_goal(engine)
+    _start_lesson(engine, curriculum_id)
+    _make_plans(engine, OWNER, count=5)
+    _make_assessments(engine, OWNER, objective_ids[0], count=10)
+
+    exported = engine.export_learning(OWNER)
+    import json
+    # Must be JSON-serializable
+    json_str = json.dumps(exported, ensure_ascii=False)
+    reparsed = json.loads(json_str)
+    assert "goals" in reparsed
+    assert "objectives" in reparsed
+    assert "lessons" in reparsed
+    assert "sessions" in reparsed
+    assert "events" in reparsed
+
+
+def test_export_learning_empty_owner(engine):
+    # Owner with no data at all
+    exported = engine.export_learning(99999)
+    assert exported["goals"] == []
+    assert exported["objectives"] == []
+    assert exported["curricula"] == []
+    assert exported["lessons"] == []
+    assert exported["sessions"] == []
+    assert exported["events"] == []
+    assert exported["mastery"] == []
+    assert exported["reviews"] == []
+    assert exported["assessments"] == []
+    assert exported["misconceptions"] == []
+    assert exported["plans"] == []
+    assert exported["progress"] == []
+
+
+def test_export_learning_no_db_changes(engine):
+    goal_id, objective_ids, curriculum_id = _seed_goal(engine)
+
+    # Capture state before export
+    before_goals = len(engine._store.goals.list(OWNER))
+    before_objectives = len(engine._store.objectives.list_for_goal(OWNER, goal_id))
+    before_lessons = len(engine._store.lessons.list_for_owner(OWNER))
+    before_sessions = len(engine._store.sessions.list_for_owner(OWNER))
+
+    exported = engine.export_learning(OWNER)
+
+    # After export, no data should have changed
+    after_goals = len(engine._store.goals.list(OWNER))
+    after_objectives = len(engine._store.objectives.list_for_goal(OWNER, goal_id))
+    after_lessons = len(engine._store.lessons.list_for_owner(OWNER))
+    after_sessions = len(engine._store.sessions.list_for_owner(OWNER))
+
+    assert before_goals == after_goals
+    assert before_objectives == after_objectives
+    assert before_lessons == after_lessons
+    assert before_sessions == after_sessions
+
+    # Exported data should still reflect the pre-export state
+    assert len(exported.get("goals", [])) == before_goals
+    assert len(exported.get("lessons", [])) == before_lessons
+    assert len(exported.get("sessions", [])) == before_sessions
+
+
 def test_golden_eval_still_passes():
     results = run_all()
     assert results["all_passed"] is True

@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Set environment BEFORE any app imports
 os.environ["BOT_TOKEN"] = "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken"
-os.environ["GEMINI_API_KEY"] = ""
+os.environ["OPENROUTER_API_KEY"] = ""
 os.environ["USE_LOCAL_FALLBACK"] = "true"
 os.environ["AUSTRO_ENVIRONMENT"] = "testing"
 
@@ -530,8 +530,8 @@ def benchmark_coaching_path() -> BenchmarkResult:
 
 def benchmark_ai_gateway_timeout_retry() -> BenchmarkResult:
     """Test AI gateway local fallback behavior (provider unavailable)."""
-    from app.ai.gemini import GeminiProvider
-    provider = GeminiProvider(global_settings)
+    from app.ai.openrouter import OpenRouterProvider
+    provider = OpenRouterProvider(global_settings)
     local = LocalProvider()
     telemetry = AITelemetry()
     
@@ -553,7 +553,8 @@ def benchmark_ai_gateway_timeout_retry() -> BenchmarkResult:
         latency = (time.perf_counter() - start) * 1000
         latencies.append(latency)
         
-        # Verify response came from local fallback (since no GEMINI_API_KEY)
+        # Verify response came from local fallback (since OPENROUTER_API_KEY is
+        # empty, OpenRouterProvider reports unavailable)
         # LocalProvider.name = "local"
         if response.metadata.provider != "local":
             print(f"WARNING: Expected local provider, got {response.metadata.provider}")

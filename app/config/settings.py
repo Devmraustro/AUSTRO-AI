@@ -9,6 +9,7 @@ removes hardcoded keys, URLs, models, quotas and timeouts from the code.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
@@ -30,16 +31,11 @@ class Settings:
     bot_token: str
     bot_name: str
     bot_username: str
-
     db_path: str
     logs_path: str
     backups_path: str
 
-    gemini_api_key: str
-    gemini_model: str = "gemini-2.5-flash"
-    gemini_api_url: str = "https://generativelanguage.googleapis.com/v1beta/models"
-    # Secondary cloud provider (failover target when Gemini is quota-limited
-    # or transiently failing). Enabled purely by the presence of a key.
+    # OpenRouter is the sole cloud AI provider. An empty key is permitted in development/test so deterministic local fallback remains usable.
     openrouter_api_key: str = ""
     openrouter_model: str = "google/gemma-4-31b-it:free"
     openrouter_api_url: str = "https://openrouter.ai/api/v1"
@@ -80,6 +76,13 @@ class Settings:
     ai_healthcheck_timeout: float = 15.0
     ai_max_retries: int = 2
     ai_retry_backoff_base: float = 0.5
+    # Ceiling for a 429 cooldown in seconds; a provider Retry-After is honored
+    # inside this bound. The provider recovers automatically afterwards.
+    ai_rate_limit_cooldown_seconds: float = 120.0
+    # Ordered free-only fallback chain routed server-side by OpenRouter via
+    # the native `models` array. Validated at startup (see below).
+    openrouter_fallback_models: tuple = ()
+    openrouter_max_fallback_models: int = 2
 
     # Optional fields with defaults
     environment: str = "development"
@@ -89,7 +92,7 @@ class Settings:
     webhook_secret: str = ""
     telegram_transport: str = "polling"  # "polling" | "webhook"
     staging_id: str = ""
-
+    support_username: str = "Mr_Austro"
     # Database settings
     db_engine: str = "sqlite"  # "sqlite" | "postgresql"
     db_host: str = "localhost"
@@ -148,10 +151,6 @@ class Settings:
     knowledge_claim_worker_id: str = ""
 
     @property
-    def has_gemini_key(self) -> bool:
-        return bool(self.gemini_api_key) and len(self.gemini_api_key) >= 10
-
-    @property
     def has_openrouter_key(self) -> bool:
         return bool(self.openrouter_api_key) and len(self.openrouter_api_key) >= 10
 
@@ -168,6 +167,69 @@ def _load_dotenv() -> None:
         load_dotenv(dotenv_path=env_path)
     else:
         load_dotenv()
+
+
+#: The only non-`:free` identifier accepted in the AI request chain: OpenRouter's
+#: official dynamic free router. Anything else must carry the `:free` suffix.
+_DYNAMIC_FREE_ROUTER = "openrouter/free"
+
+#: Structural shape of a free model id: `vendor/model:free` with URL-safe
+#: segments. A suffix check alone would accept `:free`, `vendor/:free` or
+#: arbitrary junk before the suffix. Offline and deterministic by design —
+#: startup must never depend on live catalog availability.
+_FREE_MODEL_ID_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*:free$"
+)
+
+
+def _is_free_model_id(model: str) -> bool:
+    """True when `model` is a structurally valid free-only OpenRouter id."""
+    model = (model or "").strip()
+    if model == _DYNAMIC_FREE_ROUTER:
+        return True
+    return bool(_FREE_MODEL_ID_RE.fullmatch(model))
+
+
+def _validated_openrouter_model(raw: str) -> str:
+    """Validate the PRIMARY model id; refuse paid or malformed values.
+
+    The free-only policy covers the entire request chain, primary included,
+    in every environment. Invalid ids raise instead of being replaced.
+    """
+    model = (raw or "").strip() or "google/gemma-4-31b-it:free"
+    if not _is_free_model_id(model):
+        raise ConfigurationError(
+            f"❌ OPENROUTER_MODEL accepts free models only "
+            f"(a valid 'vendor/model:free' identifier or "
+            f"'{_DYNAMIC_FREE_ROUTER}'); got '{model}'"
+        )
+    return model
+
+
+def _parse_free_fallback_models(raw: str, max_models: int) -> tuple:
+    """Parse OPENROUTER_FALLBACK_MODELS; refuse paid or malformed entries.
+
+    Empty/whitespace items are dropped, duplicates collapsed preserving first
+    occurrence order, and only structurally valid free ids are accepted — a
+    paid model in the chain is a startup error, never a silent downgrade.
+    """
+    seen: list = []
+    for item in (raw or "").split(","):
+        model = item.strip()
+        if not model:
+            continue
+        if not _is_free_model_id(model):
+            raise ConfigurationError(
+                f"❌ OPENROUTER_FALLBACK_MODELS accepts free models only "
+                f"(a valid 'vendor/model:free' identifier or "
+                f"'{_DYNAMIC_FREE_ROUTER}'); got '{model}'"
+            )
+        if model not in seen:
+            seen.append(model)
+    cap = max(0, int(max_models))
+    if len(seen) > cap:
+        seen = seen[:cap]
+    return tuple(seen)
 
 
 def load_settings() -> Settings:
@@ -198,18 +260,13 @@ def load_settings() -> Settings:
         bot_token=bot_token,
         bot_name="AUSTRO AI",
         bot_username="austro_ai_bot",
+        support_username=os.getenv("SUPPORT_USERNAME", "Mr_Austro").strip().lstrip("@") or "Mr_Austro",
         db_path=db_path,
         logs_path=str(logs_dir),
         backups_path=str(backups_dir),
-        gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
-        gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
-        gemini_api_url=os.getenv(
-            "GEMINI_API_URL",
-            "https://generativelanguage.googleapis.com/v1beta/models",
-        ),
         openrouter_api_key=os.getenv("OPENROUTER_API_KEY", ""),
-        openrouter_model=os.getenv(
-            "OPENROUTER_MODEL", "google/gemma-4-31b-it:free"
+        openrouter_model=_validated_openrouter_model(
+            os.getenv("OPENROUTER_MODEL", "google/gemma-4-31b-it:free")
         ),
         openrouter_api_url=os.getenv(
             "OPENROUTER_API_URL", "https://openrouter.ai/api/v1"
@@ -265,6 +322,16 @@ def load_settings() -> Settings:
         ai_healthcheck_timeout=float(os.getenv("AI_HEALTHCHECK_TIMEOUT", "15")),
         ai_max_retries=int(os.getenv("AI_MAX_RETRIES", "2")),
         ai_retry_backoff_base=float(os.getenv("AI_RETRY_BACKOFF_BASE", "0.5")),
+        ai_rate_limit_cooldown_seconds=float(
+            os.getenv("AI_RATE_LIMIT_COOLDOWN_SECONDS", "120")
+        ),
+        openrouter_fallback_models=_parse_free_fallback_models(
+            os.getenv("OPENROUTER_FALLBACK_MODELS", ""),
+            int(os.getenv("OPENROUTER_MAX_FALLBACK_MODELS", "2")),
+        ),
+        openrouter_max_fallback_models=int(
+            os.getenv("OPENROUTER_MAX_FALLBACK_MODELS", "2")
+        ),
         environment=os.getenv("AUSTRO_ENVIRONMENT", "development"),
         log_level=os.getenv("AUSTRO_LOG_LEVEL", "INFO"),
         webhook_url=os.getenv("WEBHOOK_URL", ""),
