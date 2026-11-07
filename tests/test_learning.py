@@ -496,15 +496,26 @@ def test_export_fails_when_repository_query_fails(engine, monkeypatch):
         err_msg = str(e)
         assert "EducationalGoalsRepository" in err_msg
         assert "list" in err_msg
-        assert "simulated db failure" in err_msg
+        # Sanitized error format
+        assert "Error: database operation failed" in err_msg
 
 
 def test_concurrent_exports_independent_failures(engine, monkeypatch):
     """Concurrent exports for two owners must have independent error state."""
+    import threading
     import sqlite3
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     from app.learning.repositories import _LearningBase
 
-    # Test 1: Owner 1's export fails
+    # Use a barrier to synchronize the start of both exports
+    barrier = threading.Barrier(2)
+    results = {}
+    errors = {}
+
+    # Track which owner should fail
+    fail_owner = {"owner": None}
+    fail_triggered = threading.Event()
+
     original_connection = _LearningBase._connection
 
     class FailingCursor:
@@ -512,7 +523,9 @@ def test_concurrent_exports_independent_failures(engine, monkeypatch):
             self._real_cursor = real_cursor
         def execute(self, sql, params=None):
             if "learning_goals" in sql and "SELECT" in sql:
-                raise sqlite3.Error("owner1 db failure")
+                if fail_owner["owner"] == threading.current_thread().ident:
+                    fail_triggered.set()
+                    raise sqlite3.Error("simulated db failure")
             return self._real_cursor.execute(sql, params)
         def __getattr__(self, name):
             return getattr(self._real_cursor, name)
@@ -530,28 +543,57 @@ def test_concurrent_exports_independent_failures(engine, monkeypatch):
         real_conn = original_connection(self)
         return FailingConnection(real_conn)
 
+    # Set up the failing connection for both threads
     monkeypatch.setattr(_LearningBase, "_connection", failing_connection)
 
-    try:
-        engine.export_learning(OWNER)
-        assert False, "Expected RuntimeError"
-    except RuntimeError as e:
-        err_msg = str(e)
-        assert "EducationalGoalsRepository" in err_msg
-        assert "owner1 db failure" in err_msg
+    def export_for_owner(owner_id):
+        """Run export for a specific owner."""
+        # Wait for both threads to be ready
+        barrier.wait(timeout=5)
+        # Signal that this thread is about to hit the failure point
+        fail_owner["owner"] = threading.current_thread().ident
+        try:
+            result = engine.export_learning(owner_id)
+            results[owner_id] = result
+        except RuntimeError as e:
+            errors[owner_id] = str(e)
+        except Exception as e:
+            errors[owner_id] = f"Unexpected: {e}"
 
-    # Test 2: After removing the patch, owner 2's export succeeds
-    monkeypatch.undo()
-
-    # Create data for owner 2
+    # Owner 1's data
+    owner1 = OWNER
+    # Owner 2's data - create separate goal
     owner2 = 200
     engine.create_goal(owner2, kind="long_term", title="owner2 goal")
-    engine.add_objective(owner2, goal_id=1, title="owner2 obj")
+    _ = engine.add_objective(owner2, goal_id=engine.create_goal(owner2, kind="long_term", title="owner2 goal2"), title="owner2 obj")
 
-    exported = engine.export_learning(owner2)
-    assert "goals" in exported
-    assert len(exported["goals"]) >= 1
-    # Verify no error from owner1's failure contaminates owner2's export
+    # Run both exports concurrently
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = {
+            executor.submit(export_for_owner, owner1): owner1,
+            executor.submit(export_for_owner, owner2): owner2,
+        }
+        for future in as_completed(futures):
+            future.result()
+
+    # Verify: one export failed with database error, the other succeeded
+    # The failure should only affect the owner whose thread triggered it
+    assert len(errors) == 1, f"Expected exactly one error, got {len(errors)}"
+    assert len(results) == 1, f"Expected exactly one success, got {len(results)}"
+
+    # The failed export should have a RuntimeError with repo/operation info
+    for owner_id, err_msg in errors.items():
+        assert "EducationalGoalsRepository" in err_msg, f"Error should identify repository: {err_msg}"
+        # Sanitized error format
+        assert "Error: database operation failed" in err_msg, f"Error should mention failure: {err_msg}"
+
+    # The successful export should have goals data
+    for owner_id, result in results.items():
+        assert "goals" in result
+        assert len(result["goals"]) >= 1
+        # Verify ownership isolation
+        for g in result["goals"]:
+            assert g.get("owner_user_id") == owner_id, f"Goal belongs to wrong owner: {g.get('owner_user_id')} vs {owner_id}"
 
 
 def test_export_empty_owner_produces_valid_empty_export(engine):
@@ -656,9 +698,72 @@ def test_export_error_identifies_repository_and_operation(engine, monkeypatch):
         assert False, "Expected RuntimeError"
     except RuntimeError as e:
         err_msg = str(e)
+        # Repository and operation must be identified
         assert "SessionsRepository" in err_msg
         assert "list_for_owner" in err_msg
-        assert "sessions table locked" in err_msg
+        # Raw database error details must NOT appear (sanitized)
+        assert "sessions table locked" not in err_msg, "Raw DB error leaked in export error"
+        # Sanitized error format should be present
+        assert "Error: database operation failed" in err_msg, f"Expected sanitized error format, got: {err_msg}"
+
+
+def test_export_error_sanitization_no_raw_details(engine, monkeypatch):
+    """Export errors must not expose raw database exception details."""
+    _seed_goal(engine)
+
+    import sqlite3
+    from app.learning.repositories import _LearningBase
+
+    original_connection = _LearningBase._connection
+
+    # Simulate a database error with sensitive-looking content
+    sensitive_error = sqlite3.Error(
+        "UNIQUE constraint failed: learning_goals.owner_user_id, learning_goals.title "
+        "INSERT INTO learning_goals (owner_user_id, kind, title) VALUES (12345, 'long_term', 'secret-project')"
+    )
+
+    class FailingCursor:
+        def __init__(self, real_cursor):
+            self._real_cursor = real_cursor
+        def execute(self, sql, params=None):
+            if "learning_goals" in sql and "SELECT" in sql:
+                raise sensitive_error
+            return self._real_cursor.execute(sql, params)
+        def __getattr__(self, name):
+            return getattr(self._real_cursor, name)
+
+    class FailingConnection:
+        def __init__(self, real_conn):
+            self._real_conn = real_conn
+        def cursor(self, *args, **kwargs):
+            real_cursor = self._real_conn.cursor(*args, **kwargs)
+            return FailingCursor(real_cursor)
+        def __getattr__(self, name):
+            return getattr(self._real_conn, name)
+
+    def failing_connection(self):
+        real_conn = original_connection(self)
+        return FailingConnection(real_conn)
+
+    monkeypatch.setattr(_LearningBase, "_connection", failing_connection)
+
+    try:
+        engine.export_learning(OWNER)
+        assert False, "Expected RuntimeError"
+    except RuntimeError as e:
+        err_msg = str(e)
+        # Repository and operation must be identified
+        assert "EducationalGoalsRepository" in err_msg
+        assert "list" in err_msg
+        # Raw SQL, values, constraint names must NOT appear
+        assert "UNIQUE constraint failed" not in err_msg
+        assert "INSERT INTO" not in err_msg
+        assert "VALUES" not in err_msg
+        assert "12345" not in err_msg
+        assert "secret-project" not in err_msg
+        assert "learning_goals.owner_user_id" not in err_msg
+        # Sanitized error format should be present
+        assert "Error: database operation failed" in err_msg
 
 
 def test_export_no_cross_user_leakage(engine):

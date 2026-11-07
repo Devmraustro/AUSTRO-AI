@@ -54,11 +54,19 @@ class ExportErrorCollector:
         self._errors: List[Dict[str, str]] = []
 
     def record(self, repository: str, operation: str, error: Exception) -> None:
-        """Record an error with repository and operation context."""
+        """Record an error with repository and operation context.
+
+        The raw error message is sanitized before storage to prevent
+        leakage of SQL parameters, credentials, or sensitive data.
+        """
+        error_type = type(error).__name__
+        # Sanitize: keep only error type and a generic message
+        # Avoid exposing SQL details, credentials, or user data
+        sanitized_error = f"{error_type}: database operation failed"
         self._errors.append({
             "repository": repository,
             "operation": operation,
-            "error": str(error),
+            "error": sanitized_error,
         })
 
     def has_errors(self) -> bool:
@@ -71,7 +79,7 @@ class ExportErrorCollector:
         self._errors.clear()
 
     def summary(self) -> str:
-        """Return a concise summary for error messages."""
+        """Return a concise summary for error messages (sanitized)."""
         if not self._errors:
             return ""
         parts = []
