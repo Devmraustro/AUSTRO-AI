@@ -100,6 +100,9 @@ class EducationalGoalsRepository(_LearningBase):
                 return cursor.lastrowid
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in learning goal create: {e}")
             return None
 
@@ -116,6 +119,9 @@ class EducationalGoalsRepository(_LearningBase):
                 return dict(row) if row else None
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in learning goal get: {e}")
             return None
 
@@ -131,6 +137,9 @@ class EducationalGoalsRepository(_LearningBase):
                 return [dict(r) for r in cursor.fetchall()]
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in learning goal list: {e}")
             return []
 
@@ -146,6 +155,9 @@ class EducationalGoalsRepository(_LearningBase):
                 return [dict(r) for r in cursor.fetchall()]
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in learning goal children: {e}")
             return []
 
@@ -162,6 +174,9 @@ class EducationalGoalsRepository(_LearningBase):
                 return cursor.rowcount > 0
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in learning goal set_status: {e}")
             return False
 
@@ -191,6 +206,9 @@ class LearningObjectivesRepository(_LearningBase):
                 return cursor.lastrowid
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in objective create: {e}")
             return None
 
@@ -210,6 +228,9 @@ class LearningObjectivesRepository(_LearningBase):
                 return data
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in objective get: {e}")
             return None
 
@@ -230,6 +251,9 @@ class LearningObjectivesRepository(_LearningBase):
                 return rows
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in objective list: {e}")
             return []
 
@@ -246,6 +270,9 @@ class LearningObjectivesRepository(_LearningBase):
                 return cursor.rowcount > 0
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in objective update_mastery: {e}")
             return False
 
@@ -262,6 +289,9 @@ class LearningObjectivesRepository(_LearningBase):
                 return cursor.rowcount > 0
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in objective set_status: {e}")
             return False
 
@@ -285,6 +315,9 @@ class LearningObjectivesRepository(_LearningBase):
                 return cursor.rowcount > 0
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in objective set_prerequisites: {e}")
             return False
 
@@ -313,6 +346,9 @@ class CurriculaRepository(_LearningBase):
                 return cursor.lastrowid
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in curriculum create: {e}")
             return None
 
@@ -333,6 +369,9 @@ class CurriculaRepository(_LearningBase):
                 return data
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in curriculum get: {e}")
             return None
 
@@ -354,6 +393,9 @@ class CurriculaRepository(_LearningBase):
                 return rows
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in curriculum list: {e}")
             return []
 
@@ -389,6 +431,9 @@ class CurriculaRepository(_LearningBase):
                 return cursor.rowcount > 0
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in curriculum update: {e}")
             return False
 
@@ -420,6 +465,9 @@ class LessonsRepository(_LearningBase):
                 return cursor.lastrowid
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in lesson create: {e}")
             return None
 
@@ -442,6 +490,9 @@ class LessonsRepository(_LearningBase):
                 return data
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in lesson get_in_curriculum: {e}")
             return None
 
@@ -463,6 +514,9 @@ class LessonsRepository(_LearningBase):
                 return data
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in lesson get: {e}")
             return None
 
@@ -478,6 +532,9 @@ class LessonsRepository(_LearningBase):
                 return int(cursor.fetchone()[0])
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in lesson count: {e}")
             return 0
 
@@ -499,6 +556,9 @@ class LessonsRepository(_LearningBase):
                 return rows
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in lesson list: {e}")
             return []
 
@@ -530,6 +590,9 @@ class SessionsRepository(_LearningBase):
                 return cursor.lastrowid
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in session create: {e}")
             return None
 
@@ -549,6 +612,9 @@ class SessionsRepository(_LearningBase):
                 return data
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in session get: {e}")
             return None
 
@@ -570,6 +636,9 @@ class SessionsRepository(_LearningBase):
                 return data
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in session resume: {e}")
             return None
 
@@ -600,6 +669,9 @@ class SessionsRepository(_LearningBase):
                 return cursor.rowcount > 0
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in session set_step: {e}")
             return False
 
@@ -617,6 +689,9 @@ class SessionsRepository(_LearningBase):
                 return cursor.rowcount > 0
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in session complete: {e}")
             return False
 
@@ -637,6 +712,9 @@ class SessionsRepository(_LearningBase):
                 return rows
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in session list: {e}")
             return []
 
@@ -661,6 +739,9 @@ class MasteryRepository(_LearningBase):
                 return data
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in mastery get: {e}")
             return None
 
@@ -693,6 +774,9 @@ class MasteryRepository(_LearningBase):
                 return cursor.rowcount >= 0
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in mastery save: {e}")
             return False
 
@@ -714,6 +798,9 @@ class MasteryRepository(_LearningBase):
                 return rows
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in mastery list: {e}")
             return []
 
@@ -730,6 +817,9 @@ class MasteryRepository(_LearningBase):
                 return cursor.rowcount > 0
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in mastery delete: {e}")
             return False
 
@@ -762,6 +852,9 @@ class ReviewsRepository(_LearningBase):
                 return int(row["review_id"]) if row else None
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in review create: {e}")
             return None
 
@@ -779,6 +872,9 @@ class ReviewsRepository(_LearningBase):
                 return dict(row) if row else None
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in review get: {e}")
             return None
 
@@ -802,6 +898,9 @@ class ReviewsRepository(_LearningBase):
                 return cursor.rowcount >= 0
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in review update: {e}")
             return False
 
@@ -819,6 +918,9 @@ class ReviewsRepository(_LearningBase):
                 return [dict(r) for r in cursor.fetchall()]
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in review due: {e}")
             return []
 
@@ -835,6 +937,9 @@ class ReviewsRepository(_LearningBase):
                 return [dict(r) for r in cursor.fetchall()]
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in review list: {e}")
             return []
 
@@ -870,6 +975,9 @@ class AssessmentsRepository(_LearningBase):
                 return cursor.lastrowid
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in assessment create: {e}")
             return None
 
@@ -915,6 +1023,9 @@ class AssessmentsRepository(_LearningBase):
                 return rows
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in assessment list: {e}")
             return []
 
@@ -959,6 +1070,9 @@ class MisconceptionsRepository(_LearningBase):
                 return True
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in misconception record: {e}")
             return False
 
@@ -988,6 +1102,9 @@ class MisconceptionsRepository(_LearningBase):
                 return data
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in misconception get: {e}")
             return None
 
@@ -1010,6 +1127,9 @@ class MisconceptionsRepository(_LearningBase):
                 return rows
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in misconception list: {e}")
             return []
 
@@ -1026,6 +1146,9 @@ class MisconceptionsRepository(_LearningBase):
                 return cursor.rowcount > 0
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in misconception acknowledge: {e}")
             return False
 
@@ -1048,6 +1171,9 @@ class PlansRepository(_LearningBase):
                 return True
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in plan save: {e}")
             return False
 
@@ -1068,6 +1194,9 @@ class PlansRepository(_LearningBase):
                 return data
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in plan get: {e}")
             return None
 
@@ -1096,6 +1225,9 @@ class PlansRepository(_LearningBase):
                 return rows
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in plan recent: {e}")
             return []
 
@@ -1127,6 +1259,9 @@ class LearningProgressRepository(_LearningBase):
                 return True
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in progress record: {e}")
             return False
 
@@ -1143,6 +1278,9 @@ class LearningProgressRepository(_LearningBase):
                 return dict(row) if row else None
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in progress get: {e}")
             return None
 
@@ -1158,6 +1296,9 @@ class LearningProgressRepository(_LearningBase):
                 return [dict(r) for r in cursor.fetchall()]
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in progress range: {e}")
             return []
 
@@ -1186,6 +1327,9 @@ class LearningEventsRepository(_LearningBase):
                 return True
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in learning event log: {e}")
             return False
 
@@ -1209,6 +1353,9 @@ class LearningEventsRepository(_LearningBase):
                 return [dict(r) for r in cursor.fetchall()]
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in learning event list: {e}")
             return []
 
@@ -1263,6 +1410,9 @@ class LearningStore:
                 return True
         except DB_ERROR as e:
             self._rollback()
+            self._manager._errors.append(
+                f"unknown: {e}"
+                )
             logger.error(f"Database error in learning clear_owner: {e}")
             return False
 

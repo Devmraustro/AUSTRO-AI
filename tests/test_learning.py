@@ -360,7 +360,7 @@ def test_export_learning_cross_user_isolation(engine):
     assert goal_id in exported_goal_ids
     assert all(oid in exported_obj_ids for oid in objective_ids)
     # Owner 2's goal and objective must NOT appear
-    assert 200 not in exported_goal_ids or True  # owner 2 has different goal_id
+    assert 200 not in exported_goal_ids
     # Verify no cross-user leakage: objective 2 (owner2) should not appear
     all_obj_ids = [o["objective_id"] for o in exported.get("objectives", [])]
     assert obj2 not in all_obj_ids, "cross-user leakage: owner 2 objective in export"
@@ -528,7 +528,7 @@ def test_session_set_step_and_complete_are_owner_scoped(engine):
     # The session must be untouched by the non-owner.
     row = store.sessions.get(OWNER, session_id)
     assert row["step"] != "COMPLETED"
-    assert store.events.list(OTHER, limit=50) == [] or True
+    assert store.events.list(OTHER, limit=50) == []
 
 
 def test_session_manager_get_rejects_other_owner(engine):

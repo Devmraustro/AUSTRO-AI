@@ -13,7 +13,6 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from app.ai.gateway import AIGateway
-from app.database.dialect import DB_ERROR
 from app.learning.assessment import AssessmentEngine
 from app.learning.book import BookToCourse
 from app.learning.coach import CoachEngine
@@ -545,66 +544,42 @@ class AdaptiveLearningEngine:
     # Privacy
     # ------------------------------------------------------------------
     def export_learning(self, owner_user_id: int) -> Dict[str, Any]:
-        try:
-            goals = self._store.goals.list(owner_user_id)
-        except DB_ERROR:
-            goals = []
-        try:
-            objectives = [
-                dict(o) for g in goals
-                for o in self._store.objectives.list_for_goal(owner_user_id, g["goal_id"])
-            ]
-        except DB_ERROR:
-            objectives = []
-        try:
-            curricula = [
-                dict(c) for g in goals
-                for c in self._store.curricula.list_for_goal(owner_user_id, g["goal_id"])
-            ]
-        except DB_ERROR:
-            curricula = []
-        try:
-            lessons = self._store.lessons.list_for_owner(owner_user_id)
-        except DB_ERROR:
-            lessons = []
-        try:
-            sessions = self._store.sessions.list_for_owner(owner_user_id)
-        except DB_ERROR:
-            sessions = []
-        try:
-            events = self._store.events.list(owner_user_id)
-        except DB_ERROR:
-            events = []
-        try:
-            mastery = self._store.mastery.list_for_owner(owner_user_id)
-        except DB_ERROR:
-            mastery = []
-        try:
-            reviews = self._store.reviews.list(owner_user_id)
-        except DB_ERROR:
-            reviews = []
-        try:
-            assessments = self._store.assessments.list(owner_user_id)
-        except DB_ERROR:
-            assessments = []
-        try:
-            misconceptions = [
-                dict(m) for m in self.misconceptions.for_owner(owner_user_id)
-            ]
-        except DB_ERROR:
-            misconceptions = []
-        try:
-            plans = self._store.plans.recent(owner_user_id)
-        except DB_ERROR:
-            plans = []
-        try:
-            progress = [
-                dict(p) for p in self._store.progress.range(owner_user_id,
-                                                            "0000-01-01",
+        # Collect all data first - if any step fails, errors are recorded
+        # in self._store._manager._errors. We check after all calls to ensure
+        # we never return a partial export.
+        goals = self._store.goals.list(owner_user_id)
+        objectives = [
+            dict(o) for g in goals
+            for o in self._store.objectives.list_for_goal(owner_user_id, g["goal_id"])
+        ]
+        curricula = [
+            dict(c) for g in goals
+            for c in self._store.curricula.list_for_goal(owner_user_id, g["goal_id"])
+        ]
+        lessons = self._store.lessons.list_for_owner(owner_user_id)
+        sessions = self._store.sessions.list_for_owner(owner_user_id)
+        events = self._store.events.list(owner_user_id)
+        mastery = self._store.mastery.list_for_owner(owner_user_id)
+        reviews = self._store.reviews.list(owner_user_id)
+        assessments = self._store.assessments.list(owner_user_id)
+        misconceptions = [
+            dict(m) for m in self.misconceptions.for_owner(owner_user_id)
+        ]
+        plans = self._store.plans.recent(owner_user_id)
+        progress = [
+            dict(p) for p in self._store.progress.range(owner_user_id,
+                                                        "0000-01-01",
                                                             "9999-12-31")
-            ]
-        except DB_ERROR:
-            progress = []
+        ]
+
+        # Fail closed: if any repository call failed, return empty but signal failure
+        if self._store._manager._errors:
+            raise RuntimeError(
+                f"Backup export failed: {len(self._store._manager._errors)} "
+                f"error(s) occurred: "
+                + "; ".join(self._store._manager._errors[:5])
+            )
+
         return {
             "goals": goals,
             "objectives": objectives,
