@@ -43,8 +43,9 @@ class MisconceptionEngine:
         row = self._store.misconceptions.get(owner_user_id, objective_id, pattern)
         return _as_misconception(row) if row else None
 
-    def for_owner(self, owner_user_id: int) -> List[Misconception]:
-        rows = self._store.misconceptions.list(owner_user_id)
+    def for_owner(self, owner_user_id: int,
+              error_collector: Optional[Any] = None) -> List[Misconception]:
+        rows = self._store.misconceptions.list(owner_user_id, error_collector=error_collector)
         return _as_misconceptions(rows)
 
     def weaknesses(self, owner_user_id: int, limit: int = 5) -> List[str]:

@@ -125,7 +125,7 @@ class EducationalGoalsRepository(_LearningBase):
             logger.error(f"Database error in learning goal get: {e}")
             return None
 
-    def list(self, owner_user_id: int) -> List[Dict[str, Any]]:
+    def list(self, owner_user_id: int, error_collector: Optional[Any] = None) -> List[Dict[str, Any]]:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
@@ -137,9 +137,10 @@ class EducationalGoalsRepository(_LearningBase):
                 return [dict(r) for r in cursor.fetchall()]
         except DB_ERROR as e:
             self._rollback()
-            self._manager._errors.append(
-                f"unknown: {e}"
-                )
+            if error_collector is not None:
+                error_collector.record("EducationalGoalsRepository", "list", e)
+            else:
+                self._manager._errors.append(f"list: {e}")
             logger.error(f"Database error in learning goal list: {e}")
             return []
 
@@ -234,7 +235,8 @@ class LearningObjectivesRepository(_LearningBase):
             logger.error(f"Database error in objective get: {e}")
             return None
 
-    def list_for_goal(self, owner_user_id: int, goal_id: int) -> List[Dict[str, Any]]:
+    def list_for_goal(self, owner_user_id: int, goal_id: int,
+                  error_collector: Optional[Any] = None) -> List[Dict[str, Any]]:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
@@ -251,9 +253,10 @@ class LearningObjectivesRepository(_LearningBase):
                 return rows
         except DB_ERROR as e:
             self._rollback()
-            self._manager._errors.append(
-                f"unknown: {e}"
-                )
+            if error_collector is not None:
+                error_collector.record("LearningObjectivesRepository", "list_for_goal", e)
+            else:
+                self._manager._errors.append(f"list_for_goal: {e}")
             logger.error(f"Database error in objective list: {e}")
             return []
 
@@ -376,7 +379,7 @@ class CurriculaRepository(_LearningBase):
             return None
 
     def list_for_goal(self, owner_user_id: int,
-                      goal_id: int) -> List[Dict[str, Any]]:
+                      goal_id: int, error_collector: Optional[Any] = None) -> List[Dict[str, Any]]:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
@@ -393,9 +396,10 @@ class CurriculaRepository(_LearningBase):
                 return rows
         except DB_ERROR as e:
             self._rollback()
-            self._manager._errors.append(
-                f"unknown: {e}"
-                )
+            if error_collector is not None:
+                error_collector.record("CurriculaRepository", "list_for_goal", e)
+            else:
+                self._manager._errors.append(f"list_for_goal: {e}")
             logger.error(f"Database error in curriculum list: {e}")
             return []
 
@@ -538,7 +542,8 @@ class LessonsRepository(_LearningBase):
             logger.error(f"Database error in lesson count: {e}")
             return 0
 
-    def list_for_owner(self, owner_user_id: int) -> List[Dict[str, Any]]:
+    def list_for_owner(self, owner_user_id: int,
+                   error_collector: Optional[Any] = None) -> List[Dict[str, Any]]:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
@@ -556,9 +561,10 @@ class LessonsRepository(_LearningBase):
                 return rows
         except DB_ERROR as e:
             self._rollback()
-            self._manager._errors.append(
-                f"unknown: {e}"
-                )
+            if error_collector is not None:
+                error_collector.record("LessonsRepository", "list_for_owner", e)
+            else:
+                self._manager._errors.append(f"list_for_owner: {e}")
             logger.error(f"Database error in lesson list: {e}")
             return []
 
@@ -695,7 +701,8 @@ class SessionsRepository(_LearningBase):
             logger.error(f"Database error in session complete: {e}")
             return False
 
-    def list_for_owner(self, owner_user_id: int) -> List[Dict[str, Any]]:
+    def list_for_owner(self, owner_user_id: int,
+                   error_collector: Optional[Any] = None) -> List[Dict[str, Any]]:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
@@ -712,9 +719,10 @@ class SessionsRepository(_LearningBase):
                 return rows
         except DB_ERROR as e:
             self._rollback()
-            self._manager._errors.append(
-                f"unknown: {e}"
-                )
+            if error_collector is not None:
+                error_collector.record("SessionsRepository", "list_for_owner", e)
+            else:
+                self._manager._errors.append(f"list_for_owner: {e}")
             logger.error(f"Database error in session list: {e}")
             return []
 
@@ -780,7 +788,8 @@ class MasteryRepository(_LearningBase):
             logger.error(f"Database error in mastery save: {e}")
             return False
 
-    def list_for_owner(self, owner_user_id: int) -> List[Dict[str, Any]]:
+    def list_for_owner(self, owner_user_id: int,
+                   error_collector: Optional[Any] = None) -> List[Dict[str, Any]]:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
@@ -798,9 +807,10 @@ class MasteryRepository(_LearningBase):
                 return rows
         except DB_ERROR as e:
             self._rollback()
-            self._manager._errors.append(
-                f"unknown: {e}"
-                )
+            if error_collector is not None:
+                error_collector.record("MasteryRepository", "list_for_owner", e)
+            else:
+                self._manager._errors.append(f"list_for_owner: {e}")
             logger.error(f"Database error in mastery list: {e}")
             return []
 
@@ -924,7 +934,8 @@ class ReviewsRepository(_LearningBase):
             logger.error(f"Database error in review due: {e}")
             return []
 
-    def list(self, owner_user_id: int) -> List[Dict[str, Any]]:
+    def list(self, owner_user_id: int,
+         error_collector: Optional[Any] = None) -> List[Dict[str, Any]]:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
@@ -937,9 +948,10 @@ class ReviewsRepository(_LearningBase):
                 return [dict(r) for r in cursor.fetchall()]
         except DB_ERROR as e:
             self._rollback()
-            self._manager._errors.append(
-                f"unknown: {e}"
-                )
+            if error_collector is not None:
+                error_collector.record("ReviewsRepository", "list", e)
+            else:
+                self._manager._errors.append(f"list: {e}")
             logger.error(f"Database error in review list: {e}")
             return []
 
@@ -982,7 +994,7 @@ class AssessmentsRepository(_LearningBase):
             return None
 
     def list(self, owner_user_id: int, objective_id: Optional[int] = None,
-             limit: Optional[int] = None) -> List[Dict[str, Any]]:
+             limit: Optional[int] = None, error_collector: Optional[Any] = None) -> List[Dict[str, Any]]:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
@@ -1023,9 +1035,10 @@ class AssessmentsRepository(_LearningBase):
                 return rows
         except DB_ERROR as e:
             self._rollback()
-            self._manager._errors.append(
-                f"unknown: {e}"
-                )
+            if error_collector is not None:
+                error_collector.record("AssessmentsRepository", "list", e)
+            else:
+                self._manager._errors.append(f"list: {e}")
             logger.error(f"Database error in assessment list: {e}")
             return []
 
@@ -1108,7 +1121,8 @@ class MisconceptionsRepository(_LearningBase):
             logger.error(f"Database error in misconception get: {e}")
             return None
 
-    def list(self, owner_user_id: int) -> List[Dict[str, Any]]:
+    def list(self, owner_user_id: int,
+         error_collector: Optional[Any] = None) -> List[Dict[str, Any]]:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
@@ -1127,9 +1141,10 @@ class MisconceptionsRepository(_LearningBase):
                 return rows
         except DB_ERROR as e:
             self._rollback()
-            self._manager._errors.append(
-                f"unknown: {e}"
-                )
+            if error_collector is not None:
+                error_collector.record("MisconceptionsRepository", "list", e)
+            else:
+                self._manager._errors.append(f"list: {e}")
             logger.error(f"Database error in misconception list: {e}")
             return []
 
@@ -1200,8 +1215,8 @@ class PlansRepository(_LearningBase):
             logger.error(f"Database error in plan get: {e}")
             return None
 
-    def recent(self, owner_user_id: int, limit: Optional[int] = None
-               ) -> List[Dict[str, Any]]:
+    def recent(self, owner_user_id: int, limit: Optional[int] = None,
+           error_collector: Optional[Any] = None) -> List[Dict[str, Any]]:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
@@ -1225,9 +1240,10 @@ class PlansRepository(_LearningBase):
                 return rows
         except DB_ERROR as e:
             self._rollback()
-            self._manager._errors.append(
-                f"unknown: {e}"
-                )
+            if error_collector is not None:
+                error_collector.record("PlansRepository", "recent", e)
+            else:
+                self._manager._errors.append(f"recent: {e}")
             logger.error(f"Database error in plan recent: {e}")
             return []
 
@@ -1284,7 +1300,8 @@ class LearningProgressRepository(_LearningBase):
             logger.error(f"Database error in progress get: {e}")
             return None
 
-    def range(self, owner_user_id: int, start: str, end: str) -> List[Dict[str, Any]]:
+    def range(self, owner_user_id: int, start: str, end: str,
+          error_collector: Optional[Any] = None) -> List[Dict[str, Any]]:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
@@ -1296,9 +1313,10 @@ class LearningProgressRepository(_LearningBase):
                 return [dict(r) for r in cursor.fetchall()]
         except DB_ERROR as e:
             self._rollback()
-            self._manager._errors.append(
-                f"unknown: {e}"
-                )
+            if error_collector is not None:
+                error_collector.record("LearningProgressRepository", "range", e)
+            else:
+                self._manager._errors.append(f"range: {e}")
             logger.error(f"Database error in progress range: {e}")
             return []
 
@@ -1333,8 +1351,8 @@ class LearningEventsRepository(_LearningBase):
             logger.error(f"Database error in learning event log: {e}")
             return False
 
-    def list(self, owner_user_id: int, limit: Optional[int] = None
-             ) -> List[Dict[str, Any]]:
+    def list(self, owner_user_id: int, limit: Optional[int] = None,
+         error_collector: Optional[Any] = None) -> List[Dict[str, Any]]:
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
@@ -1353,9 +1371,10 @@ class LearningEventsRepository(_LearningBase):
                 return [dict(r) for r in cursor.fetchall()]
         except DB_ERROR as e:
             self._rollback()
-            self._manager._errors.append(
-                f"unknown: {e}"
-                )
+            if error_collector is not None:
+                error_collector.record("LearningEventsRepository", "list", e)
+            else:
+                self._manager._errors.append(f"list: {e}")
             logger.error(f"Database error in learning event list: {e}")
             return []
 

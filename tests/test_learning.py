@@ -348,9 +348,10 @@ def test_export_learning_cross_user_isolation(engine):
     goal_id, objective_ids, curriculum_id = _seed_goal(engine)
     _start_lesson(engine, curriculum_id)
 
-    # Owner 2 creates their own data
-    engine.create_goal(200, kind="long_term", title="owner2 goal")
-    obj2 = engine.add_objective(200, goal_id=1, title="owner2 obj")
+    # Owner 2 creates their own data with their own goal
+    owner2_goal_id = engine.create_goal(200, kind="long_term", title="owner2 goal")
+    assert owner2_goal_id is not None, "owner2 goal creation failed"
+    obj2 = engine.add_objective(200, goal_id=owner2_goal_id, title="owner2 obj")
     engine.add_objective(OWNER, goal_id, title="owner1 obj")
 
     exported = engine.export_learning(OWNER)
@@ -360,10 +361,15 @@ def test_export_learning_cross_user_isolation(engine):
     assert goal_id in exported_goal_ids
     assert all(oid in exported_obj_ids for oid in objective_ids)
     # Owner 2's goal and objective must NOT appear
-    assert 200 not in exported_goal_ids
+    assert owner2_goal_id not in exported_goal_ids, "cross-user leakage: owner 2 goal in export"
     # Verify no cross-user leakage: objective 2 (owner2) should not appear
     all_obj_ids = [o["objective_id"] for o in exported.get("objectives", [])]
     assert obj2 not in all_obj_ids, "cross-user leakage: owner 2 objective in export"
+    # Verify all exported records belong to owner 1
+    for g in exported.get("goals", []):
+        assert g.get("owner_user_id") == OWNER, f"goal {g.get('goal_id')} has wrong owner"
+    for o in exported.get("objectives", []):
+        assert o.get("owner_user_id") == OWNER, f"objective {o.get('objective_id')} has wrong owner"
 
 
 def test_export_learning_json_safe(engine):
@@ -427,6 +433,268 @@ def test_export_learning_no_db_changes(engine):
     assert len(exported.get("goals", [])) == before_goals
     assert len(exported.get("lessons", [])) == before_lessons
     assert len(exported.get("sessions", [])) == before_sessions
+
+
+# ----------------------------------------------------------------------
+# Export error-tracking tests (operation-scoped error collector)
+# ----------------------------------------------------------------------
+
+
+def test_export_succeeds_after_unrelated_db_error(engine, monkeypatch):
+    """A previous unrelated DB error must not cause a later export to fail."""
+    _seed_goal(engine)
+
+    # Simulate a previous DB error by directly appending to manager's legacy list
+    engine._store._manager._errors.append("legacy: some old error")
+
+    # Export should succeed because it uses its own operation-scoped collector
+    exported = engine.export_learning(OWNER)
+    assert "goals" in exported
+    assert len(exported["goals"]) >= 1
+
+
+def test_export_fails_when_repository_query_fails(engine, monkeypatch):
+    """Export must fail when a required repository query fails."""
+    _seed_goal(engine)
+
+    import sqlite3
+    from app.learning.repositories import _LearningBase
+
+    # Create wrapper classes for connection and cursor
+    class FailingCursor:
+        def __init__(self, real_cursor):
+            self._real_cursor = real_cursor
+        def execute(self, sql, params=None):
+            if "learning_goals" in sql and "SELECT" in sql:
+                raise sqlite3.Error("simulated db failure")
+            return self._real_cursor.execute(sql, params)
+        def __getattr__(self, name):
+            return getattr(self._real_cursor, name)
+
+    class FailingConnection:
+        def __init__(self, real_conn):
+            self._real_conn = real_conn
+        def cursor(self, *args, **kwargs):
+            real_cursor = self._real_conn.cursor(*args, **kwargs)
+            return FailingCursor(real_cursor)
+        def __getattr__(self, name):
+            return getattr(self._real_conn, name)
+
+    original_connection = _LearningBase._connection
+
+    def failing_connection(self):
+        real_conn = original_connection(self)
+        return FailingConnection(real_conn)
+
+    monkeypatch.setattr(_LearningBase, "_connection", failing_connection)
+
+    # Export must raise RuntimeError with repository/operation identification
+    try:
+        engine.export_learning(OWNER)
+        assert False, "Expected RuntimeError"
+    except RuntimeError as e:
+        err_msg = str(e)
+        assert "EducationalGoalsRepository" in err_msg
+        assert "list" in err_msg
+        assert "simulated db failure" in err_msg
+
+
+def test_concurrent_exports_independent_failures(engine, monkeypatch):
+    """Concurrent exports for two owners must have independent error state."""
+    import sqlite3
+    from app.learning.repositories import _LearningBase
+
+    # Test 1: Owner 1's export fails
+    original_connection = _LearningBase._connection
+
+    class FailingCursor:
+        def __init__(self, real_cursor):
+            self._real_cursor = real_cursor
+        def execute(self, sql, params=None):
+            if "learning_goals" in sql and "SELECT" in sql:
+                raise sqlite3.Error("owner1 db failure")
+            return self._real_cursor.execute(sql, params)
+        def __getattr__(self, name):
+            return getattr(self._real_cursor, name)
+
+    class FailingConnection:
+        def __init__(self, real_conn):
+            self._real_conn = real_conn
+        def cursor(self, *args, **kwargs):
+            real_cursor = self._real_conn.cursor(*args, **kwargs)
+            return FailingCursor(real_cursor)
+        def __getattr__(self, name):
+            return getattr(self._real_conn, name)
+
+    def failing_connection(self):
+        real_conn = original_connection(self)
+        return FailingConnection(real_conn)
+
+    monkeypatch.setattr(_LearningBase, "_connection", failing_connection)
+
+    try:
+        engine.export_learning(OWNER)
+        assert False, "Expected RuntimeError"
+    except RuntimeError as e:
+        err_msg = str(e)
+        assert "EducationalGoalsRepository" in err_msg
+        assert "owner1 db failure" in err_msg
+
+    # Test 2: After removing the patch, owner 2's export succeeds
+    monkeypatch.undo()
+
+    # Create data for owner 2
+    owner2 = 200
+    engine.create_goal(owner2, kind="long_term", title="owner2 goal")
+    engine.add_objective(owner2, goal_id=1, title="owner2 obj")
+
+    exported = engine.export_learning(owner2)
+    assert "goals" in exported
+    assert len(exported["goals"]) >= 1
+    # Verify no error from owner1's failure contaminates owner2's export
+
+
+def test_export_empty_owner_produces_valid_empty_export(engine):
+    """An owner with no data must produce a valid empty export, not an error."""
+    exported = engine.export_learning(99999)  # Non-existent owner
+    assert exported == {
+        "goals": [],
+        "objectives": [],
+        "curricula": [],
+        "lessons": [],
+        "sessions": [],
+        "events": [],
+        "mastery": [],
+        "reviews": [],
+        "assessments": [],
+        "misconceptions": [],
+        "plans": [],
+        "progress": [],
+    }
+
+
+def test_export_no_partial_data_on_failure(engine, monkeypatch):
+    """On failure, export must not return partial data - must raise."""
+    _seed_goal(engine)
+
+    import sqlite3
+    from app.learning.repositories import _LearningBase
+
+    original_connection = _LearningBase._connection
+
+    class FailingCursor:
+        def __init__(self, real_cursor):
+            self._real_cursor = real_cursor
+        def execute(self, sql, params=None):
+            if "learning_objectives" in sql and "SELECT" in sql:
+                raise sqlite3.Error("objectives failure")
+            return self._real_cursor.execute(sql, params)
+        def __getattr__(self, name):
+            return getattr(self._real_cursor, name)
+
+    class FailingConnection:
+        def __init__(self, real_conn):
+            self._real_conn = real_conn
+        def cursor(self, *args, **kwargs):
+            real_cursor = self._real_conn.cursor(*args, **kwargs)
+            return FailingCursor(real_cursor)
+        def __getattr__(self, name):
+            return getattr(self._real_conn, name)
+
+    def failing_connection(self):
+        real_conn = original_connection(self)
+        return FailingConnection(real_conn)
+
+    monkeypatch.setattr(_LearningBase, "_connection", failing_connection)
+
+    try:
+        engine.export_learning(OWNER)
+        assert False, "Expected RuntimeError"
+    except RuntimeError as e:
+        err_msg = str(e)
+        assert "LearningObjectivesRepository" in err_msg
+        assert "list_for_goal" in err_msg
+    # Verify no partial export was returned (exception was raised)
+
+
+def test_export_error_identifies_repository_and_operation(engine, monkeypatch):
+    """Error messages must identify the repository and operation."""
+    _seed_goal(engine)
+
+    import sqlite3
+    from app.learning.repositories import _LearningBase
+
+    original_connection = _LearningBase._connection
+
+    class FailingCursor:
+        def __init__(self, real_cursor):
+            self._real_cursor = real_cursor
+        def execute(self, sql, params=None):
+            if "learning_sessions" in sql and "SELECT" in sql:
+                raise sqlite3.Error("sessions table locked")
+            return self._real_cursor.execute(sql, params)
+        def __getattr__(self, name):
+            return getattr(self._real_cursor, name)
+
+    class FailingConnection:
+        def __init__(self, real_conn):
+            self._real_conn = real_conn
+        def cursor(self, *args, **kwargs):
+            real_cursor = self._real_conn.cursor(*args, **kwargs)
+            return FailingCursor(real_cursor)
+        def __getattr__(self, name):
+            return getattr(self._real_conn, name)
+
+    def failing_connection(self):
+        real_conn = original_connection(self)
+        return FailingConnection(real_conn)
+
+    monkeypatch.setattr(_LearningBase, "_connection", failing_connection)
+
+    try:
+        engine.export_learning(OWNER)
+        assert False, "Expected RuntimeError"
+    except RuntimeError as e:
+        err_msg = str(e)
+        assert "SessionsRepository" in err_msg
+        assert "list_for_owner" in err_msg
+        assert "sessions table locked" in err_msg
+
+
+def test_export_no_cross_user_leakage(engine):
+    """Export must not leak data from other users."""
+    # Owner 1 data
+    goal_id1, obj_ids1, curr_id1 = _seed_goal(engine)
+    _start_lesson(engine, curr_id1)
+
+    # Owner 2 data (create goal, objective, curriculum, but skip lesson for simplicity)
+    owner2 = 200
+    goal_id2 = engine.create_goal(owner2, kind="long_term", title="owner2 goal")
+    obj_id2 = engine.add_objective(owner2, goal_id=goal_id2, title="owner2 obj")
+    _ = engine.build_curriculum(owner2, goal_id2, title="owner2 curriculum")
+
+    # Export owner 1
+    exported = engine.export_learning(OWNER)
+
+    # Verify owner 1 data present
+    exported_goal_ids = {g["goal_id"] for g in exported["goals"]}
+    exported_obj_ids = {o["objective_id"] for o in exported["objectives"]}
+    assert goal_id1 in exported_goal_ids
+    assert all(oid in exported_obj_ids for oid in obj_ids1)
+
+    # Verify owner 2 data absent
+    assert goal_id2 not in exported_goal_ids
+    assert obj_id2 not in exported_obj_ids
+
+    # Verify all records belong to owner 1
+    for g in exported["goals"]:
+        assert g.get("owner_user_id") == OWNER
+    for o in exported["objectives"]:
+        assert o.get("owner_user_id") == OWNER
+    for c in exported["curricula"]:
+        assert c.get("owner_user_id") == OWNER
+    for l in exported["lessons"]:
+        assert l.get("owner_user_id") == OWNER
 
 
 def test_golden_eval_still_passes():
