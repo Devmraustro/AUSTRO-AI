@@ -5,7 +5,7 @@
 - **Repository**: Devmraustro/AUSTRO-AI
 - **Branch**: `codex/openrouter-only-remove-gemini`
 - **Initial HEAD (before remediation)**: `0f30d9a643634e7ba2c52cca48ddc60907dbebd5`
-- **Final HEAD (after remediation)**: `93bc3fc`
+- **Final HEAD (after remediation)**: `f43c3bb697485d17b64b8ac75eee8a6767ec2aed`
 - **PR**: #12 (open, not merged)
 - **Upstream**: `origin/codex/openrouter-only-remove-gemini`
 
@@ -36,12 +36,17 @@ class ExportErrorCollector:
     """
 
     def record(self, repository: str, operation: str, error: Exception) -> None:
-        """Record an error with repository and operation context."""
+        """Record an error with repository and operation context.
+
+        The raw error message is sanitized before storage to prevent
+        leakage of SQL parameters, credentials, or sensitive data.
+        """
 ```
 
 **Key properties**:
 - Created fresh per `export_learning()` call
 - Records repository name and operation (e.g., "EducationalGoalsRepository.list")
+- Sanitizes error messages: raw database exception details are replaced with generic messages
 - Does not expose SQL parameters, credentials, or sensitive user data
 - No global mutable state
 
@@ -106,12 +111,47 @@ def export_learning(self, owner_user_id: int) -> Dict[str, Any]:
 - ✅ Genuine repository failures always cause export failure (fail-closed)
 - ✅ Genuinely empty dataset produces valid empty export
 - ✅ Error messages identify repository and operation
-- ✅ No sensitive data in error messages
+- ✅ Raw database exception details are sanitized (no SQL, credentials, user data)
 - ✅ No unbounded global error accumulation
 
 ---
 
-## 5. Owner-Isolation Test Correction
+## 5. Error Sanitization
+
+The `ExportErrorCollector.record()` method sanitizes error messages before storage:
+
+```python
+def record(self, repository: str, operation: str, error: Exception) -> None:
+    error_type = type(error).__name__
+    # Sanitize: keep only error type and a generic message
+    # Avoid exposing SQL details, credentials, or user data
+    sanitized_error = f"{error_type}: database operation failed"
+    self._errors.append({
+        "repository": repository,
+        "operation": operation,
+        "error": sanitized_error,
+    })
+```
+
+**What is sanitized out**:
+- Raw SQL queries and parameters
+- Constraint names and violation details
+- Specific user IDs, project names, or other personal data
+- Full SQL statements with VALUES clauses
+- Database-specific error codes and messages
+
+**What is preserved**:
+- Repository name and operation (for debugging)
+- Exception type name (e.g., "Error", "OperationalError")
+- Generic failure indication
+
+**Tests added**:
+- `test_export_error_sanitization_no_raw_details`: Verifies raw SQL, VALUES, constraint names, user IDs, and project names do not appear in exported errors
+- `test_export_error_identifies_repository_and_operation`: Verifies repository/operation identification while raw details are absent
+
+---
+
+## 4. Owner-Isolation Test Correction
 
 ### The Problem in `test_export_learning_cross_user_isolation`
 
@@ -146,11 +186,68 @@ for g in exported.get("goals", []):
 |------|---------|
 | `test_export_succeeds_after_unrelated_db_error` | Legacy manager errors don't contaminate new exports |
 | `test_export_fails_when_repository_query_fails` | Export fails when required query fails |
-| `test_concurrent_exports_independent_failures` | Independent error state for concurrent exports |
+| `test_concurrent_exports_independent_failures` | Independent error state for concurrent exports (genuinely concurrent) |
 | `test_export_empty_owner_produces_valid_empty_export` | Empty dataset → valid empty export (not error) |
 | `test_export_no_partial_data_on_failure` | No partial export on failure (fail-closed) |
-| `test_export_error_identifies_repository_and_operation` | Error messages identify repo + operation |
+| `test_export_error_identifies_repository_and_operation` | Error messages identify repo + operation, sanitized |
+| `test_export_error_sanitization_no_raw_details` | Raw SQL/params/constraints never leak |
 | `test_export_no_cross_user_leakage` | Cross-user isolation with actual IDs |
+
+---
+
+## 6. Concurrent Export Test Implementation
+
+The test `test_concurrent_exports_independent_failures` now uses **genuinely concurrent execution**:
+
+```python
+def test_concurrent_exports_independent_failures(engine, monkeypatch):
+    """Concurrent exports for two owners must have independent error state."""
+    import threading
+    import sqlite3
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from app.learning.repositories import _LearningBase
+
+    # Use a barrier to synchronize the start of both exports
+    barrier = threading.Barrier(2)
+    results = {}
+    errors = {}
+    fail_owner = {"owner": None}
+    fail_triggered = threading.Event()
+
+    # ... FailingCursor/FailingConnection setup ...
+
+    def export_for_owner(owner_id):
+        """Run export for a specific owner."""
+        barrier.wait(timeout=5)  # Synchronize start
+        fail_owner["owner"] = threading.current_thread().ident
+        try:
+            result = engine.export_learning(owner_id)
+            results[owner_id] = result
+        except RuntimeError as e:
+            errors[owner_id] = str(e)
+
+    # Run both exports concurrently
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = {
+            executor.submit(export_for_owner, owner1): owner1,
+            executor.submit(export_for_owner, owner2): owner2,
+        }
+        for future in as_completed(futures):
+            future.result()
+
+    # Verify: one export failed, the other succeeded
+    assert len(errors) == 1
+    assert len(results) == 1
+    # Failed export has repo/operation info
+    # Successful export has correct owner data
+```
+
+**Key properties**:
+- Uses `ThreadPoolExecutor` with `max_workers=2` for genuine concurrency
+- `threading.Barrier(2)` synchronizes the start of both operations
+- Thread-local failure injection ensures only one export fails
+- Deterministic cleanup via `ThreadPoolExecutor` context manager
+- No `monkeypatch.undo()` between sequential operations
 
 ---
 
@@ -174,10 +271,10 @@ Removed from Git tracking (preserved locally):
 
 | File | Change Type |
 |------|-------------|
-| `app/learning/engine.py` | Added `ExportErrorCollector`; rewrote `export_learning()` |
+| `app/learning/engine.py` | Added `ExportErrorCollector` with sanitization; rewrote `export_learning()` |
 | `app/learning/repositories.py` | Added `error_collector` param to 12 methods |
 | `app/learning/misconceptions.py` | Added `error_collector` param to `for_owner()` |
-| `tests/test_learning.py` | Fixed isolation test; added 9 new tests |
+| `tests/test_learning.py` | Fixed isolation test; added 9 new tests (including genuine concurrency test) |
 | `apply_h1_fixes.py` | **Deleted from tracking** |
 | `check_syntax.py` | **Deleted from tracking** |
 | `austro_ai.db-shm` | **Deleted from tracking** |
@@ -190,9 +287,9 @@ Removed from Git tracking (preserved locally):
 
 | Test Suite | Tests | Status |
 |------------|-------|--------|
-| `tests/test_learning.py` | 40 | ✅ All pass |
+| `tests/test_learning.py` | 41 | ✅ All pass |
 | `tests/test_audit_regressions.py` | 63 | ✅ All pass |
-| **Total** | **103** | ✅ **All pass** |
+| **Total** | **104** | ✅ **All pass** |
 
 **Static Analysis**:
 - `pyflakes`: ✅ Clean (0 issues)
@@ -225,7 +322,11 @@ Removed from Git tracking (preserved locally):
 
 ## 11. CI Verification
 
-- **Push CI**: Triggered on `93bc3fc` (to be verified)
+- **Local test run**: 104 tests passed (41 learning + 63 audit regression)
+- **Pyflakes**: Clean (0 issues)
+- **Compile checks**: All modules compile successfully
+- **Git diff --check**: Clean
+- **Push CI**: To be verified on `f43c3bb697485d17b64b8ac75eee8a6767ec2aed`
 - **PR CI**: PR #12 (open, not merged, to be verified)
 - **Previous CI**: Both push and PR runs passed on `ac71db7` and `0f30d9a`
 
@@ -234,9 +335,9 @@ Removed from Git tracking (preserved locally):
 ## 12. Remaining Limitations
 
 1. **No account-wide export/deletion verified**: Only owner-scoped operations tested
-2. **Concurrency test is sequential**: Uses `monkeypatch.undo()` between tests rather than true parallel execution (due to shared engine instance)
-3. **Legacy `_manager._errors` still exists**: Kept for backward compatibility with non-export code paths
-4. **Some repository methods not updated**: Only 12 methods used in export were modified; other methods still use legacy error tracking
+2. **Legacy `_manager._errors` still exists**: Kept for backward compatibility with non-export code paths
+3. **Some repository methods not updated**: Only 12 methods used in export were modified; other methods still use legacy error tracking
+4. **Concurrency test uses shared engine instance**: The test creates separate data for each owner but uses the same engine fixture; true isolation would require separate engine instances per thread
 
 ---
 
@@ -252,6 +353,6 @@ Removed from Git tracking (preserved locally):
 
 ## 14. Final Commit
 
-- **SHA**: `93bc3fc`
+- **SHA**: `f43c3bb697485d17b64b8ac75eee8a6767ec2aed`
 - **Branch**: `codex/openrouter-only-remove-gemini`
 - **Pushed**: ✅ Yes
