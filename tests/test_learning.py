@@ -501,31 +501,29 @@ def test_export_fails_when_repository_query_fails(engine, monkeypatch):
 
 
 def test_concurrent_exports_independent_failures(engine, monkeypatch):
-    """Concurrent exports for two owners must have independent error state."""
+    """Concurrent exports for two owners must have independent error state.
+
+    This test runs multiple iterations to verify deterministic behavior.
+    Owner 1's export always fails; owner 2's export always succeeds.
+    """
     import threading
     import sqlite3
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from app.learning.repositories import _LearningBase
 
-    # Use a barrier to synchronize the start of both exports
-    barrier = threading.Barrier(2)
-    results = {}
-    errors = {}
-
-    # Track which owner should fail
-    fail_owner = {"owner": None}
-    fail_triggered = threading.Event()
-
     original_connection = _LearningBase._connection
+
+    # Thread-local storage for owner ID - deterministic per thread
+    thread_owner = threading.local()
 
     class FailingCursor:
         def __init__(self, real_cursor):
             self._real_cursor = real_cursor
         def execute(self, sql, params=None):
             if "learning_goals" in sql and "SELECT" in sql:
-                if fail_owner["owner"] == threading.current_thread().ident:
-                    fail_triggered.set()
-                    raise sqlite3.Error("simulated db failure")
+                # Deterministic: fail only for owner1 (pre-determined)
+                if getattr(thread_owner, "owner_id", None) == "owner1":
+                    raise sqlite3.Error("simulated db failure for owner1")
             return self._real_cursor.execute(sql, params)
         def __getattr__(self, name):
             return getattr(self._real_cursor, name)
@@ -543,57 +541,71 @@ def test_concurrent_exports_independent_failures(engine, monkeypatch):
         real_conn = original_connection(self)
         return FailingConnection(real_conn)
 
-    # Set up the failing connection for both threads
     monkeypatch.setattr(_LearningBase, "_connection", failing_connection)
 
-    def export_for_owner(owner_id):
-        """Run export for a specific owner."""
-        # Wait for both threads to be ready
-        barrier.wait(timeout=5)
-        # Signal that this thread is about to hit the failure point
-        fail_owner["owner"] = threading.current_thread().ident
-        try:
-            result = engine.export_learning(owner_id)
-            results[owner_id] = result
-        except RuntimeError as e:
-            errors[owner_id] = str(e)
-        except Exception as e:
-            errors[owner_id] = f"Unexpected: {e}"
+    def run_single_iteration():
+        """Run one iteration of concurrent exports."""
+        barrier = threading.Barrier(2)
 
-    # Owner 1's data
-    owner1 = OWNER
-    # Owner 2's data - create separate goal
-    owner2 = 200
-    engine.create_goal(owner2, kind="long_term", title="owner2 goal")
-    _ = engine.add_objective(owner2, goal_id=engine.create_goal(owner2, kind="long_term", title="owner2 goal2"), title="owner2 obj")
+        # Pre-create owner2's data once per iteration
+        owner2 = 200
+        owner2_goal_id = engine.create_goal(owner2, kind="long_term", title="owner2 goal")
+        assert owner2_goal_id is not None
+        owner2_obj_id = engine.add_objective(owner2, goal_id=owner2_goal_id, title="owner2 obj")
+        assert owner2_obj_id is not None
 
-    # Run both exports concurrently
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = {
-            executor.submit(export_for_owner, owner1): owner1,
-            executor.submit(export_for_owner, owner2): owner2,
-        }
-        for future in as_completed(futures):
-            future.result()
+        def export_for_owner(owner_key, owner_id):
+            """Run export for a specific owner with deterministic failure injection."""
+            # Set thread-local owner ID
+            thread_owner.owner_id = owner_key
+            try:
+                # Wait for both threads to be ready before starting
+                barrier.wait(timeout=5)
+                result = engine.export_learning(owner_id)
+                return ("success", owner_key, result)
+            except RuntimeError as e:
+                return ("error", owner_key, str(e))
+            except Exception as e:
+                return ("unexpected", owner_key, str(e))
 
-    # Verify: one export failed with database error, the other succeeded
-    # The failure should only affect the owner whose thread triggered it
-    assert len(errors) == 1, f"Expected exactly one error, got {len(errors)}"
-    assert len(results) == 1, f"Expected exactly one success, got {len(results)}"
+        owner1 = OWNER
 
-    # The failed export should have a RuntimeError with repo/operation info
-    for owner_id, err_msg in errors.items():
-        assert "EducationalGoalsRepository" in err_msg, f"Error should identify repository: {err_msg}"
-        # Sanitized error format
-        assert "Error: database operation failed" in err_msg, f"Error should mention failure: {err_msg}"
+        # Run both exports concurrently
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future1 = executor.submit(export_for_owner, "owner1", owner1)
+            future2 = executor.submit(export_for_owner, "owner2", owner2)
 
-    # The successful export should have goals data
-    for owner_id, result in results.items():
-        assert "goals" in result
-        assert len(result["goals"]) >= 1
-        # Verify ownership isolation
-        for g in result["goals"]:
-            assert g.get("owner_user_id") == owner_id, f"Goal belongs to wrong owner: {g.get('owner_user_id')} vs {owner_id}"
+            outcomes = {}
+            for future in as_completed([future1, future2]):
+                status, owner_key, data = future.result()
+                outcomes[owner_key] = (status, data)
+
+        return outcomes
+
+    # Run multiple iterations to verify deterministic behavior
+    for iteration in range(25):
+        outcomes = run_single_iteration()
+
+        # Verify: owner1 fails, owner2 succeeds
+        assert "owner1" in outcomes, "owner1 missing from outcomes"
+        assert "owner2" in outcomes, "owner2 missing from outcomes"
+
+        status1, data1 = outcomes["owner1"]
+        status2, data2 = outcomes["owner2"]
+
+        # Exactly one failure (owner1), one success (owner2)
+        assert status1 == "error", f"iteration {iteration}: owner1 should fail, got {status1}: {data1}"
+        assert status2 == "success", f"iteration {iteration}: owner2 should succeed, got {status2}"
+
+        # Verify error message contains repo/operation info (sanitized)
+        assert "EducationalGoalsRepository" in data1, f"iteration {iteration}: error should identify repository"
+        assert "Error: database operation failed" in data1, f"iteration {iteration}: error should be sanitized"
+
+        # Verify successful export has goals and correct ownership
+        assert "goals" in data2, f"iteration {iteration}: success should have goals"
+        assert len(data2["goals"]) >= 1, f"iteration {iteration}: should have at least one goal"
+        for g in data2["goals"]:
+            assert g.get("owner_user_id") == 200, f"iteration {iteration}: goal belongs to wrong owner"
 
 
 def test_export_empty_owner_produces_valid_empty_export(engine):
