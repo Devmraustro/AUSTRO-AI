@@ -5,7 +5,7 @@
 - **Repository**: Devmraustro/AUSTRO-AI
 - **Branch**: `codex/openrouter-only-remove-gemini`
 - **Initial HEAD (before remediation)**: `0f30d9a643634e7ba2c52cca48ddc60907dbebd5`
-- **Final HEAD (after remediation)**: `c135c24120b83cde629725aad2ffb92909580220`
+- **Final HEAD (after remediation)**: `a0f7dfe013645cc535d5444a81c6db25248442be`
 - **PR**: #12 (open, not merged)
 - **Upstream**: `origin/codex/openrouter-only-remove-gemini`
 
@@ -41,6 +41,15 @@ class ExportErrorCollector:
         The raw error message is sanitized before storage to prevent
         leakage of SQL parameters, credentials, or sensitive data.
         """
+        error_type = type(error).__name__
+        # Sanitize: keep only error type and a generic message
+        # Avoid exposing SQL details, credentials, or user data
+        sanitized_error = f"{error_type}: database operation failed"
+        self._errors.append({
+            "repository": repository,
+            "operation": operation,
+            "error": sanitized_error,
+        })
 ```
 
 **Key properties**:
@@ -197,7 +206,7 @@ for g in exported.get("goals", []):
 
 ## 6. Concurrent Export Test Implementation
 
-The test `test_concurrent_exports_independent_failures` now uses **genuinely concurrent execution with deterministic failure injection**:
+The test `test_concurrent_exports_independent_failures` now uses **genuinely concurrent execution with deterministic failure injection and proven overlap**:
 
 ```python
 def test_concurrent_exports_independent_failures(engine, monkeypatch):
@@ -215,6 +224,12 @@ def test_concurrent_exports_independent_failures(engine, monkeypatch):
 
     # Thread-local storage for owner ID - deterministic per thread
     thread_owner = threading.local()
+
+    # Synchronization primitives to prove actual overlap
+    enter_count = 0
+    enter_lock = threading.Lock()
+    enter_event = threading.Event()
+    overlap_barrier = threading.Barrier(2)
 
     class FailingCursor:
         def __init__(self, real_cursor):
@@ -244,10 +259,14 @@ def test_concurrent_exports_independent_failures(engine, monkeypatch):
     monkeypatch.setattr(_LearningBase, "_connection", failing_connection)
 
     def run_single_iteration():
-        """Run one iteration of concurrent exports."""
-        barrier = threading.Barrier(2)
-        results = {}
-        errors = {}
+        """Run one iteration of concurrent exports with proven overlap."""
+        # Reset synchronization state for each iteration
+        nonlocal enter_count
+        enter_count = 0
+        enter_event.clear()
+
+        # Synchronization for proving overlap
+        overlap_barrier = threading.Barrier(2)
 
         # Pre-create owner2's data once per iteration
         owner2 = 200
@@ -261,8 +280,14 @@ def test_concurrent_exports_independent_failures(engine, monkeypatch):
             # Set thread-local owner ID
             thread_owner.owner_id = owner_key
             try:
-                # Wait for both threads to be ready before starting
-                barrier.wait(timeout=5)
+                # Signal entry into export
+                with enter_lock:
+                    nonlocal enter_count
+                    enter_count += 1
+                    if enter_count == 2:
+                        enter_event.set()  # Both threads have entered
+                # Wait for both threads to enter (proves overlap)
+                overlap_barrier.wait(timeout=5)
                 result = engine.export_learning(owner_id)
                 return ("success", owner_key, result)
             except RuntimeError as e:
@@ -281,6 +306,10 @@ def test_concurrent_exports_independent_failures(engine, monkeypatch):
             for future in as_completed([future1, future2]):
                 status, owner_key, data = future.result()
                 outcomes[owner_key] = (status, data)
+
+        # Verify overlap occurred
+        assert enter_count == 2, "Both threads must have entered export_learning"
+        assert enter_event.is_set(), "Both threads must have signaled entry"
 
         return outcomes
 
@@ -314,6 +343,7 @@ def test_concurrent_exports_independent_failures(engine, monkeypatch):
 - ✅ Uses `ThreadPoolExecutor` with `max_workers=2` for genuine concurrency
 - ✅ `threading.Barrier(2)` synchronizes the start of both operations
 - ✅ `threading.local()` provides deterministic per-thread failure targeting (no shared mutable state)
+- ✅ `enter_count`/`enter_event`/`overlap_barrier` prove both threads entered `export_learning` before proceeding
 - ✅ Pre-determined failure assignment: owner1 always fails, owner2 always succeeds
 - ✅ **25 iterations** verified with **0 flakes** (deterministic)
 - ✅ Captures and uses actual database IDs from creation methods
@@ -401,7 +431,7 @@ Removed from Git tracking (preserved locally):
 - **Pyflakes**: Clean (0 issues)
 - **Compile checks**: All modules compile successfully
 - **Git diff --check**: Clean
-- **Push CI**: Triggered on `c135c24120b83cde629725aad2ffb92909580220` (to be verified)
+- **Push CI**: Triggered on `a0f7dfe013645cc535d5444a81c6db25248442be` (to be verified)
 - **PR CI**: PR #12 (open, not merged, to be verified)
 - **Previous CI**: Both push and PR runs passed on `ac71db7` and `0f30d9a`
 
@@ -428,6 +458,6 @@ Removed from Git tracking (preserved locally):
 
 ## 14. Final Commit
 
-- **SHA**: `c135c24120b83cde629725aad2ffb92909580220`
+- **SHA**: `a0f7dfe013645cc535d5444a81c6db25248442be`
 - **Branch**: `codex/openrouter-only-remove-gemini`
 - **Pushed**: ✅ Yes
