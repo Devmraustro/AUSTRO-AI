@@ -503,8 +503,8 @@ def test_export_fails_when_repository_query_fails(engine, monkeypatch):
 def test_concurrent_exports_independent_failures(engine, monkeypatch):
     """Concurrent exports for two owners must have independent error state.
 
-    This test runs multiple iterations to verify deterministic behavior.
-    Owner 1's export always fails; owner 2's export always succeeds.
+    This test runs 25 iterations to verify deterministic behavior with
+    proven overlap. Owner 1's export always fails; owner 2's export always succeeds.
     """
     import threading
     import sqlite3
@@ -515,6 +515,11 @@ def test_concurrent_exports_independent_failures(engine, monkeypatch):
 
     # Thread-local storage for owner ID - deterministic per thread
     thread_owner = threading.local()
+
+    # Synchronization primitives to prove actual overlap
+    enter_count = 0
+    enter_lock = threading.Lock()
+    enter_event = threading.Event()
 
     class FailingCursor:
         def __init__(self, real_cursor):
@@ -544,8 +549,14 @@ def test_concurrent_exports_independent_failures(engine, monkeypatch):
     monkeypatch.setattr(_LearningBase, "_connection", failing_connection)
 
     def run_single_iteration():
-        """Run one iteration of concurrent exports."""
-        barrier = threading.Barrier(2)
+        """Run one iteration of concurrent exports with proven overlap."""
+        # Reset synchronization state for each iteration
+        nonlocal enter_count
+        enter_count = 0
+        enter_event.clear()
+
+        # Synchronization for proving overlap
+        overlap_barrier = threading.Barrier(2)
 
         # Pre-create owner2's data once per iteration
         owner2 = 200
@@ -559,8 +570,14 @@ def test_concurrent_exports_independent_failures(engine, monkeypatch):
             # Set thread-local owner ID
             thread_owner.owner_id = owner_key
             try:
-                # Wait for both threads to be ready before starting
-                barrier.wait(timeout=5)
+                # Signal entry into export
+                with enter_lock:
+                    nonlocal enter_count
+                    enter_count += 1
+                    if enter_count == 2:
+                        enter_event.set()  # Both threads have entered
+                # Wait for both threads to enter (proves overlap)
+                overlap_barrier.wait(timeout=5)
                 result = engine.export_learning(owner_id)
                 return ("success", owner_key, result)
             except RuntimeError as e:
@@ -579,6 +596,10 @@ def test_concurrent_exports_independent_failures(engine, monkeypatch):
             for future in as_completed([future1, future2]):
                 status, owner_key, data = future.result()
                 outcomes[owner_key] = (status, data)
+
+        # Verify overlap occurred
+        assert enter_count == 2, "Both threads must have entered export_learning"
+        assert enter_event.is_set(), "Both threads must have signaled entry"
 
         return outcomes
 
