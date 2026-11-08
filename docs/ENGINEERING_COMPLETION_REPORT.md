@@ -5,7 +5,7 @@
 - **Repository**: Devmraustro/AUSTRO-AI
 - **Branch**: `codex/openrouter-only-remove-gemini`
 - **Initial HEAD (before remediation)**: `0f30d9a643634e7ba2c52cca48ddc60907dbebd5`
-- **Final HEAD (after remediation)**: `1c36ba18f7b947e65c53953de446b2fa64d5e171`
+- **Final HEAD (after remediation)**: `75c22d7fa026cf5ec2768fbee28387c337cebaa6`
 - **PR**: #12 (open, not merged)
 - **Upstream**: `origin/codex/openrouter-only-remove-gemini`
 
@@ -401,7 +401,7 @@ Removed from Git tracking (preserved locally):
 - **Pyflakes**: Clean (0 issues)
 - **Compile checks**: All modules compile successfully
 - **Git diff --check**: Clean
-- **Push CI**: Triggered on `1c36ba18f7b947e65c53953de446b2fa64d5e171` (to be verified)
+- **Push CI**: Triggered on `75c22d7fa026cf5ec2768fbee28387c337cebaa6` (to be verified)
 - **PR CI**: PR #12 (open, not merged, to be verified)
 - **Previous CI**: Both push and PR runs passed on `ac71db7` and `0f30d9a`
 
@@ -428,6 +428,6 @@ Removed from Git tracking (preserved locally):
 
 ## 14. Final Commit
 
-- **SHA**: `1c36ba18f7b947e65c53953de446b2fa64d5e171`
+- **SHA**: `75c22d7fa026cf5ec2768fbee28387c337cebaa6`
 - **Branch**: `codex/openrouter-only-remove-gemini`
 - **Pushed**: ✅ Yes
