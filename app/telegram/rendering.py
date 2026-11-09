@@ -205,12 +205,21 @@ async def _send(
     # on; continuation messages are content-only.
     if method == "edit_message_text" and len(chunks) > 1:
         first_body = chunks[0] + CONTINUATION_MARKER
-        sent = await _send_one(
-            call, first_body,
-            reply_markup=reply_markup,
-            parse_mode=parse_mode,
-            attempts=attempts,
-        )
+        try:
+            sent = await _send_one(
+                call, first_body,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+                attempts=attempts,
+            )
+        except Exception as error:  # noqa: BLE001
+            # The first chunk may be identical while later chunks changed.
+            # Telegram's "Message is not modified" applies only to that edit;
+            # it must not suppress delivery of the remaining content.
+            if "not modified" not in str(error).lower():
+                raise
+            logger.debug("Skipped identical primary chunk edit")
+            sent = None
         message = getattr(target, "message", None)
         continuation_call = getattr(message, "reply_text", None)
         if continuation_call is None:
