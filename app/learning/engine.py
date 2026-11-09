@@ -106,21 +106,26 @@ class AdaptiveLearningEngine:
         self._today = today or (lambda: _today())
         self._date = lambda: datetime.strptime(self._today(), _DATE_FMT).date()
 
-        self.curricula = CurriculumEngine(store)
-        self.scheduler = SpacedReviewScheduler(today=self._date)
-        self.sessions = SessionManager(store)
-        self.lessons = LessonGenerator(store, ai, self._settings)
-        self.assessments = AssessmentEngine(store, ai)
-        self.misconceptions = MisconceptionEngine(store)
-        self.diagnostic = DiagnosticEngine(
+        # NOTE: sub-engines are named with a trailing underscore on purpose.
+        # `AdaptiveLearningEngine` also exposes facade methods with the same
+        # names (`curricula()`, ...) and an instance attribute wins over the
+        # class method of the same name, which made those methods
+        # unreachable (TypeError: 'CurriculumEngine' object is not callable).
+        self.curricula_ = CurriculumEngine(store)
+        self.scheduler_ = SpacedReviewScheduler(today=self._date)
+        self.sessions_ = SessionManager(store)
+        self.lessons_ = LessonGenerator(store, ai, self._settings)
+        self.assessments_ = AssessmentEngine(store, ai)
+        self.misconceptions_ = MisconceptionEngine(store)
+        self.diagnostic_ = DiagnosticEngine(
             store, memory_score=self._memory_score if memory_service else None,
         )
-        self.planner = AdaptivePlanner(store, self._settings, today=self._today)
-        self.review = WeeklyReviewEngine(store, ai, self._settings,
-                                         today=self._today)
-        self.coach = CoachEngine(store, ai, self._settings, today=self._today)
-        self.books = BookToCourse(store, knowledge, ai, self._settings)
-        self.flashcards = FlashcardEngine(store)
+        self.planner_ = AdaptivePlanner(store, self._settings, today=self._today)
+        self.review_ = WeeklyReviewEngine(store, ai, self._settings,
+                                          today=self._today)
+        self.coach_ = CoachEngine(store, ai, self._settings, today=self._today)
+        self.books_ = BookToCourse(store, knowledge, ai, self._settings)
+        self.flashcards_ = FlashcardEngine(store)
 
     # ------------------------------------------------------------------
     # Memory integration (learning state is only ever recorded when the
@@ -168,15 +173,15 @@ class AdaptiveLearningEngine:
     # ------------------------------------------------------------------
     def from_lesson(self, owner_user_id: int, lesson_id: int) -> List[Flashcard]:
         """Generate flashcards from a lesson's content and recap."""
-        return self.flashcards.from_lesson(owner_user_id, lesson_id)
+        return self.flashcards_.from_lesson(owner_user_id, lesson_id)
 
     def from_objective(self, owner_user_id: int, objective_id: int) -> List[Flashcard]:
         """Generate flashcards from an objective's concept."""
-        return self.flashcards.from_objective(owner_user_id, objective_id)
+        return self.flashcards_.from_objective(owner_user_id, objective_id)
 
     def from_assessment(self, owner_user_id: int, objective_id: int) -> List[Flashcard]:
         """Generate flashcards from weak concepts after assessment."""
-        return self.flashcards.from_assessment(owner_user_id, objective_id)
+        return self.flashcards_.from_assessment(owner_user_id, objective_id)
 
     def record_flashcard_review(
         self,
@@ -186,7 +191,7 @@ class AdaptiveLearningEngine:
         answer: str = "",
     ) -> Dict[str, Any]:
         """Record a flashcard review result and schedule next review."""
-        return self.flashcards.record_review(owner_user_id, flashcard_id, correct, answer)
+        return self.flashcards_.record_review(owner_user_id, flashcard_id, correct, answer)
 
 
 # ------------------------------------------------------------------
@@ -237,23 +242,23 @@ class AdaptiveLearningEngine:
     def build_curriculum(self, owner_user_id: int, goal_id: int, *,
                           title: str, mode: str = "READ",
                           objective_ids: Optional[List[int]] = None) -> Optional[Dict[str, Any]]:
-        return self.curricula.build(
+        return self.curricula_.build(
             owner_user_id=owner_user_id, goal_id=goal_id, title=title,
             mode=mode, objective_ids=objective_ids,
         )
 
     def curricula(self, owner_user_id: int, goal_id: int) -> List[Dict[str, Any]]:
-        return self.curricula.for_goal(owner_user_id, goal_id)
+        return self.curricula_.for_goal(owner_user_id, goal_id)
 
     def curriculum(self, owner_user_id: int, curriculum_id: int) -> Optional[Dict[str, Any]]:
-        return self.curricula.get(owner_user_id, curriculum_id)
+        return self.curricula_.get(owner_user_id, curriculum_id)
 
     # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
     def diagnose(self, owner_user_id: int, goal_id: int,
                  self_ratings: Optional[Dict[int, float]] = None) -> Dict[str, Any]:
-        result = self.diagnostic.diagnose(owner_user_id, goal_id, self_ratings)
+        result = self.diagnostic_.diagnose(owner_user_id, goal_id, self_ratings)
         self._store.events.log(owner_user_id, "diagnostic_ran", None, None,
                                {"goal_id": goal_id,
                                 "level": result.overall_level})
@@ -265,11 +270,11 @@ class AdaptiveLearningEngine:
     def next_lesson(self, owner_user_id: int, curriculum_id: int, *,
                     objective_id: Optional[int] = None, mode: Optional[str] = None,
                     grounded: bool = False, force: bool = False) -> Optional[Dict[str, Any]]:
-        curriculum = self.curricula.get(owner_user_id, curriculum_id)
+        curriculum = self.curricula_.get(owner_user_id, curriculum_id)
         if curriculum is None:
             return None
         mode = mode or curriculum.get("mode") or "READ"
-        ordered = self.curricula.ordered_objective_ids(curriculum)
+        ordered = self.curricula_.ordered_objective_ids(curriculum)
 
         chosen_id = objective_id
         if chosen_id is None:
@@ -287,7 +292,7 @@ class AdaptiveLearningEngine:
             source_id = curriculum.get("source_id")
             evidence = self._grounded_evidence(owner_user_id, objective, source_id)
 
-        lesson = self.lessons.generate(
+        lesson = self.lessons_.generate(
             owner_user_id=owner_user_id, curriculum_id=curriculum_id,
             objective_id=chosen_id, mode=mode, evidence=evidence, force=force,
         )
@@ -297,15 +302,15 @@ class AdaptiveLearningEngine:
         resume = self._store.sessions.resume(owner_user_id)
         session = None
         if resume is not None and resume.get("objective_id") == chosen_id:
-            self.sessions.attach_lesson(_session_row(resume), lesson.lesson_id)
+            self.sessions_.attach_lesson(_session_row(resume), lesson.lesson_id)
             session = _session_row(resume)
         else:
-            session = self.sessions.start(
+            session = self.sessions_.start(
                 owner_user_id, chosen_id, curriculum.get("goal_id"),
                 curriculum_id, mode,
             )
             if session is not None:
-                self.sessions.attach_lesson(session, lesson.lesson_id)
+                self.sessions_.attach_lesson(session, lesson.lesson_id)
         self._store.events.log(
             owner_user_id, "lesson_generated", chosen_id,
             session.session_id if session else None,
@@ -319,12 +324,12 @@ class AdaptiveLearningEngine:
         }
 
     def continue_session(self, owner_user_id: int) -> Optional[Dict[str, Any]]:
-        session = self.sessions.resume(owner_user_id)
+        session = self.sessions_.resume(owner_user_id)
         if session is None:
             return None
         result = _session_dict(session)
         if session.lesson_id:
-            lesson = self.lessons.get(owner_user_id, session.lesson_id)
+            lesson = self.lessons_.get(owner_user_id, session.lesson_id)
             result["lesson"] = _lesson_dict(lesson) if lesson else None
         if session.objective_id:
             result["objective"] = self._store.objectives.get(owner_user_id, session.objective_id)
@@ -336,7 +341,7 @@ class AdaptiveLearningEngine:
         if source_id is None:
             return []
         try:
-            return self.books.evidence(owner_user_id, source_id,
+            return self.books_.evidence(owner_user_id, source_id,
                                        objective.get("title") or "", top_k=3)
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning(f"grounded evidence failed: {exc}")
@@ -363,7 +368,7 @@ class AdaptiveLearningEngine:
     # ------------------------------------------------------------------
     def quick_check(self, owner_user_id: int, session_id: int,
                     objective_id: int) -> List[Dict[str, Any]]:
-        questions = self.assessments.generate_questions(
+        questions = self.assessments_.generate_questions(
             owner_user_id=owner_user_id, objective_id=objective_id, count=2,
             kinds=["multiple_choice", "true_false"],
         )
@@ -377,19 +382,19 @@ class AdaptiveLearningEngine:
                            questions: Optional[List[Dict[str, Any]]] = None
                            ) -> Dict[str, Any]:
         if not questions:
-            questions = self.assessments.generate_questions(
+            questions = self.assessments_.generate_questions(
                 owner_user_id=owner_user_id, objective_id=objective_id, count=2,
                 kinds=["multiple_choice", "true_false"],
             )
         parsed = [_question_from_dict(q) for q in questions]
-        result = self.assessments.submit(
+        result = self.assessments_.submit(
             owner_user_id=owner_user_id, objective_id=objective_id,
             questions=parsed, answers=answers, session_id=session_id,
         )
         self._store.progress.record(owner_user_id, self._today(),
                                     practice_count=len(questions))
         if session_id:
-            self.sessions.advance(_session_row({"session_id": session_id,
+            self.sessions_.advance(_session_row({"session_id": session_id,
                                                 "owner_user_id": owner_user_id}),
                                   "PRACTICE")
         self._remember_state_from(owner_user_id, objective_id)
@@ -403,14 +408,14 @@ class AdaptiveLearningEngine:
         lesson = None
         if objective is not None:
             goal_id = objective.get("goal_id")
-            curricula = self.curricula.for_goal(owner_user_id, goal_id)
+            curricula = self.curricula_.for_goal(owner_user_id, goal_id)
             for curriculum in curricula:
                 found = self._store.lessons.get_in_curriculum(
                     owner_user_id, curriculum["curriculum_id"], objective_id)
                 if found:
                     lesson = found
                     break
-        questions = self.assessments.generate_questions(
+        questions = self.assessments_.generate_questions(
             owner_user_id=owner_user_id, objective_id=objective_id,
             count=count, kinds=kinds, lesson=lesson,
         )
@@ -421,7 +426,7 @@ class AdaptiveLearningEngine:
                            answers: Dict[int, str],
                            session_id: Optional[int] = None) -> Dict[str, Any]:
         parsed = [_question_from_dict(q) for q in questions]
-        result = self.assessments.submit(
+        result = self.assessments_.submit(
             owner_user_id=owner_user_id, objective_id=objective_id,
             questions=parsed, answers=answers, session_id=session_id,
         )
@@ -432,7 +437,7 @@ class AdaptiveLearningEngine:
             self._store.events.log(owner_user_id, "weak_concept", objective_id,
                                    session_id, {"concept": concept})
         if session_id:
-            self.sessions.advance(_session_row({"session_id": session_id,
+            self.sessions_.advance(_session_row({"session_id": session_id,
                                                 "owner_user_id": owner_user_id}),
                                   "ASSESS")
         self._remember_state_from(owner_user_id, objective_id)
@@ -481,7 +486,7 @@ class AdaptiveLearningEngine:
         if item is None:
             return None
         objective_id = int(item["objective_id"])
-        updated = self.scheduler.schedule(
+        updated = self.scheduler_.schedule(
             item, correct, on=self._date(),
         )
         self._store.reviews.update(owner_user_id, objective_id,
@@ -494,7 +499,7 @@ class AdaptiveLearningEngine:
         self._store.progress.record(owner_user_id, self._today(),
                                     review_count=1)
         if not correct:
-            self.misconceptions.detect(
+            self.misconceptions_.detect(
                 owner_user_id, objective_id,
                 item.get("concept") or "عام", answer, correct=False,
             )
@@ -552,7 +557,7 @@ class AdaptiveLearningEngine:
                 for p in self._store.progress.range(owner_user_id, "0000-01-01",
                                                      self._today())),
             assessment_score_avg=self._avg_assessment(owner_user_id),
-            misconceptions=len(self.misconceptions.for_owner(owner_user_id)),
+            misconceptions=len(self.misconceptions_.for_owner(owner_user_id)),
         )
         return overview
 
@@ -566,17 +571,17 @@ class AdaptiveLearningEngine:
     def daily_plan(self, owner_user_id: int, *,
                     day: Optional[str] = None,
                     time_minutes: Optional[int] = None) -> Dict[str, Any]:
-        return _as_dict(self.planner.plan_day(owner_user_id, day, time_minutes))
+        return _as_dict(self.planner_.plan_day(owner_user_id, day, time_minutes))
 
     def weekly_review(self, owner_user_id: int,
                        days: int = 7) -> Dict[str, Any]:
-        result = self.review.weekly(owner_user_id, days)
+        result = self.review_.weekly(owner_user_id, days)
         self._store.events.log(owner_user_id, "weekly_review", None, None,
                                {"period_end": result.period_end})
         return _as_dict(result)
 
     def coach_today(self, owner_user_id: int) -> Dict[str, Any]:
-        return _as_dict(self.coach.today(owner_user_id))
+        return _as_dict(self.coach_.today(owner_user_id))
 
     # ------------------------------------------------------------------
     # Book-to-course
@@ -584,7 +589,7 @@ class AdaptiveLearningEngine:
     def book_course(self, owner_user_id: int, source_id: int, *,
                      title: Optional[str] = None,
                      mode: str = "READ") -> Optional[Dict[str, Any]]:
-        return self.books.create_course(
+        return self.books_.create_course(
             owner_user_id=owner_user_id, source_id=source_id, title=title,
             mode=mode,
         )
@@ -619,7 +624,7 @@ class AdaptiveLearningEngine:
         reviews = self._store.reviews.list(owner_user_id, error_collector=collector)
         assessments = self._store.assessments.list(owner_user_id, error_collector=collector)
         misconceptions = [
-            dict(m) for m in self.misconceptions.for_owner(owner_user_id, error_collector=collector)
+            dict(m) for m in self.misconceptions_.for_owner(owner_user_id, error_collector=collector)
         ]
         plans = self._store.plans.recent(owner_user_id, error_collector=collector)
         progress = [

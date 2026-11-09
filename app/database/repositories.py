@@ -293,6 +293,37 @@ class PlanRepository(_BaseRepository):
             logger.error(f"Database error in get_daily_plan: {e}")
             return None
 
+    def set_completed(self, user_id: int, date: str,
+                      completed: List[bool]) -> bool:
+        """Persist per-task completion flags for one user's plan.
+
+        Scoped by ``user_id`` as well as ``date`` so a stale callback from
+        another account can never mark someone else's tasks. ``completed`` is
+        stored as a JSON array parallel to ``tasks``.
+        """
+        try:
+            with self._manager._lock:
+                cursor = self._connection().cursor()
+                cursor.execute(
+                    "UPDATE daily_plans SET completed_tasks = ? "
+                    "WHERE user_id = ? AND date = ?",
+                    (json.dumps(list(completed)), user_id, date),
+                )
+                updated = cursor.rowcount
+                if updated:
+                    done = sum(1 for flag in completed if flag)
+                    status = "completed" if completed and done == len(completed) else "pending"
+                    cursor.execute(
+                        "UPDATE daily_plans SET status = ? WHERE user_id = ? AND date = ?",
+                        (status, user_id, date),
+                    )
+                self._connection().commit()
+                return updated > 0
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in set_completed_tasks: {e}")
+            return False
+
 
 class HabitRepository(_BaseRepository):
     def create(self, user_id: int, name: str, description: str,
@@ -630,6 +661,42 @@ class StatsRepository(_BaseRepository):
         "total_reviews": 0,
     }
 
+    def log_completed_task(self, user_id: int, date: str, delta: int = 1) -> bool:
+        """Adjust the number of completed tasks recorded for one day.
+
+        ``progress.tasks_completed`` is what the dashboard, the weekly summary
+        and the coach read, so completing a plan task has to update it - but
+        never by double counting: re-tapping a task that is already done sends
+        ``delta=0`` from the caller, and un-completing it subtracts, clamped at
+        zero so a legacy row cannot go negative.
+        """
+        if delta == 0:
+            return True
+        try:
+            with self._manager._lock:
+                cursor = self._connection().cursor()
+                if delta > 0:
+                    cursor.execute(
+                        "INSERT INTO progress (user_id, date, tasks_completed) "
+                        "VALUES (?, ?, ?) "
+                        "ON CONFLICT (user_id, date) DO UPDATE SET "
+                        "tasks_completed = COALESCE(progress.tasks_completed, 0) + ?",
+                        (user_id, date, delta, delta),
+                    )
+                else:
+                    cursor.execute(
+                        "UPDATE progress SET tasks_completed = "
+                        "MAX(COALESCE(tasks_completed, 0) + ?, 0) "
+                        "WHERE user_id = ? AND date = ?",
+                        (delta, user_id, date),
+                    )
+                self._connection().commit()
+                return True
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in log_completed_task: {e}")
+            return False
+
     def dashboard(self, user_id: int) -> Dict[str, Any]:
         """Get comprehensive dashboard statistics."""
         try:
@@ -761,6 +828,13 @@ class Database:
 
     def get_daily_plan(self, user_id: int, date: str) -> Optional[Dict[str, Any]]:
         return self.plans.get(user_id, date)
+
+    def set_daily_plan_completed(self, user_id: int, date: str,
+                                 completed: List[bool]) -> bool:
+        return self.plans.set_completed(user_id, date, completed)
+
+    def log_completed_task(self, user_id: int, date: str, delta: int = 1) -> bool:
+        return self.stats.log_completed_task(user_id, date, delta)
 
     def create_habit(self, user_id: int, name: str, description: str,
                      frequency: str = "daily", reminder_time: str = "08:00") -> Optional[int]:

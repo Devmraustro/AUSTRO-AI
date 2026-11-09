@@ -30,6 +30,7 @@ from app.core.errors import public_message
 from app.domain.context import UserContext
 from app.infrastructure.scheduler import ReminderScheduler
 from app.observability.logging_config import setup_logging
+from app.telegram import rendering as render
 from app.telegram.handlers import (
     _knowledge_menu_content_for,
     get_accountability_handlers,
@@ -85,7 +86,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
-            await update.message.reply_text(
+            await render.reply(update.message,
                 f"مرحباً بعودتك {user.first_name}! 👋\n\n"
                 f"أنا AUSTRO AI، جاهز لمساعدتك اليوم! 💪\n\n"
                 f"اختر ما تريد:",
@@ -100,14 +101,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             keyboard = [[InlineKeyboardButton("🚀 ابدأ التسجيل", callback_data="start_registration")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
-            await update.message.reply_text(
+            await render.reply(update.message,
                 ARABIC_RESPONSES["welcome"],
                 reply_markup=reply_markup,
                 parse_mode="Markdown"
             )
     except Exception as e:  # noqa: BLE001 - keep /start resilient
         logger.error(f"Error in start command: {e}")
-        await update.message.reply_text(
+        await render.reply(update.message,
             "❌ عذراً، حدث خطأ. الرجاء المحاولة مرة أخرى أو التواصل مع الدعم."
         )
 
@@ -117,7 +118,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not await guard_command_action(update, context):
         return
     support = settings.support_username.strip().lstrip("@") or "Mr_Austro"
-    support_escaped = support.replace("_", "\\_")
+    # Escape every legacy-Markdown special character: escaping only "_"
+    # still broke help for handles that contain "*", "[" or "`".
+    support_escaped = "".join(
+        f"\\{char}" if char in "_*`[]()~>#+-=|{}.!" else char
+        for char in support
+    )
     help_text = (
         "🆘 *المساعدة*\n\n"
         "الأوامر المتاحة:\n"
@@ -133,7 +139,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/settings - الإعدادات\n\n"
         f"للمساعدة: تواصل مع @{support_escaped}"
     )
-    await update.message.reply_text(help_text, parse_mode="Markdown")
+    await render.reply(update.message, help_text, parse_mode="Markdown")
 
 
 async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -148,7 +154,7 @@ async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         tasks = plan.get("tasks", [])
         tasks_text = "\n".join([f"• {task.get('task', task) if isinstance(task, dict) else task}" for task in tasks]) if tasks else "لا توجد مهام"
 
-        await update.message.reply_text(
+        await render.reply(update.message,
             ARABIC_RESPONSES["daily_plan"].format(
                 tasks=tasks_text,
                 review_time=plan.get("review_time", "غير محدد"),
@@ -159,7 +165,7 @@ async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     else:
         keyboard = [[InlineKeyboardButton("📅 إنشاء خطة", callback_data="plan_new")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(
+        await render.reply(update.message,
             "لا توجد خطة لليوم.",
             reply_markup=reply_markup
         )
@@ -176,7 +182,7 @@ async def goals_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not goals:
         keyboard = [[InlineKeyboardButton("➕ إضافة هدف", callback_data="goal_new")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("لا توجد أهداف حالياً.", reply_markup=reply_markup)
+        await render.reply(update.message, "لا توجد أهداف حالياً.", reply_markup=reply_markup)
         return
 
     goals_text = "🎯 **أهدافك:**\n\n"
@@ -186,7 +192,7 @@ async def goals_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         goals_text += f"{i}. {status_emoji} {goal['title']}\n"
         goals_text += f"   {progress_bar} {goal['progress']}%\n\n"
 
-    await update.message.reply_text(goals_text, parse_mode="Markdown")
+    await render.reply(update.message, goals_text, parse_mode="Markdown")
 
 
 async def habits_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -200,7 +206,7 @@ async def habits_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not habits:
         keyboard = [[InlineKeyboardButton("➕ إضافة عادة", callback_data="habit_new")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("لا توجد عادات حالياً.", reply_markup=reply_markup)
+        await render.reply(update.message, "لا توجد عادات حالياً.", reply_markup=reply_markup)
         return
 
     habits_text = "🔄 **عاداتك:**\n\n"
@@ -209,7 +215,7 @@ async def habits_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         fire = "🔥" if streak > 0 else "⚪"
         habits_text += f"{i}. {fire} {habit['name']} ({streak} يوم)\n"
 
-    await update.message.reply_text(habits_text, parse_mode="Markdown")
+    await render.reply(update.message, habits_text, parse_mode="Markdown")
 
 
 async def progress_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -220,7 +226,7 @@ async def progress_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     services = get_services(context)
     summary = services.progress.weekly_summary(user_id)
 
-    await update.message.reply_text(
+    await render.reply(update.message,
         f"📈 **تقدمك (آخر 7 أيام)**\n\n"
         f"⏰ ساعات الدراسة: {summary['total_hours']}\n"
         f"✅ المهام المنجزة: {summary['total_tasks']}\n"
@@ -239,7 +245,7 @@ async def review_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.message.reply_text(
+    await render.reply(update.message,
         "🌙 **المحاسبة اليومية**\n\n"
         "اختر ما تريد:",
         reply_markup=reply_markup
@@ -261,11 +267,11 @@ async def coach_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user_id = update.effective_user.id
     stats = services.dashboard.stats(user_id)
 
-    await update.message.reply_text("⏳ جاري تحليل أدائك...")
+    await render.reply(update.message, "⏳ جاري تحليل أدائك...")
 
     memory_block = services.memory.memory_block(user_id, subject="training")
     advice = await services.coaching.advice(stats, user_id=user_id, memory=memory_block)
-    await update.message.reply_text(advice, parse_mode="Markdown")
+    await render.reply(update.message, advice, parse_mode="Markdown")
 
 
 async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -295,7 +301,7 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         f"📝 **المراجعات:** {stats['total_reviews']}"
     )
 
-    await update.message.reply_text(dashboard_text, parse_mode="Markdown")
+    await render.reply(update.message, dashboard_text, parse_mode="Markdown")
 
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -309,7 +315,7 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.message.reply_text(
+    await render.reply(update.message,
         "⚙️ **الإعدادات**\n\n"
         "اختر ما تريد تعديله:",
         reply_markup=reply_markup
@@ -325,7 +331,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     effect - PTB ignores the return value of a handler that is not part of a
     conversation - and it advertised a state reset that never happened.
     """
-    await update.message.reply_text("❌ تم إلغاء العملية.")
+    await render.reply(update.message, "❌ تم إلغاء العملية.")
 
 
 async def knowledge_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -336,7 +342,7 @@ async def knowledge_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     text, markup = _knowledge_menu_content_for(
         services.knowledge.counts(update.effective_user.id)
     )
-    await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+    await render.reply(update.message, text, reply_markup=markup, parse_mode="Markdown")
 
 
 def _update_label(update: Update) -> str:
@@ -373,7 +379,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     try:
         if update and update.effective_message:
-            await update.effective_message.reply_text(message)
+            await render.reply(update.effective_message, message)
         elif update and update.callback_query:
             await update.callback_query.answer(message, show_alert=True)
     except Exception as e:  # noqa: BLE001 - the handler itself must never crash
