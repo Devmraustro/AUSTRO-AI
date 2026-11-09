@@ -790,8 +790,6 @@ def test_pg_failure_between_writes_rolls_back(pg_db, monkeypatch):
 
 def test_pg_accounting_uses_greatest_clamp(pg_db):
     """A reopen with no matching credit clamps at 0, not -1."""
-    from datetime import datetime
-
     date = _pg_plan(pg_db)
     conn = pg_db._get_connection()
     cursor = conn.cursor()
@@ -807,18 +805,20 @@ def test_pg_accounting_uses_greatest_clamp(pg_db):
     conn.commit()
 
     assert pg_db.plans.set_task_state(1, date, 0, False)["status"] == "changed"
-    assert _pg_weekly(pg_db) == 0
 
-    cursor.execute(
+    # Re-acquire the connection: ``_pg_weekly`` closes the thread-local one, so
+    # the cursor above is no longer usable.
+    counter = pg_db._get_connection().cursor()
+    counter.execute(
         "SELECT tasks_completed FROM progress WHERE user_id = %s AND date = %s",
         (1, date),
     )
-    assert cursor.fetchone()[0] == 0
+    assert counter.fetchone()[0] == 0, "the counter was driven below zero"
+    assert _pg_weekly(pg_db) == 0
 
     # And a real completion afterwards still counts once.
     assert pg_db.plans.set_task_state(1, date, 0, True)["status"] == "changed"
     assert _pg_weekly(pg_db) == 1
-    assert datetime.utcnow()  # keep the import meaningful for readers
 
 
 # ============================ SCHEDULER ============================
