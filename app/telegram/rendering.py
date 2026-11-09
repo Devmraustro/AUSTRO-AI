@@ -198,6 +198,37 @@ async def _send(
     if not chunks:
         return None
 
+    # A callback query can edit exactly one existing Telegram message.  For
+    # oversized edits, replace that message with the first chunk and send the
+    # remaining chunks as new messages in the same chat.  Keeping the keyboard
+    # on the edited (primary) message preserves the controls users are acting
+    # on; continuation messages are content-only.
+    if method == "edit_message_text" and len(chunks) > 1:
+        first_body = chunks[0] + CONTINUATION_MARKER
+        sent = await _send_one(
+            call, first_body,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+            attempts=attempts,
+        )
+        message = getattr(target, "message", None)
+        continuation_call = getattr(message, "reply_text", None)
+        if continuation_call is None:
+            raise RuntimeError(
+                "Cannot deliver a long edited message: callback has no "
+                "message.reply_text continuation target"
+            )
+        for index, chunk in enumerate(chunks[1:], start=1):
+            is_last = index == len(chunks) - 1
+            body = chunk if is_last else chunk + CONTINUATION_MARKER
+            sent = await _send_one(
+                continuation_call, body,
+                reply_markup=None,
+                parse_mode=parse_mode,
+                attempts=attempts,
+            )
+        return sent
+
     sent = None
     for index, chunk in enumerate(chunks):
         is_last = index == len(chunks) - 1
