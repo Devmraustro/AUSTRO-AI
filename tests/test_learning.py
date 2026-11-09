@@ -500,11 +500,6 @@ def test_export_fails_when_repository_query_fails(engine, monkeypatch):
         assert "Error: database operation failed" in err_msg
 
 
-import threading
-import sqlite3
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from app.learning.repositories import _LearningBase, EducationalGoalsRepository
-
 def test_concurrent_exports_independent_failures(engine, monkeypatch):
     """Concurrent exports for two owners must have independent error state.
 
