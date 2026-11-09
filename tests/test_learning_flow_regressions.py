@@ -410,6 +410,39 @@ async def test_long_answer_is_chunked_instead_of_failing():
 
 
 @pytest.mark.asyncio
+async def test_long_edit_updates_original_and_sends_continuations():
+    """An edit changes one Telegram message; later chunks must be new messages."""
+    edit_call = _RejectingCall(reject_when=lambda kwargs: False)
+    continuation_call = _RejectingCall(reject_when=lambda kwargs: False)
+    query = _Target("edit_message_text", edit_call)
+    query.message = _Target("reply_text", continuation_call)
+    keyboard = object()
+    body = "\n\n".join(f"فقرة {index} " + "نص " * 60 for index in range(40))
+    assert len(body) > render.MAX_MESSAGE_LENGTH
+
+    await render.edit(query, body, reply_markup=keyboard)
+
+    assert len(edit_call.calls) == 1, "the same Telegram message was edited repeatedly"
+    assert continuation_call.calls, "remaining chunks were not sent as new messages"
+    first_text, first_kwargs = edit_call.calls[0]
+    assert first_kwargs.get("reply_markup") is keyboard, (
+        "the action keyboard must remain attached to the primary edited message"
+    )
+    assert render.CONTINUATION_MARKER.strip() in first_text
+    assert all("reply_markup" not in kwargs for _, kwargs in continuation_call.calls), (
+        "continuation messages must not duplicate the action keyboard"
+    )
+    all_calls = edit_call.calls + continuation_call.calls
+    assert all(len(text) <= render.MAX_MESSAGE_LENGTH for text, _ in all_calls)
+    assert render.CONTINUATION_MARKER.strip() not in continuation_call.calls[-1][0], (
+        "the final continuation must not advertise another chunk"
+    )
+    delivered = "".join(text.removesuffix(render.CONTINUATION_MARKER) for text, _ in all_calls)
+    for paragraph in ("فقرة 0", "فقرة 39"):
+        assert paragraph in delivered, f"message content was lost: {paragraph}"
+
+
+@pytest.mark.asyncio
 async def test_identical_edit_is_not_reported_as_an_error():
     async def edit(text, **kwargs):
         from telegram.error import BadRequest
