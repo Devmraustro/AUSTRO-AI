@@ -98,6 +98,15 @@ _INSERT_TABLE_RE: Pattern = re.compile(
 _OR_REPLACE_RE: Pattern = re.compile(r"^\s*INSERT\s+OR\s+REPLACE\s+INTO", re.IGNORECASE)
 _OR_IGNORE_RE: Pattern = re.compile(r"^\s*INSERT\s+OR\s+IGNORE\s+INTO", re.IGNORECASE)
 _MAX2_RE: Pattern = re.compile(r"MAX\(\s*longest_streak\s*,\s*current_streak\s*\+\s*1\s*\)", re.IGNORECASE)
+# SQLite's two-argument scalar max(a, b) (clamp helper) has no PostgreSQL
+# equivalent: PostgreSQL's max() is an AGGREGATE, so `MAX(x, 0)` fails with
+# "function max(integer, integer) does not exist". GREATEST(a, b) is the
+# element-wise version. Restricted to exactly two arguments so the aggregate
+# form `MAX(COALESCE(...))` and multi-argument aggregates are never rewritten.
+_SCALAR_MAX2_RE: Pattern = re.compile(
+    r"\bMAX\(\s*((?:[^(),]|\([^()]*\))+?)\s*,\s*((?:[^(),]|\([^()]*\))+?)\s*\)",
+    re.IGNORECASE,
+)
 _COLUMN_SPLIT_RE: Pattern = re.compile(r"\s*,\s*")
 
 
@@ -182,6 +191,7 @@ def translate_query(sql: str) -> Tuple[str, bool]:
     """
     out = _QMARK_RE.sub("%s", sql)
     out = _MAX2_RE.sub("GREATEST(longest_streak, current_streak + 1)", out)
+    out = _SCALAR_MAX2_RE.sub(r"GREATEST(\1, \2)", out)
 
     table = _parse_table(out)
     returns_primary_key = False

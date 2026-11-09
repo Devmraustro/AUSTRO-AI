@@ -84,6 +84,7 @@ class LocalProvider:
         "english_lesson": "_english_lesson",
         "cyber_lesson": "_cyber_lesson",
         "grounded_answer": "_grounded_answer",
+        "study_session": "_study_session",
     }
 
     @property
@@ -256,6 +257,29 @@ class LocalProvider:
             "لا تنسَ حرف S في الأفعال مع He/She/It\n"
             "✅ He studies hard\n"
             "❌ He study hard"
+        )
+
+    def _study_session(self, data: Dict[str, Any]) -> str:
+        """Deterministic 25-minute session skeleton for one topic.
+
+        Mirrors the structure the AI prompt asks for, so a learner without a
+        provider key still gets a usable session instead of the gateway's
+        generic "service unavailable" text.
+        """
+        topic = (data.get("topic") or "الموضوع").strip() or "الموضوع"
+        return (
+            f"📚 **جلسة دراسة: {topic}**\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "🔎 **تمهيد (3 دقائق)**\n"
+            f"1. ماذا تعرف بالفعل عن «{topic}»؟\n"
+            "2. ما أول سؤال يخطر في بالك عنه؟\n"
+            "3. أين قابلته آخر مرة؟\n\n"
+            "📖 **تعلّم (12 دقيقة)**\n"
+            f"اقرأ تعريفاً واحداً واضحاً لـ«{topic}»، ثم اكتب الجملة الأساسية "
+            "بأسلوبك أنت. إن لم تستطع، فالعنصر غير مفهوم بعد.\n\n"
+            "✍️ **تطبيق (10 دقائق)**\n"
+            f"اشرح «{topic}» لشخص لا يعرفه في ثلاث جمل، مع مثال واحد من واقعك.\n\n"
+            "🎯 ما الذي يجب أن تخرج به من هذه الجلسة؟"
         )
 
     def _cyber_lesson(self, data: Dict[str, Any]) -> str:

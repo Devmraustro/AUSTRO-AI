@@ -45,6 +45,48 @@ _PROGRESS_FIELDS = frozenset({
 })
 
 
+def _load_json_list(raw: Any) -> List[Any]:
+    """Decode a JSON-array column into a list; any bad shape becomes []."""
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return raw
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return value if isinstance(value, list) else []
+
+
+def _load_flags(raw: Any, length: int) -> List[bool]:
+    """Decode ``daily_plans.completed_tasks`` into exactly ``length`` booleans.
+
+    Legacy rows may hold a JSON array, a ``{index: bool}`` object or NULL; every
+    shape is coerced so an old plan can still be completed from the bot.
+    """
+    flags = [False] * length
+    if isinstance(raw, list):
+        for index in range(min(length, len(raw))):
+            flags[index] = bool(raw[index])
+        return flags
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            try:
+                index = int(key)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= index < length:
+                flags[index] = bool(value)
+        return flags
+    if raw:
+        try:
+            decoded = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return flags
+        return _load_flags(decoded, length)
+    return flags
+
+
 class _BaseRepository:
     """Shared helpers: locked access to the thread-local connection."""
 
@@ -293,6 +335,74 @@ class PlanRepository(_BaseRepository):
             logger.error(f"Database error in get_daily_plan: {e}")
             return None
 
+    def set_task_state(self, user_id: int, date: str, index: int,
+                       done: bool) -> Optional[Dict[str, Any]]:
+        """Move one task to an explicit state, exactly once.
+
+        WHY THIS EXISTS (delivered-callback idempotency)
+        ------------------------------------------------
+        Telegram retries a callback query when the bot does not answer fast
+        enough, and two application workers can deliver the same tap
+        concurrently. A blind "flip whatever is stored" write is not
+        idempotent: two deliveries of ONE tap flip the task twice, so the
+        completion is silently lost (and, before the progress counter became
+        transition-aware, the weekly total flip-flopped 1 -> 0).
+
+        The caller therefore states the state it wants (``done``), not a flip.
+        The read and the compare-and-set happen under the repository lock, so a
+        duplicate delivery finds the row already in the requested state and
+        writes nothing.
+
+        Returns ``None`` when the plan or the task index does not exist,
+        otherwise:
+          * ``{"status": "changed", "done": <bool>, "task": <title>}``
+          * ``{"status": "already", "done": <bool>, "task": <title>}``
+        Only ``changed`` represents a real transition; callers must count
+        statistics from that status alone.
+        """
+        try:
+            with self._manager._lock:
+                cursor = self._connection().cursor()
+                cursor.execute(
+                    "SELECT tasks, completed_tasks FROM daily_plans "
+                    "WHERE user_id = ? AND date = ?",
+                    (user_id, date),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+
+                def _col(name: str, position: int):
+                    return row[name] if isinstance(row, dict) else row[position]
+
+                tasks = _load_json_list(_col("tasks", 0))
+                if not 0 <= index < len(tasks):
+                    return None
+                flags = _load_flags(_col("completed_tasks", 1), len(tasks))
+
+                task = tasks[index]
+                title = (task.get("task") or task.get("title")
+                         if isinstance(task, dict) else str(task))
+
+                if flags[index] == bool(done):
+                    return {"status": "already", "done": bool(done),
+                            "task": title}
+
+                flags[index] = bool(done)
+                cursor.execute(
+                    "UPDATE daily_plans SET completed_tasks = ?, status = ? "
+                    "WHERE user_id = ? AND date = ?",
+                    (json.dumps(flags),
+                     "completed" if flags and all(flags) else "pending",
+                     user_id, date),
+                )
+                self._connection().commit()
+                return {"status": "changed", "done": bool(done), "task": title}
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in set_task_state: {e}")
+            return None
+
     def set_completed(self, user_id: int, date: str,
                       completed: List[bool]) -> bool:
         """Persist per-task completion flags for one user's plan.
@@ -303,16 +413,16 @@ class PlanRepository(_BaseRepository):
         """
         try:
             with self._manager._lock:
+                flags = [bool(value) for value in completed]
                 cursor = self._connection().cursor()
                 cursor.execute(
                     "UPDATE daily_plans SET completed_tasks = ? "
                     "WHERE user_id = ? AND date = ?",
-                    (json.dumps(list(completed)), user_id, date),
+                    (json.dumps(flags), user_id, date),
                 )
                 updated = cursor.rowcount
                 if updated:
-                    done = sum(1 for flag in completed if flag)
-                    status = "completed" if completed and done == len(completed) else "pending"
+                    status = "completed" if flags and all(flags) else "pending"
                     cursor.execute(
                         "UPDATE daily_plans SET status = ? WHERE user_id = ? AND date = ?",
                         (status, user_id, date),
@@ -832,6 +942,10 @@ class Database:
     def set_daily_plan_completed(self, user_id: int, date: str,
                                  completed: List[bool]) -> bool:
         return self.plans.set_completed(user_id, date, completed)
+
+    def set_daily_plan_task_state(self, user_id: int, date: str, index: int,
+                                  done: bool) -> Optional[Dict[str, Any]]:
+        return self.plans.set_task_state(user_id, date, index, done)
 
     def log_completed_task(self, user_id: int, date: str, delta: int = 1) -> bool:
         return self.stats.log_completed_task(user_id, date, delta)

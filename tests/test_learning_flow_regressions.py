@@ -490,13 +490,23 @@ def test_every_button_in_the_bot_has_a_handler():
     assert not dead, f"buttons rendered with no handler (taps do nothing): {dead}"
 
 
+def _plan_owner(container):
+    from app.domain.context import UserContext
+
+    container.users.ensure_user(UserContext(OWNER, "learner", "Learner", ""))
+
+
+def _today() -> str:
+    from datetime import datetime
+
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+
 @pytest.mark.asyncio
 async def test_plan_task_completion_updates_progress():
     container = _container()
-    container.users.ensure_user(
-        __import__("app.domain.context", fromlist=["UserContext"]).UserContext(
-            OWNER, "learner", "Learner", ""))
-    today = __import__("datetime").datetime.utcnow().strftime("%Y-%m-%d")
+    _plan_owner(container)
+    today = _today()
     container.plans.create(NewPlan(
         user_id=OWNER, date=today,
         tasks=[{"task": "قراءة 10 صفحات", "done": False},
@@ -505,8 +515,7 @@ async def test_plan_task_completion_updates_progress():
     ))
 
     update = _FakeUpdate(callback=True, data="plan_task_0")
-    context = _FakeContext(container)
-    await H.plan_complete_task(update, context)
+    await H.plan_complete_task(update, _FakeContext(container))
 
     text = _rendered(update)
     assert "حدث خطأ" not in text
@@ -514,11 +523,128 @@ async def test_plan_task_completion_updates_progress():
     assert container.dashboard.stats(OWNER)["weekly_tasks"] == 1
     assert "✅" in update.callback_query.answer.call_args.args[0]
 
-    # Tapping the same task again re-opens it and never double counts.
-    again = _FakeUpdate(callback=True, data="plan_task_0")
-    await H.plan_complete_task(again, _FakeContext(container))
+    # The button now asks for the opposite state explicitly.
+    reopened = _FakeUpdate(callback=True, data="plan_task_0_0")
+    await H.plan_complete_task(reopened, _FakeContext(container))
     assert container.dashboard.stats(OWNER)["weekly_tasks"] == 0
-    assert "0/2" in _rendered(again)
+    assert "0/2" in _rendered(reopened)
+
+
+@pytest.mark.asyncio
+async def test_repeated_delivery_of_one_completion_is_idempotent():
+    """A THIRD party retry must not undo the completion.
+
+    This is the exact failure found while transferring the fixes: the same
+    callback delivered twice (Telegram retry / two workers) used to flip the
+    task back, so `weekly_tasks` went 1 -> 0 and the user's completion was
+    silently lost.
+    """
+    container = _container()
+    _plan_owner(container)
+    today = _today()
+    container.plans.create(NewPlan(
+        user_id=OWNER, date=today, tasks=[{"task": "مهمة"}],
+        priorities=[], review_time="20:00", break_time="10",
+    ))
+
+    first = _FakeUpdate(callback=True, data="plan_task_0")
+    await H.plan_complete_task(first, _FakeContext(container))
+    assert container.dashboard.stats(OWNER)["weekly_tasks"] == 1
+
+    for _ in range(3):  # the same callback, delivered again
+        again = _FakeUpdate(callback=True, data="plan_task_0")
+        await H.plan_complete_task(again, _FakeContext(container))
+        assert container.dashboard.stats(OWNER)["weekly_tasks"] == 1, (
+            "a retried completion must never be counted twice or undone"
+        )
+        assert "1/1" in _rendered(again)
+        assert "بالفعل" in again.callback_query.answer.call_args.args[0]
+
+    plan = container.plans.for_date(OWNER, today)
+    assert plan["completed_tasks"] == [True]
+    assert plan["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_repeated_delivery_of_one_reopen_is_idempotent():
+    container = _container()
+    _plan_owner(container)
+    today = _today()
+    container.plans.create(NewPlan(
+        user_id=OWNER, date=today, tasks=[{"task": "مهمة"}],
+        priorities=[], review_time="20:00", break_time="10",
+    ))
+    container.plans.set_task_done(OWNER, today, 0, True)
+    assert container.dashboard.stats(OWNER)["weekly_tasks"] == 1
+
+    for _ in range(3):
+        update = _FakeUpdate(callback=True, data="plan_task_0_0")
+        await H.plan_complete_task(update, _FakeContext(container))
+        assert container.dashboard.stats(OWNER)["weekly_tasks"] == 0, (
+            "re-opening must subtract exactly one completion"
+        )
+    assert container.plans.for_date(OWNER, today)["completed_tasks"] == [False]
+
+
+def test_service_counts_only_real_transitions():
+    """Statistics come from the transition status, never from the request."""
+    container = _container()
+    _plan_owner(container)
+    today = _today()
+    container.plans.create(NewPlan(
+        user_id=OWNER, date=today,
+        tasks=[{"task": "أ"}, {"task": "ب"}],
+        priorities=[], review_time="20:00", break_time="10",
+    ))
+    service = container.plans
+
+    assert service.set_task_done(OWNER, today, 0, True)["transition"] == "changed"
+    assert service.set_task_done(OWNER, today, 0, True)["transition"] == "already"
+    assert container.dashboard.stats(OWNER)["weekly_tasks"] == 1
+
+    assert service.set_task_done(OWNER, today, 1, True)["transition"] == "changed"
+    assert container.dashboard.stats(OWNER)["weekly_tasks"] == 2
+    plan = service.for_date(OWNER, today)
+    assert service.all_done(plan) is True
+
+
+def test_completion_credits_the_plans_own_date_not_today():
+    """Completing yesterday's plan must not rewrite today's progress row."""
+    container = _container()
+    _plan_owner(container)
+    old_date = "2026-01-05"
+    container.plans.create(NewPlan(
+        user_id=OWNER, date=old_date, tasks=[{"task": "قديمة"}],
+        priorities=[], review_time="20:00", break_time="10",
+    ))
+
+    container.plans.set_task_done(OWNER, old_date, 0, True)
+
+    row = [r for r in database_progress(container, OWNER) if r["date"] == old_date]
+    assert row and row[0]["tasks_completed"] == 1
+
+
+def database_progress(container, user_id):
+    return container.db.get_progress(user_id, days=3650)
+
+
+def test_task_state_is_scoped_to_the_owning_user():
+    """A stale callback from another account must never touch this plan."""
+    container = _container()
+    _plan_owner(container)
+    other = OWNER + 1
+    from app.domain.context import UserContext
+
+    container.users.ensure_user(UserContext(other, "other", "Other", ""))
+    today = _today()
+    container.plans.create(NewPlan(
+        user_id=OWNER, date=today, tasks=[{"task": "خاصة"}],
+        priorities=[], review_time="20:00", break_time="10",
+    ))
+
+    assert container.plans.set_task_done(other, today, 0, True) is None
+    assert container.plans.for_date(OWNER, today)["completed_tasks"] in (None, [])
+    assert container.dashboard.stats(other)["weekly_tasks"] == 0
 
 
 @pytest.mark.asyncio
@@ -593,3 +719,117 @@ def test_text_router_targets_are_real_coroutines():
         assert func is not None, f"text_router calls a missing {target}"
         assert inspect.iscoroutinefunction(func), f"{target} is not awaitable"
         assert target in H.ENTRY_POINT_RATELIMITS, target
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL parity for the completion path
+# ---------------------------------------------------------------------------
+
+
+def test_scalar_max_is_translated_for_postgresql():
+    """`MAX(a, b)` is SQLite-only; PostgreSQL's max() is an aggregate.
+
+    The reopen path clamps with `MAX(tasks_completed + ?, 0)`. Untranslated it
+    fails on PostgreSQL with "function max(integer, integer) does not exist" -
+    a bug SQLite cannot reveal. `translate_query` is exactly what the
+    PostgreSQL cursor applies, so asserting on it is the offline proxy for the
+    integration test that needs a live server.
+    """
+    from app.database.dialect import translate_query
+
+    sql = ("UPDATE progress SET tasks_completed = "
+           "MAX(COALESCE(tasks_completed, 0) + ?, 0) "
+           "WHERE user_id = ? AND date = ?")
+    out, _ = translate_query(sql)
+
+    assert "GREATEST(COALESCE(tasks_completed, 0) + %s, 0)" in out
+    assert "MAX(" not in out.upper()
+    assert "?" not in out, "bind placeholders must be %s for psycopg2"
+
+
+def test_aggregates_are_never_rewritten_to_greatest():
+    """Only the two-argument scalar form is rewritten."""
+    from app.database.dialect import translate_query
+
+    for sql in (
+        "SELECT COALESCE(SUM(tasks_completed), 0) FROM progress",
+        "SELECT MAX(count) FROM learning_misconceptions",
+        "SELECT MAX(a, b, c) FROM t",
+    ):
+        out, _ = translate_query(sql)
+        assert "GREATEST" not in out, f"aggregate rewritten: {out}"
+
+
+def test_every_plan_sql_statement_survives_the_postgres_translation():
+    """No repository statement may keep a `?` placeholder on PostgreSQL."""
+    import pathlib as _pathlib
+    import re as _re
+
+    from app.database.dialect import translate_query
+
+    source = _pathlib.Path(
+        __import__("app.database.repositories", fromlist=["x"]).__file__
+    ).read_text()
+    executed = _re.findall(r'cursor\.execute\(\s*\n?\s*((?:"[^"]*"\s*\n?\s*)+)', source)
+    statements = [" ".join("".join(_re.findall(r'"([^"]*)"', chunk)).split())
+                  for chunk in executed]
+    relevant = [sql for sql in statements
+                if "daily_plans" in sql or "tasks_completed" in sql]
+    assert len(relevant) >= 7, "the completion SQL was not found in the source"
+    for sql in relevant:
+        out, _ = translate_query(sql)
+        assert "?" not in out, f"untranslated placeholder in: {sql}"
+        assert "MAX(" not in out.upper() or "SELECT MAX" in out.upper(), (
+            f"scalar MAX() left untranslated: {sql}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Found by replaying the whole menu graph end to end
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_prog_concept_from_a_typed_message_does_not_crash():
+    """text_router feeds prog_concept_text a MESSAGE update, not a callback.
+
+    The first version of this handler re-entered `prog_concept`, which assumed
+    `update.callback_query` was present and raised AttributeError on the text
+    path - the button worked, typing the concept did not.
+    """
+    container = _container()
+    context = _FakeContext(container, user_data={"prog_concept_mode": True})
+    update = _FakeUpdate(text="الوراثة في بايثون")
+    object.__setattr__(update, "callback_query", None)
+
+    await H.prog_concept_text(update, context)
+
+    text = _rendered(update)
+    assert "حدث خطأ" not in text
+    assert text.strip(), "the concept explanation was not sent"
+    assert context.user_data.get("prog_concept_mode") is None
+
+
+@pytest.mark.asyncio
+async def test_prog_concept_button_still_works():
+    container = _container()
+    context = _FakeContext(container, user_data={"prog_concept_topic": "Big-O"})
+    update = _FakeUpdate(callback=True, data="prog_concept")
+
+    await H.prog_concept(update, context)
+
+    assert _rendered(update).strip()
+    update.callback_query.answer.assert_awaited()
+
+
+def test_study_session_has_a_deterministic_local_generator():
+    """Every AI capability the UI can reach needs an offline fallback."""
+    from app.ai.local import LocalProvider
+    from app.domain.ai import AIRequest
+
+    out = LocalProvider().generate(AIRequest(
+        capability="study_session", prompt="ignored", data={"topic": "التشفير"},
+    ))
+    assert "جلسة دراسة" in out
+    assert "التشفير" in out
+    assert "دقائق" in out

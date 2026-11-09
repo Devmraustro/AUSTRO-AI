@@ -603,16 +603,27 @@ def _is_task_done(flags, index: int) -> bool:
 
 
 def plan_keyboard(plan) -> InlineKeyboardMarkup:
-    """Buttons for one task each, so completing a plan takes one tap."""
+    """Buttons for one task each, so completing a plan takes one tap.
+
+    The callback carries the state the tap *asks for* (``plan_task_1`` done,
+    ``plan_task_1_0`` reopened) instead of a blind toggle: a re-delivered
+    callback then repeats the same request, and the service treats it as a
+    no-op instead of undoing the user's completion.
+    """
     tasks = plan.get("tasks") or []
     done_flags = plan.get("completed_tasks") or []
     keyboard = []
     for index, task in enumerate(tasks):
-        mark = "✅" if _is_task_done(done_flags, index) else "⬜"
+        is_done = _is_task_done(done_flags, index)
+        mark = "✅" if is_done else "⬜"
         label = f"{mark} {_plan_task_title(task)}"
         if len(label) > 60:  # Telegram caps button text
             label = label[:57] + "…"
-        keyboard.append([InlineKeyboardButton(label, callback_data=f"plan_task_{index}")])
+        if is_done:
+            data = f"plan_task_{index}_0"   # ask for "not done"
+        else:
+            data = f"plan_task_{index}"     # ask for "done"
+        keyboard.append([InlineKeyboardButton(label, callback_data=data)])
     keyboard.append([InlineKeyboardButton("📅 خطة جديدة", callback_data="plan_new")])
     keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="menu_plan")])
     return InlineKeyboardMarkup(keyboard)
@@ -644,15 +655,23 @@ async def plan_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def plan_complete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Toggle one task of today's plan (button `plan_task_<index>`)."""
+    """Set one task of today's plan (button `plan_task_<n>` / `plan_task_<n>_0`).
+
+    Idempotent by construction: the callback names the desired state, so a
+    retried or concurrently delivered tap repeats the same request and is
+    reported as "already" instead of flipping the completion back.
+    """
     if not await guard_command_action(update, context):
         return None
     query = update.callback_query
     services = get_services(context)
     user_id = update.effective_user.id
+
+    parts = (query.data or "").split("_")
     try:
-        index = int((query.data or "").rsplit("_", 1)[-1])
-    except (TypeError, ValueError):
+        index = int(parts[2])
+        done = not (len(parts) > 3 and parts[3] == "0")
+    except (IndexError, ValueError):
         await query.answer("اختيار غير صالح", show_alert=True)
         return None
 
@@ -661,14 +680,15 @@ async def plan_complete_task(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("لا توجد خطة اليوم", show_alert=True)
         return None
 
-    plan = services.plans.toggle_task(user_id, plan["date"], index)
+    plan = services.plans.set_task_done(user_id, plan["date"], index, done)
     if plan is None:
         await query.answer("تعذر تحديث المهمة", show_alert=True)
         return None
 
-    just_completed = plan.get("just_completed_task")
-    if just_completed:
-        note = f"✅ أُنجزت: {just_completed}"
+    if plan.get("transition") == "already":
+        note = "ℹ️ هذه المهمة محدَّثة بالفعل" + (" ✅" if done else "")
+    elif done:
+        note = f"✅ أُنجزت: {plan.get('just_completed_task')}"
         if services.plans.all_done(plan):
             note += "\n🎉 أكملت كل مهام اليوم!"
     else:
@@ -1019,36 +1039,71 @@ async def menu_programming(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def prog_concept(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Explain a programming concept (button used to be dead)."""
+    """Explain a programming concept (button used to be dead).
+
+    Serves two entry points with the same rendering:
+      * the inline button   -> callback update, answers the query and edits in place;
+      * the typed concept   -> message update (via `text_router`), replies anew.
+    Both are handled here so the answer never depends on which surface was used
+    (the text path previously re-entered this function with a message update,
+    where the callback query attribute was None and the handler crashed while
+    acknowledging that nonexistent query).
+    """
     if not await guard_ai_action(update, context):
         return None
-    query = update.callback_query
-    await query.answer()
+    # NOTE: nothing may be read from the update before the guard above - the
+    # contract checker in `_assert_entry_point_guard_contracts` enforces that
+    # the limit is spent before any side effect (and `getattr(update, ...)` on
+    # an update object counts as one).
     services = get_services(context)
+    query = getattr(update, "callback_query", None)
+    message = getattr(update, "message", None)
+    is_callback = query is not None
+
+    def _surface():
+        return query if is_callback else message
 
     concept = context.user_data.pop("prog_concept_topic", None)
     if not concept:
-        await render.edit(query,
-            "📖 **شرح مفهوم برمجي**\n\nأرسل اسم المفهوم الذي تريد شرحه.\n"
-            "مثال: الوراثة في بايثون، أو Big-O",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("🔙 رجوع", callback_data="menu_programming")]]),
-            parse_mode="Markdown",
-        )
+        if is_callback:
+            await query.answer()
+            await render.edit(
+                query,
+                "📖 **شرح مفهوم برمجي**\n\nأرسل اسم المفهوم الذي تريد شرحه.\n"
+                "مثال: الوراثة في بايثون، أو Big-O",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🔙 رجوع",
+                                           callback_data="menu_programming")]]),
+                parse_mode="Markdown",
+            )
+        else:
+            await render.reply(
+                message,
+                "أرسل اسم المفهوم من فضلك.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🔙 رجوع",
+                                           callback_data="menu_programming")]]),
+            )
         context.user_data["prog_concept_mode"] = True
         return None
 
-    await render.edit(query, "⏳ جاري تجهيز الشرح...")
-    explanation = await services.learning.explain_concept(
-        concept, "البرمجة",
-    )
-    keyboard = [
+    if is_callback:
+        await query.answer()
+        await render.edit(query, "⏳ جاري تجهيز الشرح...")
+    else:
+        await render.reply(message, "⏳ جاري تجهيز الشرح...")
+
+    explanation = await services.learning.explain_concept(concept, "البرمجة")
+    keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📖 مفهوم آخر", callback_data="prog_concept")],
         [InlineKeyboardButton("🔙 رجوع", callback_data="menu_programming")],
-    ]
-    await render.edit(query, explanation,
-                      reply_markup=InlineKeyboardMarkup(keyboard),
-                      parse_mode="Markdown")
+    ])
+    if is_callback:
+        await render.edit(query, explanation, reply_markup=keyboard,
+                          parse_mode="Markdown")
+    else:
+        await render.reply(message, explanation, reply_markup=keyboard,
+                           parse_mode="Markdown")
     return None
 
 
@@ -1060,7 +1115,6 @@ async def prog_concept_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await render.reply(update.message, "أرسل اسم المفهوم من فضلك.")
         return None
     context.user_data["prog_concept_topic"] = concept
-    # Reuse the same handler so the answer renders exactly like the button flow.
     return await prog_concept(update, context)
 
 
@@ -3617,7 +3671,7 @@ def get_menu_handlers() -> list:
         CallbackQueryHandler(goal_list, pattern="^goal_list$"),
         CallbackQueryHandler(menu_plan, pattern="^menu_plan$"),
         CallbackQueryHandler(plan_today, pattern="^plan_today$"),
-        CallbackQueryHandler(plan_complete_task, pattern="^plan_task_\\d+$"),
+        CallbackQueryHandler(plan_complete_task, pattern="^plan_task_\\d+(_0)?$"),
         CallbackQueryHandler(menu_discipline, pattern="^menu_discipline$"),
         CallbackQueryHandler(discipline_challenge, pattern="^discipline_challenge$"),
         CallbackQueryHandler(discipline_check, pattern="^discipline_check$"),

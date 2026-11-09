@@ -86,7 +86,42 @@ without a handler fails the suite.
 
 ---
 
-## 3. One bad character no longer loses the whole message
+## 3. Task completion is idempotent (found during the `main` transfer)
+
+Telegram retries a callback query when the bot does not acknowledge it fast
+enough, and two workers can handle the same tap concurrently. The first version
+of the new "complete task" button flipped whatever was stored, so the *same*
+callback delivered twice undid the completion and the weekly total went
+`1 → 0` — the user's work disappeared.
+
+Completion is now stated, not flipped:
+
+* the callback names the desired state (`plan_task_<n>` = done,
+  `plan_task_<n>_0` = reopened);
+* `PlanRepository.set_task_state()` reads and compare-and-sets under the
+  repository lock, returning `changed` / `already`;
+* `PlanService.set_task_done()` increments `progress.tasks_completed` from the
+  `changed` status **only**, so a duplicate delivery is a no-op (and a reopen
+  subtracts exactly one, clamped at zero);
+* the credit lands on the **plan's own date**, never on today's row.
+
+Verified: 10 sequential deliveries → one `changed`; 8 concurrent threads →
+exactly one `changed`; 3 reopens → the counter returns to its previous value.
+
+**No XP system exists in this codebase** — `progress.tasks_completed` (read by
+the dashboard, the weekly summary and the coach) is the accounting surface.
+
+### PostgreSQL parity bug found in the same path
+
+The reopen clamp used SQLite's scalar `MAX(a, b)`. PostgreSQL has no such
+function (`max()` is an aggregate), so the statement would have failed there
+with `function max(integer, integer) does not exist` — invisible on SQLite.
+`app/database/dialect.py` now rewrites the two-argument scalar form to
+`GREATEST(a, b)` while leaving aggregates untouched. Regression tests assert
+every `daily_plans`/`progress` statement survives `translate_query()` with no
+`?` placeholder left and no scalar `MAX` un-translated.
+
+## 4. One bad character no longer loses the whole message
 
 `parse_mode="Markdown"` with AI-generated Arabic text is fragile: a single
 unbalanced `*`, `_` or `` ` `` makes Telegram reject the *entire* message
@@ -117,7 +152,28 @@ applied to answers longer than 4096 characters.
 .venv/bin/python -m pytest tests/test_learning_flow_regressions.py -q
 ```
 
-Result: **986 passed, 131 skipped**.
+| change | verification |
+| --- | --- |
+| learning engine naming | `test_no_instance_attribute_shadows_a_facade_method`, full flow via the real handler graph |
+| dead buttons | `test_every_button_in_the_bot_has_a_handler` (parses every `callback_data` in the source) |
+| task idempotency | repeated + concurrent delivery tests, transition-only accounting |
+| rendering fallback | markup repair, plain-text retry, 4096-char chunking, edit fallback |
+| PostgreSQL parity | `translate_query()` checks; live PG covered by CI's Postgres service |
+
+Result: **998 passed, 131 skipped** (the 131 skips are PostgreSQL/Cassandra
+integration modules that need a live server; locally 100 %, in CI the Postgres
+job runs 25 of them with zero skips).
+
+Additional defects found and fixed while replaying the whole menu graph in a
+sandbox (each now has a test):
+
+* the plan screen built its date with local `datetime.now()` while plan
+  creation stores the UTC date, so around midnight the "today" screen looked at
+  a date that had no plan (`PlanService.today()` now uses the same UTC rule);
+* `prog_concept_text` re-entered a callback-only handler and crashed when the
+  concept was typed instead of tapped;
+* `study_session` had no deterministic local generator, so a deployment without
+  a provider key got "service unavailable" instead of a session.
 
 Manual end-to-end check (fake Telegram objects, the real `build_application()`
 handler graph) of the exact screenshot sequence —

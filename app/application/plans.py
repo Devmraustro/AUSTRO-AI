@@ -37,38 +37,36 @@ class PlanService:
         percent = int(round(done * 100 / total)) if total else 0
         return {"done": done, "total": total, "percent": percent}
 
-    def toggle_task(self, user_id: int, date: str, index: int) -> Optional[Dict[str, Any]]:
-        """Flip the completion flag of task ``index`` and persist it.
+    def set_task_done(self, user_id: int, date: str, index: int,
+                      done: bool) -> Optional[Dict[str, Any]]:
+        """Move one task to an explicit completion state, exactly once.
 
-        Returns the updated plan, or ``None`` when the plan/task does not
-        exist. Completion is stored in ``daily_plans.completed_tasks`` and the
-        number of *newly* completed tasks is added to today's progress row, so
-        the dashboard, the weekly summary and the coach all see the same work.
-        Re-toggling a task back to "not done" subtracts it again and never
-        drives the counter below zero.
+        Statistics are incremented from the repository's *transition* status
+        only ("changed"), never from the request: a duplicate Telegram delivery
+        (a retried callback query, or two workers handling the same tap) must
+        not count the same completion twice. ``done=False`` reverses a single
+        completion, clamped at zero.
+
+        Returns the updated plan with ``just_completed_task`` /
+        ``just_reopened_task`` set, or ``None`` when the plan/task is missing.
         """
+        outcome = self._db.plans.set_task_state(user_id, date, index, done)
+        if outcome is None:
+            return None
+
+        if outcome["status"] == "changed":
+            self._db.stats.log_completed_task(
+                user_id, date, delta=1 if outcome["done"] else -1,
+            )
+
         plan = self.for_date(user_id, date)
         if plan is None:
             return None
-        tasks = plan.get("tasks") or []
-        if not 0 <= index < len(tasks):
-            return None
-
-        done_flags = _normalise_flags(plan.get("completed_tasks"), len(tasks))
-        was_done = done_flags[index]
-        done_flags[index] = not was_done
-
-        updated = self._db.plans.set_completed(user_id, date, done_flags)
-        if not updated:
-            return None
-
-        task = tasks[index] if isinstance(tasks[index], dict) else {"task": str(tasks[index])}
-        self._db.stats.log_completed_task(user_id, date, delta=1 if done_flags[index] else -1)
-
-        plan = self.for_date(user_id, date) or plan
-        plan["completed_tasks"] = done_flags
-        plan["just_completed_task"] = task.get("task") if done_flags[index] else None
-        plan["just_reopened_task"] = None if done_flags[index] else task.get("task")
+        plan["just_completed_task"] = (
+            outcome["task"] if outcome["done"] else None)
+        plan["just_reopened_task"] = (
+            None if outcome["done"] else outcome["task"])
+        plan["transition"] = outcome["status"]
         plan.update(self.task_progress(plan))
         return plan
 
