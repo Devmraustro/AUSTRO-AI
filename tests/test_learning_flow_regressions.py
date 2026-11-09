@@ -443,6 +443,29 @@ async def test_long_edit_updates_original_and_sends_continuations():
 
 
 @pytest.mark.asyncio
+async def test_long_edit_continues_when_primary_chunk_is_unchanged():
+    """An unchanged first chunk must not discard changed continuation chunks."""
+    async def edit(text, **kwargs):
+        from telegram.error import BadRequest
+
+        raise BadRequest("Message is not modified")
+
+    continuation_call = _RejectingCall(reject_when=lambda kwargs: False)
+    query = _Target("edit_message_text", edit)
+    query.message = _Target("reply_text", continuation_call)
+    body = "\n\n".join(f"فقرة {index} " + "نص " * 60 for index in range(40))
+    chunks = render.chunk_text(body)
+
+    await render.edit(query, body)
+
+    assert len(chunks) > 1
+    assert len(continuation_call.calls) == len(chunks) - 1
+    delivered = [text.removesuffix(render.CONTINUATION_MARKER)
+                 for text, _ in continuation_call.calls]
+    assert delivered == chunks[1:], "continuation delivery duplicated or lost chunks"
+
+
+@pytest.mark.asyncio
 async def test_identical_edit_is_not_reported_as_an_error():
     async def edit(text, **kwargs):
         from telegram.error import BadRequest
