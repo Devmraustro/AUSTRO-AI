@@ -20,3 +20,6 @@ __all__ = [
     "scheduler_post_stop",
     "main",
 ]
+
+if __name__ == "__main__":
+    main()
