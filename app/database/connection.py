@@ -24,7 +24,7 @@ import logging
 import os
 import sqlite3
 import threading
-from typing import Optional
+from typing import List, Optional
 
 from app.config.settings import settings
 from app.database.dialect import get_postgresql_cursor_factory, to_postgresql
@@ -322,6 +322,10 @@ class DatabaseManager:
         # RLock: repo methods may nest (e.g. set_consent -> ensure -> get)
         # while already holding the manager lock.
         self._lock = threading.RLock()
+        # Errors encountered by repository methods during export-style reads.
+        # Repository methods catch DB_ERROR and return empty results, but record
+        # the error here so callers like export_learning() can detect failures.
+        self._errors: List[str] = []
         self.init_database()
 
     def _get_connection(self):

@@ -456,7 +456,7 @@ def test_zip_bomb_limits_are_configurable():
         ("authorization header",
          "authorization: Bearer abcdef1234567890abcdef", "abcdef1234567890abcdef"),
         ("labelled secret",
-         "GEMINI_API_KEY=AIzaSyDExample1234567890abcdefghijklmnopqrstu",
+         "OPENROUTER_API_KEY=AIzaSyDExample1234567890abcdefghijklmnopqrstu",
          "AIzaSyDExample"),
         ("card number", "4111111111111111", "4111111111111111"),
         ("telegram file id",
@@ -587,7 +587,7 @@ def test_info_is_the_default_log_level():
 def test_setup_logging_is_idempotent(tmp_path, monkeypatch):
     """Repeat calls must not stack duplicate handlers and double every line."""
     monkeypatch.setenv("BOT_TOKEN", "123456789:TEST-audit-token")
-    monkeypatch.setenv("GEMINI_API_KEY", "")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "")
 
     from app.config import settings as settings_mod
     from app.observability.logging_config import setup_logging
@@ -639,7 +639,7 @@ def _add_memory(store, subject, claim, consent, key):
 def test_pending_memory_never_reaches_the_prompt(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "a.db"))
     monkeypatch.setenv("BOT_TOKEN", "123456789:TEST-audit-token")
-    monkeypatch.setenv("GEMINI_API_KEY", "")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "")
 
     from app.config.settings import settings
     from app.memory.models import TaskContext
@@ -666,7 +666,7 @@ def test_automatic_consent_is_retrievable(tmp_path, monkeypatch):
     """The gate must not over-block: automatic memories are fine."""
     monkeypatch.setenv("DB_PATH", str(tmp_path / "a.db"))
     monkeypatch.setenv("BOT_TOKEN", "123456789:TEST-audit-token")
-    monkeypatch.setenv("GEMINI_API_KEY", "")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "")
 
     from app.config.settings import settings
     from app.memory.models import TaskContext
@@ -684,7 +684,7 @@ def test_automatic_consent_is_retrievable(tmp_path, monkeypatch):
 def test_unknown_consent_state_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "a.db"))
     monkeypatch.setenv("BOT_TOKEN", "123456789:TEST-audit-token")
-    monkeypatch.setenv("GEMINI_API_KEY", "")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "")
 
     from app.config.settings import settings
     from app.memory.models import TaskContext
@@ -720,7 +720,7 @@ def test_low_confidence_memory_is_reviewable_then_becomes_retrievable(
     """
     monkeypatch.setenv("DB_PATH", str(tmp_path / "a.db"))
     monkeypatch.setenv("BOT_TOKEN", "123456789:TEST-audit-token")
-    monkeypatch.setenv("GEMINI_API_KEY", "")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "")
 
     import database
     from app.core.container import build_container

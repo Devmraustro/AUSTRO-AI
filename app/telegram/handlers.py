@@ -1643,7 +1643,7 @@ async def settings_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def settings_ai_reconnect(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reconnect to Gemini."""
+    """Reconnect to OpenRouter (re-runs the provider health check)."""
     if not await guard_expensive_action(update, context):
         return None
     services = get_services(context)

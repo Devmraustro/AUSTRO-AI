@@ -11,12 +11,12 @@ from pathlib import Path
 
 from app.config.prompts import (
     ARABIC_RESPONSES,
-    GEMINI_COACH_PROMPT,
-    GEMINI_CYBER_PROMPT,
-    GEMINI_ENGLISH_PROMPT,
-    GEMINI_PROGRAMMING_PROMPT,
-    GEMINI_STUDY_PROMPT,
-    GEMINI_SYSTEM_PROMPT,
+    AUSTRO_COACH_PROMPT,
+    AUSTRO_CYBER_PROMPT,
+    AUSTRO_ENGLISH_PROMPT,
+    AUSTRO_PROGRAMMING_PROMPT,
+    AUSTRO_STUDY_PROMPT,
+    AUSTRO_SYSTEM_PROMPT,
     LOCAL_AI_RESPONSES,
     MODES,
     REMINDER_TIMES,
@@ -28,9 +28,9 @@ BOT_TOKEN = settings.bot_token
 BOT_NAME = settings.bot_name
 BOT_USERNAME = settings.bot_username
 DB_PATH = settings.db_path
-GEMINI_API_KEY = settings.gemini_api_key
-GEMINI_MODEL = settings.gemini_model
-GEMINI_API_URL = settings.gemini_api_url
+OPENROUTER_API_KEY = settings.openrouter_api_key
+OPENROUTER_MODEL = settings.openrouter_model
+OPENROUTER_API_URL = settings.openrouter_api_url
 USE_LOCAL_FALLBACK = settings.use_local_fallback
 
 WEBHOOK_URL = settings.webhook_url
@@ -56,9 +56,9 @@ __all__ = [
     "BACKUP_PATH",
     "LOGS_DIR",
     "LOGS_PATH",
-    "GEMINI_API_KEY",
-    "GEMINI_MODEL",
-    "GEMINI_API_URL",
+    "OPENROUTER_API_KEY",
+    "OPENROUTER_MODEL",
+    "OPENROUTER_API_URL",
     "USE_LOCAL_FALLBACK",
     "WEBHOOK_URL",
     "WEBHOOK_PORT",
@@ -68,11 +68,11 @@ __all__ = [
     "MODES",
     "SYSTEMS",
     "ARABIC_RESPONSES",
-    "GEMINI_SYSTEM_PROMPT",
-    "GEMINI_STUDY_PROMPT",
-    "GEMINI_ENGLISH_PROMPT",
-    "GEMINI_PROGRAMMING_PROMPT",
-    "GEMINI_CYBER_PROMPT",
-    "GEMINI_COACH_PROMPT",
+    "AUSTRO_SYSTEM_PROMPT",
+    "AUSTRO_STUDY_PROMPT",
+    "AUSTRO_ENGLISH_PROMPT",
+    "AUSTRO_PROGRAMMING_PROMPT",
+    "AUSTRO_CYBER_PROMPT",
+    "AUSTRO_COACH_PROMPT",
     "REMINDER_TIMES",
 ]

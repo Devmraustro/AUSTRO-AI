@@ -44,12 +44,21 @@ def test_backup_worker_enables_encryption_from_a_read_only_secret(
     assert str(env["BACKUP_ENCRYPTION_ENABLED"]).lower() == "true"
     key_path = env["BACKUP_ENCRYPTION_KEY_FILE"]
     assert key_path == f"/run/secrets/{secret}"
-    assert secret in backup["secrets"]
+    # A file secret would be mounted 0444 by default and Compose ignores
+    # mode/uid/gid outside Swarm, so the key is a read-only bind mount whose
+    # host file itself is 0400 (checked by the loader at run time).
+    mounts = backup["volumes"]
+    mount = next(
+        m for m in mounts
+        if isinstance(m, dict) and m.get("target") == f"/run/secrets/{secret}"
+    )
+    assert mount["type"] == "bind"
+    assert mount["read_only"] is True
+    assert mount["source"]  # host path defined, never inline content
+    assert "content" not in mount
     # the key itself must never be an environment value
     for value in env.values():
         assert "BEGIN" not in str(value)
-    assert doc["secrets"][secret]["file"]  # host path defined, never inline content
-    assert "content" not in doc["secrets"][secret]
 
 
 @pytest.mark.parametrize("fixture_name", ["prod", "staging"])
@@ -60,8 +69,12 @@ def test_backup_plaintext_work_dir_is_tmpfs_not_the_backup_volume(request, fixtu
     mounts = backup["volumes"]
     tmpfs = [m for m in mounts if isinstance(m, dict) and m.get("type") == "tmpfs"]
     assert tmpfs and tmpfs[0]["target"] == "/var/tmp/austro-backup-work"
-    # the only persistent mount is the archive directory
-    persistent = [m for m in mounts if not (isinstance(m, dict) and m.get("type") == "tmpfs")]
+    # the only persistent writable mount is the archive directory (the key is a
+    # separate read-only bind mount)
+    persistent = [
+        m for m in mounts
+        if not (isinstance(m, dict) and m.get("type") in ("tmpfs", "bind"))
+    ]
     assert persistent == ["backups:/app/backups"]
     assert backup.get("read_only") is True
 
@@ -129,10 +142,33 @@ def test_deprecated_backup_wrapper_fails_closed_without_key(tmp_path):
     database contact or archive write.
     """
     import os
+    import sys
 
     env = {k: v for k, v in os.environ.items()
            if k not in ("BACKUP_ENCRYPTION_ENABLED", "BACKUP_ENCRYPTION_KEY_FILE")}
     env.update({"DB_HOST": "127.0.0.1", "DB_PORT": "1"})
+    if os.name == "nt":
+        # The wrapper execs `python3`; on Windows, Git Bash would otherwise
+        # resolve the extensionless WindowsApps python3 stub. Put an
+        # extensionless #!/bin/sh shim ahead of PATH that re-execs the same
+        # interpreter running this test, so the real wrapper logic is what
+        # gets exercised on every platform.
+        def msys_path(p):
+            s = str(p)
+            if len(s) > 2 and s[1] == ":":
+                return "/" + s[0].lower() + s[2:].replace("\\", "/")
+            return s.replace("\\", "/")
+
+        shim = tmp_path / "py3shim"
+        shim.mkdir()
+        shim_script = shim / "python3"
+        shim_script.write_text(
+            "#!/bin/sh\n"
+            'exec "' + msys_path(sys.executable) + '" "$@"\n',
+            encoding="utf-8",
+        )
+        shim_script.chmod(0o755)
+        env["PATH"] = str(shim) + os.pathsep + env.get("PATH", "")
     outdir = tmp_path / "backups"
     result = subprocess.run(
         ["bash", str(REPO_ROOT / "scripts" / "backup.sh"), str(outdir)],

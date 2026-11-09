@@ -46,10 +46,13 @@ if REPO_ROOT not in sys.path:
 from scripts.pg_backup import (  # noqa: E402
     ARCHIVE_SUFFIX,
     MANIFEST_SUFFIX,
+    _assert_remote_tls,
     archive_is_encrypted,
     file_sha256,
     find_tool,
     open_archive_sql,
+    postgres_tls_env,
+    postgres_tls_kwargs,
     write_pgpass,
 )
 from scripts.restore_safety import (  # noqa: E402
@@ -75,10 +78,12 @@ def _psycopg2_connect(**kwargs):
 
 
 def _pg_conn_args(env: Mapping[str, str]) -> Dict[str, str]:
-    return {
+    args = {
         "host": env.get("DB_HOST", "127.0.0.1"),
         "port": env.get("DB_PORT", "5432"),
     }
+    args.update(postgres_tls_kwargs(env))
+    return args
 
 
 def _run_psql(
@@ -94,15 +99,26 @@ def _run_psql(
     if runner is not None:
         return runner(dbname, stream)
     conn = _pg_conn_args(env)
+    # Start from a scrubbed copy of the environment so an inherited insecure
+    # PGSSLMODE (or stale certificate paths) cannot override the policy derived
+    # from DB_SSLMODE / DB_SSL_*.
     psql_env = {
-        **{k: v for k, v in os.environ.items() if k not in ("PGPASSWORD",)},
+        k: v for k, v in os.environ.items()
+        if k not in ("PGPASSWORD", "PGSSLMODE", "PGSSLROOTCERT",
+                     "PGSSLCERT", "PGSSLKEY")
+    }
+    psql_env.update({
         "PGHOST": conn["host"],
         "PGPORT": conn["port"],
         "PGDATABASE": dbname,
         "PGUSER": user,
         "PGPASSFILE": str(pgpass),
         "PGCLIENTENCODING": "UTF8",
-    }
+    })
+    psql_env.update(postgres_tls_env(env))
+    for key in ("PGSSLMODE", "PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY"):
+        if not psql_env.get(key):
+            psql_env.pop(key, None)
     # psql reads the verified SQL from its stdin pipe. The decrypted stream is a
     # Python object without a file descriptor, so it is copied in bounded
     # chunks. stderr goes to a temp file so a noisy psql cannot deadlock on a
@@ -248,6 +264,12 @@ def run_restore_drill(
                         "The target database was NOT modified.")
         return EXIT_FAILED
     _say("1/5", "archive, key, decompression and content checksum verified")
+
+    try:
+        _assert_remote_tls(env.get("DB_HOST", "127.0.0.1"), env)
+    except RuntimeError as exc:
+        _say("refused", f"TLS FAILED: {exc}. The target database was NOT modified.")
+        return EXIT_FAILED
 
     def conn_factory(dbname: str, *, user: str = admin_user, password: str = admin_password):
         args = _pg_conn_args(env)

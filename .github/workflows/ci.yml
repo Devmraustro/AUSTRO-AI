@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       BOT_TOKEN: "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken"
-      GEMINI_API_KEY: ""
+      OPENROUTER_API_KEY: ""
     strategy:
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
@@ -110,7 +110,7 @@ jobs:
       - name: Run evaluation regression harness
         env:
           BOT_TOKEN: "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken"
-          GEMINI_API_KEY: ""
+          OPENROUTER_API_KEY: ""
         run: python scripts/verify.py
 
       # This step previously ran `pytest tests/test_security.py || echo skip`.
@@ -164,7 +164,7 @@ jobs:
           cat >> .env.staging <<'EOF'
           AUSTRO_ENVIRONMENT=staging
           BOT_TOKEN=000000000:CI-placeholder-not-a-real-token
-          GEMINI_API_KEY=ci-placeholder-key
+          OPENROUTER_API_KEY=sk-or-ci-placeholder-key
           DB_HOST=staging-db.internal.example
           DB_NAME=austro_ai_staging
           DB_USER=austro_staging
@@ -180,7 +180,7 @@ jobs:
           cat > .env <<'EOF'
           AUSTRO_ENVIRONMENT=production
           BOT_TOKEN=111111111:CI-production-placeholder-token
-          GEMINI_API_KEY=ci-production-placeholder-key
+          OPENROUTER_API_KEY=sk-or-ci-production-placeholder-key
           DB_HOST=prod-db.internal.example
           DB_NAME=austro_ai
           DB_USER=austro
@@ -399,5 +399,5 @@ jobs:
       - name: Run performance tests
         env:
           BOT_TOKEN: "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken"
-          GEMINI_API_KEY: ""
+          OPENROUTER_API_KEY: ""
         run: python tests/test_performance.py

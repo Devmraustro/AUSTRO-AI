@@ -20,7 +20,7 @@ from typing import Any, Dict
 
 # Set required environment variables BEFORE any app imports
 os.environ["BOT_TOKEN"] = "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken"
-os.environ["GEMINI_API_KEY"] = ""
+os.environ["OPENROUTER_API_KEY"] = ""
 
 REPO_ROOT = os.getcwd()
 os.chdir(REPO_ROOT)

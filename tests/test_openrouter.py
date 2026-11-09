@@ -4,23 +4,25 @@ All HTTP is mocked at `app.ai.openrouter.requests`; no network and no real
 API key are required. Provider behaviour covers: success, missing key,
 401/403, 429 with/without Retry-After, 5xx, timeout, connection failure,
 malformed JSON and empty content. Gateway behaviour covers the failover
-chain Gemini -> OpenRouter -> local -> safe message, bounded retries,
+OpenRouter -> local -> safe message, bounded retries,
 no-retry-on-auth, and telemetry attribution (provider/model), plus secret
 redaction in raised errors.
 """
 
 import asyncio
 import dataclasses
+import json
 import os
 
 os.environ.setdefault("BOT_TOKEN", "123456789:ABCdefghIJKlmnoPQRstuvwxyz-DummyToken")
-os.environ["GEMINI_API_KEY"] = ""
 os.environ["OPENROUTER_API_KEY"] = ""
 
 import pytest
 import requests
 
 from app.ai.gateway import AIGateway
+from app.ai.local import LocalProvider
+from app.ai.telemetry import AITelemetry
 from app.ai.openrouter import OpenRouterProvider
 from app.config.settings import settings as base_settings
 from app.core.errors import AIAuthenticationError, AIProviderError, RateLimitError
@@ -29,7 +31,6 @@ from app.domain.ai import AIRequest
 _OR_KEY = "sk-or-test-key-0000000000"
 
 _DEFAULTS = dict(
-    gemini_api_key="",
     openrouter_api_key=_OR_KEY,
     openrouter_model="google/gemma-4-31b-it:free",
     openrouter_api_url="https://openrouter.example/api/v1",
@@ -50,18 +51,33 @@ def _request():
 
 class _Response:
     def __init__(self, status_code=200, payload=None, headers=None,
-                 raise_json=False):
+                 raise_json=False, raw=None):
         self.status_code = status_code
         self._payload = payload if payload is not None else {
             "choices": [{"message": {"content": "or-ok"}}]
         }
         self._raise_json = raise_json
         self.headers = headers or {}
+        if raw is not None:
+            self._raw = raw
+        elif raise_json:
+            # Invalid JSON bytes: mirrors an upstream that answers 200 with a
+            # broken body (the old json() double, now streamed).
+            self._raw = b'{"choices": [{"message": {"content"'
+        else:
+            self._raw = json.dumps(self._payload).encode("utf-8")
 
     def json(self):
         if self._raise_json:
             raise ValueError("malformed json")
         return self._payload
+
+    def close(self):
+        self.closed_count = getattr(self, "closed_count", 0) + 1
+
+    def iter_content(self, chunk_size=None):
+        for i in range(0, len(self._raw), max(1, chunk_size or 65536)):
+            yield self._raw[i:i + (chunk_size or 65536)]
 
 
 def _or_payload(text="or-ok"):
@@ -229,10 +245,67 @@ async def test_connection_failure_raises_provider_error(monkeypatch):
 @pytest.mark.asyncio
 async def test_malformed_json_raises_provider_error(monkeypatch):
     provider = _provider(
-        monkeypatch, lambda *a, **k: _Response(raise_json=True)
+        monkeypatch, lambda *a, **k: _Response(raw=b'{"choices": no json')
     )
     with pytest.raises(AIProviderError, match="Malformed JSON"):
         await provider.generate(_request())
+
+
+@pytest.mark.asyncio
+async def test_oversized_response_body_is_refused(monkeypatch):
+    """A hostile/broken upstream cannot push unbounded bytes into memory.
+
+    The provider reads at most _MAX_RESPONSE_BYTES of a 200 body; anything
+    larger is an AIProviderError, never an OOM or a hang.
+    """
+    from app.ai.openrouter import _MAX_RESPONSE_BYTES
+    blob = b'{"choices": [{"message": {"content": "' + b"x" * _MAX_RESPONSE_BYTES
+    provider = _provider(monkeypatch, lambda *a, **k: _Response(raw=blob))
+    with pytest.raises(AIProviderError, match="exceeds the size limit"):
+        await provider.generate(_request())
+    assert provider.is_available is True, "a size-cap refusal is not permanent"
+
+
+@pytest.mark.asyncio
+async def test_oversized_content_length_is_refused_without_reading(monkeypatch):
+    declared = {"n": 0}
+
+    class _Huge:
+        status_code = 200
+        headers = {"Content-Length": str(50 * 1024 * 1024)}
+
+        def close(self):
+            pass
+
+        def iter_content(self, chunk_size=None):  # must never be reached
+            declared["n"] += 1
+            raise AssertionError("oversized Content-Length must fail closed")
+
+    provider = _provider(monkeypatch, lambda *a, **k: _Huge())
+    with pytest.raises(AIProviderError, match="exceeds the size limit"):
+        await provider.generate(_request())
+    assert declared["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_body_read_failure_is_provider_error(monkeypatch):
+    def behaviour(*args, **kwargs):
+        class _Broken:
+            status_code = 200
+            headers = {}
+
+            def close(self):
+                pass
+
+            def iter_content(self, chunk_size=None):
+                raise requests.exceptions.ConnectionError("reset mid-body")
+
+        return _Broken()
+
+    provider = _provider(monkeypatch, behaviour)
+    with pytest.raises(AIProviderError, match="body read failed"):
+        await provider.generate(_request())
+    assert provider.is_available is True
 
 
 @pytest.mark.asyncio
@@ -271,26 +344,29 @@ async def test_error_messages_never_contain_the_key(monkeypatch):
 @pytest.mark.asyncio
 async def test_daily_quota_disables_and_raises_rate_limit(monkeypatch):
     provider = _provider(monkeypatch, lambda *a, **k: _Response())
-    provider.request_count = provider._settings.max_requests_per_day
+    # daily enforcement reads the daily counter, not lifetime statistics;
+    # the setup mutation respects the documented lock ownership contract
+    with provider._state_lock:
+        provider._daily_used = provider._settings.max_requests_per_day
     with pytest.raises(RateLimitError, match="Daily quota"):
         await provider.generate(_request())
     assert provider.is_available is False
 
 
-# ============================ gateway: failover chain ============================
+# ============================ gateway: OpenRouter-only ============================
 
+class _FakeOpenRouter:
+    """Duck-typed OpenRouter provider for gateway behavior tests."""
 
-class _FakeGemini:
-    """Duck-typed primary provider standing in for Gemini."""
-
-    name = "gemini"
-    model = "gemini-2.5-flash"
+    name = "openrouter"
+    model = "test/openrouter-model"
     request_count = 0
 
     def __init__(self, behaviour=None, available=True):
         self._behaviour = behaviour
         self._available = available
         self.calls = 0
+        self.reconnect_calls = 0
 
     @property
     def is_available(self):
@@ -300,209 +376,342 @@ class _FakeGemini:
         self.calls += 1
         if self._behaviour is not None:
             return self._behaviour(self)
-        return "gemini-ok"
+        return "openrouter-ok"
+
+    def reconnect(self):
+        self.reconnect_calls += 1
+        return self._available
 
 
-def _gateway(monkeypatch, primary, or_behaviour=None, **cfg_overrides):
-    monkeypatch.setattr(
-        "app.ai.openrouter.requests.get", lambda *a, **k: _Response())
-    secondary = None
-    if or_behaviour is not None:
-        monkeypatch.setattr("app.ai.openrouter.requests.post", or_behaviour)
-        secondary = OpenRouterProvider(_cfg(**cfg_overrides))
-        assert secondary.is_available
-    return AIGateway(
-        settings_=_cfg(**cfg_overrides),
-        provider=primary,
-        secondary=secondary,
-    )
-
-
-@pytest.mark.asyncio
-async def test_gemini_success_skips_openrouter(monkeypatch):
-    or_calls = {"n": 0}
-
-    def or_behaviour(*a, **k):
-        or_calls["n"] += 1
-        return _Response()
-
-    gateway = _gateway(monkeypatch, _FakeGemini(), or_behaviour)
-    response = await gateway.generate(_request())
-    assert response.text == "gemini-ok"
-    assert response.metadata.provider == "gemini"
-    assert response.metadata.model == "gemini-2.5-flash"
-    assert or_calls["n"] == 0, "secondary must not be called when primary succeeds"
+def _gateway(monkeypatch, primary=None, behaviour=None, **cfg_overrides):
+    if primary is None:
+        monkeypatch.setattr(
+            "app.ai.openrouter.requests.get", lambda *a, **k: _Response()
+        )
+        if behaviour is not None:
+            monkeypatch.setattr("app.ai.openrouter.requests.post", behaviour)
+            primary = OpenRouterProvider(_cfg(**cfg_overrides))
+            assert primary.is_available
+        else:
+            primary = _FakeOpenRouter(available=False)
+    return AIGateway(settings_=_cfg(**cfg_overrides), provider=primary)
 
 
 @pytest.mark.asyncio
-async def test_gemini_429_fails_over_to_openrouter(monkeypatch):
-    primary = _FakeGemini(
-        behaviour=lambda p: (_ for _ in ()).throw(RateLimitError("quota"))
-    )
-    gateway = _gateway(monkeypatch, primary, lambda *a, **k: _Response())
+async def test_openrouter_primary_success_records_provider(monkeypatch):
+    gateway = _gateway(monkeypatch, _FakeOpenRouter())
     response = await gateway.generate(_request())
-    assert response.text == "or-ok"
+    assert response.text == "openrouter-ok"
     assert response.metadata.provider == "openrouter"
-    assert response.metadata.model == "google/gemma-4-31b-it:free"
-    assert primary.calls == 1, "rate limit must not be retried on the same key"
-
-
-@pytest.mark.asyncio
-async def test_gemini_5xx_fails_over_to_openrouter(monkeypatch):
-    primary = _FakeGemini(
-        behaviour=lambda p: (_ for _ in ()).throw(AIProviderError("500"))
-    )
-    gateway = _gateway(
-        monkeypatch, primary, lambda *a, **k: _Response(), ai_max_retries=0
-    )
-    response = await gateway.generate(_request())
-    assert response.text == "or-ok"
-    assert response.metadata.provider == "openrouter"
-
-
-@pytest.mark.asyncio
-async def test_openrouter_used_when_gemini_unconfigured(monkeypatch):
-    gateway = _gateway(
-        monkeypatch, _FakeGemini(available=False), lambda *a, **k: _Response()
-    )
-    response = await gateway.generate(_request())
-    assert response.text == "or-ok"
-    assert response.metadata.provider == "openrouter"
+    assert response.metadata.model == "test/openrouter-model"
 
 
 @pytest.mark.asyncio
 async def test_openrouter_auth_failure_falls_to_local(monkeypatch):
-    primary = _FakeGemini(available=False)
-
-    def or_behaviour(*a, **k):
+    def behaviour(*a, **k):
         return _Response(status_code=401)
-
-    gateway = _gateway(monkeypatch, primary, or_behaviour, ai_max_retries=2)
+    gateway = _gateway(monkeypatch, behaviour=behaviour, ai_max_retries=2)
     response = await gateway.generate(_request())
     assert response.metadata.provider == "local"
-    assert response.text, "local fallback answered"
+    assert response.text
 
 
 @pytest.mark.asyncio
 async def test_openrouter_429_falls_to_local(monkeypatch):
-    primary = _FakeGemini(available=False)
-
-    def or_behaviour(*a, **k):
+    def behaviour(*a, **k):
         return _Response(status_code=429, headers={"Retry-After": "5"})
-
-    gateway = _gateway(monkeypatch, primary, or_behaviour)
+    gateway = _gateway(monkeypatch, behaviour=behaviour)
     response = await gateway.generate(_request())
     assert response.metadata.provider == "local"
 
 
 @pytest.mark.asyncio
 async def test_openrouter_transient_failures_are_bounded_then_local(monkeypatch):
-    primary = _FakeGemini(available=False)
-    or_calls = {"n": 0}
-
-    def or_behaviour(*a, **k):
-        or_calls["n"] += 1
+    calls = {"n": 0}
+    def behaviour(*a, **k):
+        calls["n"] += 1
         return _Response(status_code=503)
-
-    gateway = _gateway(monkeypatch, primary, or_behaviour, ai_max_retries=2,
-                       ai_retry_backoff_base=0.0)
+    gateway = _gateway(
+        monkeypatch, behaviour=behaviour, ai_max_retries=2,
+        ai_retry_backoff_base=0.0,
+    )
     response = await gateway.generate(_request())
     assert response.metadata.provider == "local"
-    assert or_calls["n"] == 3, "1 attempt + ai_max_retries(2) retries, then stop"
+    assert calls["n"] == 3
 
 
 @pytest.mark.asyncio
-async def test_all_providers_fail_returns_safe_message(monkeypatch):
-    primary = _FakeGemini(
-        behaviour=lambda p: (_ for _ in ()).throw(AIProviderError("down"))
-    )
-
-    def or_behaviour(*a, **k):
+async def test_openrouter_failure_returns_safe_message_when_local_disabled(monkeypatch):
+    def behaviour(*a, **k):
         return _Response(status_code=500)
-
     gateway = _gateway(
-        monkeypatch, primary, or_behaviour,
-        ai_max_retries=0, ai_retry_backoff_base=0.0, use_local_fallback=False,
+        monkeypatch, behaviour=behaviour, ai_max_retries=0,
+        ai_retry_backoff_base=0.0, use_local_fallback=False,
     )
     response = await gateway.generate(_request())
     from app.ai.gateway import _UNAVAILABLE_MESSAGE
     assert response.text == _UNAVAILABLE_MESSAGE
     assert response.metadata.success is False
     assert response.metadata.provider == "none"
-    assert "AIProviderError" in response.metadata.error
 
 
 @pytest.mark.asyncio
-async def test_local_fallback_attributed_as_local_not_llm(monkeypatch):
-    primary = _FakeGemini(available=False)
-
-    def or_behaviour(*a, **k):
-        return _Response(status_code=403)
-
-    gateway = _gateway(monkeypatch, primary, or_behaviour)
-    response = await gateway.generate(_request())
-    assert response.metadata.provider == "local"
-    assert response.metadata.model == "deterministic-local"
-
-
-@pytest.mark.asyncio
-async def test_no_duplicate_generation_on_success(monkeypatch):
-    """Each provider is called at most once per attempt - no double-send."""
-    primary = _FakeGemini()
-    or_calls = {"n": 0}
-
-    def or_behaviour(*a, **k):
-        or_calls["n"] += 1
-        return _Response()
-
-    gateway = _gateway(monkeypatch, primary, or_behaviour)
-    await gateway.generate(_request())
-    assert primary.calls == 1 and or_calls["n"] == 0
-
-
-@pytest.mark.asyncio
-async def test_unconfigured_secondary_never_constructs_network(monkeypatch):
-    """Default gateway (no explicit secondary) with no key stays inert."""
+async def test_gateway_default_provider_is_openrouter_and_no_key_stays_inert(monkeypatch):
     def no_network(*a, **k):
         raise AssertionError("no OpenRouter HTTP call may happen without a key")
-
     monkeypatch.setattr("app.ai.openrouter.requests.get", no_network)
     monkeypatch.setattr("app.ai.openrouter.requests.post", no_network)
-    gateway = AIGateway(settings_=_cfg(openrouter_api_key=""), provider=_FakeGemini())
+    gateway = AIGateway(settings_=_cfg(openrouter_api_key=""))
+    assert isinstance(gateway.provider, OpenRouterProvider)
+    assert gateway.provider.is_available is False
     response = await gateway.generate(_request())
-    assert response.text == "gemini-ok"
+    assert response.metadata.provider == "local"
 
 
 @pytest.mark.asyncio
-async def test_reconnect_refreshes_both_providers(monkeypatch):
-    monkeypatch.setattr(
-        "app.ai.openrouter.requests.get", lambda *a, **k: _Response())
-    reconnected = {"gemini": False}
-
-    class _Reconnectable(_FakeGemini):
-        def reconnect(self):
-            reconnected["gemini"] = True
-            return True
-
-    gateway = _gateway(monkeypatch, _Reconnectable())
+async def test_reconnect_refreshes_only_openrouter(monkeypatch):
+    provider = _FakeOpenRouter(available=True)
+    gateway = _gateway(monkeypatch, provider)
     await gateway.reconnect()
-    assert reconnected["gemini"] is True
-    # The auto-constructed secondary has a key + a mocked-200 health check,
-    # so reconnect leaves it available for failover.
-    assert gateway.secondary.is_available is True
+    assert provider.reconnect_calls == 1
+    assert not hasattr(gateway, "secondary")
 
 
 @pytest.mark.asyncio
 async def test_pacing_spans_concurrent_calls(monkeypatch):
     import time as _time
     timestamps = []
-
     def behaviour(*args, **kwargs):
         timestamps.append(_time.monotonic())
         return _Response()
-
     provider = _provider(monkeypatch, behaviour, min_request_interval=0.05)
     await asyncio.gather(*(provider.generate(_request()) for _ in range(4)))
     assert len(timestamps) == 4
     span = max(timestamps) - min(timestamps)
     assert span >= 3 * 0.05 * 0.8, "paced slots must spread, not burst"
+
+
+
+# --------------------------------------------------------------------------- #
+# Guaranteed response close on every path (try/finally)                       #
+# --------------------------------------------------------------------------- #
+async def test_response_closed_exactly_once_on_success(monkeypatch):
+    holder = {}
+
+    def behaviour(url, **kwargs):
+        holder["response"] = _Response(payload=_or_payload("fine"))
+        return holder["response"]
+
+    provider = _provider(monkeypatch, behaviour)
+    request = _request()
+    assert await provider.generate(request) == "fine"
+    assert holder["response"].closed_count == 1
+
+
+async def test_response_closed_on_json_parse_failure(monkeypatch):
+    holder = {}
+
+    def behaviour(url, **kwargs):
+        holder["response"] = _Response(raise_json=True)
+        return holder["response"]
+
+    provider = _provider(monkeypatch, behaviour)
+    with pytest.raises(AIProviderError):
+        await provider.generate(_request())
+    assert holder["response"].closed_count == 1
+
+
+async def test_response_closed_on_stream_read_failure(monkeypatch):
+    holder = {}
+
+    def behaviour(url, **kwargs):
+        holder["response"] = _Response()
+
+        def broken_iter(chunk_size=None):
+            raise requests.exceptions.ConnectionError("reset mid-body")
+            yield  # pragma: no cover
+
+        holder["response"].iter_content = broken_iter
+        return holder["response"]
+
+    provider = _provider(monkeypatch, behaviour)
+    with pytest.raises(AIProviderError):
+        await provider.generate(_request())
+    assert holder["response"].closed_count == 1
+
+
+async def test_response_closed_on_oversized_body(monkeypatch):
+    from app.ai.openrouter import _MAX_RESPONSE_BYTES
+
+    holder = {}
+
+    def behaviour(url, **kwargs):
+        blob = b'{"choices": [{"message": {"content": "' + b"x" * _MAX_RESPONSE_BYTES
+        holder["response"] = _Response(raw=blob)
+        return holder["response"]
+
+    provider = _provider(monkeypatch, behaviour)
+    with pytest.raises(AIProviderError, match="exceeds the size limit"):
+        await provider.generate(_request())
+    assert holder["response"].closed_count == 1
+
+
+async def test_response_closed_on_http_400(monkeypatch):
+    holder = {}
+
+    def behaviour(url, **kwargs):
+        holder["response"] = _Response(status_code=400)
+        return holder["response"]
+
+    provider = _provider(monkeypatch, behaviour)
+    with pytest.raises(AIProviderError):
+        await provider.generate(_request())
+    assert holder["response"].closed_count == 1
+
+
+async def test_response_closed_on_http_429(monkeypatch):
+    holder = {}
+
+    def behaviour(url, **kwargs):
+        holder["response"] = _Response(
+            status_code=429, headers={"Retry-After": "1"}
+        )
+        return holder["response"]
+
+    provider = _provider(monkeypatch, behaviour)
+    with pytest.raises(RateLimitError):
+        await provider.generate(_request())
+    assert holder["response"].closed_count == 1
+
+
+async def test_response_closed_on_http_5xx(monkeypatch):
+    holder = {}
+
+    def behaviour(url, **kwargs):
+        holder["response"] = _Response(status_code=503)
+        return holder["response"]
+
+    provider = _provider(monkeypatch, behaviour)
+    with pytest.raises(AIProviderError):
+        await provider.generate(_request())
+    assert holder["response"].closed_count == 1
+
+
+async def test_response_closed_on_http_401(monkeypatch):
+    holder = {}
+
+    def behaviour(url, **kwargs):
+        holder["response"] = _Response(status_code=401)
+        return holder["response"]
+
+    provider = _provider(monkeypatch, behaviour)
+    with pytest.raises(AIAuthenticationError):
+        await provider.generate(_request())
+    assert holder["response"].closed_count == 1
+
+
+# --------------------------------------------------------------------------- #
+# Strict response-schema validation                                           #
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("kwargs", [
+    {"payload": {"choices": ["invalid"]}},
+    {"payload": {"choices": [{"message": "invalid"}]}},
+    {"payload": {"choices": [{"message": {"content": []}}]}},
+    {"payload": {"choices": [{"message": {"content": None}}]}},
+    {"payload": {"choices": []}},
+    {"payload": []},
+    {"raw": b"null"},   # top-level JSON null
+])
+async def test_malformed_response_schema_raises_provider_error(monkeypatch, kwargs):
+    """Every malformed upstream body must surface as AIProviderError - never
+    as an AttributeError or TypeError from response-structure access."""
+    def behaviour(url, **kw):
+        return _Response(**kwargs)
+
+    provider = _provider(monkeypatch, behaviour)
+    with pytest.raises(AIProviderError) as excinfo:
+        await provider.generate(_request())
+    assert not isinstance(excinfo.value, (AttributeError, TypeError))
+
+
+async def test_wellformed_response_still_extracts_text(monkeypatch):
+    """Regression: the ordinary valid response keeps extracting text."""
+    def behaviour(url, **kwargs):
+        return _Response(payload=_or_payload("still fine"))
+
+    provider = _provider(monkeypatch, behaviour)
+    request = _request()
+    assert await provider.generate(request) == "still fine"
+
+
+async def test_gateway_falls_back_on_malformed_response_schema(monkeypatch):
+    """A malformed upstream body routes the gateway to the local fallback
+    without crashing the chat pipeline."""
+    def behaviour(url, **kwargs):
+        return _Response(payload={"choices": ["invalid"]})
+
+    provider = _provider(
+        monkeypatch, behaviour,
+        ai_max_retries=0, ai_retry_backoff_base=0.0, min_request_interval=0.0,
+    )
+    gateway = AIGateway(
+        _cfg(**{"ai_max_retries": 0, "ai_retry_backoff_base": 0.0,
+                "min_request_interval": 0.0}),
+        provider=provider, local=LocalProvider(), telemetry=AITelemetry(),
+    )
+    response = await gateway.generate(_request())
+    assert response.metadata.provider == "local", "fallback path engaged"
+    assert response.text
+    assert response.metadata.success is True
+
+
+async def test_gateway_uses_openrouter_on_wellformed_response(monkeypatch):
+    """Regression: a well-formed response keeps the OpenRouter attribution."""
+    def behaviour(url, **kwargs):
+        return _Response(payload=_or_payload("direct answer"))
+
+    provider = _provider(monkeypatch, behaviour)
+    gateway = AIGateway(
+        _cfg(), provider=provider, local=LocalProvider(), telemetry=AITelemetry(),
+    )
+    response = await gateway.generate(_request())
+    assert response.metadata.provider == "openrouter"
+    assert response.text == "direct answer"
+    assert response.metadata.success is True
+
+
+@pytest.mark.asyncio
+async def test_cooldown_is_rechecked_after_pacing_before_quota_reservation(monkeypatch):
+    """A 429 from another in-flight request blocks tasks still waiting to send."""
+    waiting = asyncio.Event()
+    release = asyncio.Event()
+    sends = {"count": 0}
+
+    def behaviour(*args, **kwargs):
+        sends["count"] += 1
+        return _Response()
+
+    provider = _provider(
+        monkeypatch,
+        behaviour,
+        min_request_interval=0.0,
+        ai_rate_limit_cooldown_seconds=5.0,
+    )
+
+    async def paused_rate_limit():
+        waiting.set()
+        await release.wait()
+
+    provider._rate_limit = paused_rate_limit
+    task = asyncio.create_task(provider.generate(_request()))
+    await waiting.wait()
+
+    # Simulate a parallel request receiving 429 while this request is paced.
+    provider._apply_rate_limit_headers({"Retry-After": "5"})
+    release.set()
+
+    with pytest.raises(RateLimitError, match="cooling down"):
+        await task
+
+    assert sends["count"] == 0, "no request may be sent during the newly applied cooldown"
+    assert provider.daily_used == 0, "a request rejected before send must not reserve quota"

@@ -9,7 +9,7 @@
 | Variable | Source | Required |
 |---|---|---|
 | `BOT_TOKEN` | From @BotFather | ✅ Required |
-| `GEMINI_API_KEY` | Google AI Studio (optional) | ⚠️ Optional (local fallback if unset) |
+| `OPENROUTER_API_KEY` | OpenRouter (cloud AI provider) | Required for cloud AI tests; local fallback remains available |
 | `AUSTRO_ENVIRONMENT` | Free-form | ✅ Recommended: "development" or "production" |
 | `AUSTRO_LOG_LEVEL` | Free-form | ✅ Recommended: "INFO" or "WARNING" |
 

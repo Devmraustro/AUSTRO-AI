@@ -89,7 +89,7 @@ handlers exists (`tests/test_handlers.py`, no network).
 ## 7. PRODUCTION SMOKE TEST — `A` on SQLite (8/8), `A` on PostgreSQL (8/8)
 
 `scripts/smoke_test.py` (production env: log WARNING, webhook set,
-`USE_LOCAL_FALLBACK=0`, non-empty GEMINI key):
+`USE_LOCAL_FALLBACK=0`, non-empty OPENROUTER key):
 
 | Check | SQLite | PostgreSQL |
 |---|---|---|

@@ -11,7 +11,7 @@ AI budget.
 import os
 
 os.environ.setdefault("BOT_TOKEN", "123456789:TEST-rate-limit-token-abcdef")
-os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key-0000000000")
+os.environ.setdefault("OPENROUTER_API_KEY", "test-openrouter-key-0000000000")
 
 import pytest  # noqa: E402
 

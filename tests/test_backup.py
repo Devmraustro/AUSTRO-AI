@@ -125,6 +125,8 @@ def env(monkeypatch):
     monkeypatch.setenv("DB_NAME", "austro_ai")
     monkeypatch.setenv("DB_USER", "austro")
     monkeypatch.setenv("DB_PASSWORD", PASSWORD)
+    # Remote host in tests follows the production TLS policy.
+    monkeypatch.setenv("DB_SSLMODE", "require")
     monkeypatch.delenv("PGPASSWORD", raising=False)
     monkeypatch.delenv("PG_BIN", raising=False)
     return monkeypatch
@@ -503,6 +505,9 @@ def _write_raw(tmp_path: Path, body: bytes = None) -> Path:
 def _key_file(tmp_path: Path, key: bytes) -> Path:
     path = tmp_path / "backup.key"
     path.write_bytes(key)
+    # Secret files are 0600 in production; the loader rejects group/world
+    # readable keys on POSIX, so match that here.
+    path.chmod(0o600)
     return path
 
 
@@ -759,6 +764,7 @@ def test_plaintext_dump_never_lands_in_the_backup_directory(env, tmp_path, monke
     dump_target = Path(runner.calls[0]["argv"][runner.calls[0]["argv"].index("-f") + 1])
     assert outdir.resolve() not in dump_target.resolve().parents
     assert work.resolve() in dump_target.resolve().parents
+    assert dump_target.name.endswith(pg_backup.RAW_SUFFIX)
     # nothing plaintext-like survives in the persistent directory
     assert not [p for p in outdir.iterdir() if p.suffix == ".part" or p.suffix == ".sql"]
 
@@ -805,6 +811,11 @@ def test_stale_plaintext_from_killed_run_is_purged(env, tmp_path, monkeypatch):
     work = _workdir(tmp_path, monkeypatch)
     legacy = outdir / f".{BACKUP_PREFIX}20251201_020000.sql.part"
     legacy.write_text("PLAINTEXT SECRET DUMP", encoding="utf-8")
+    visible = outdir / f"leftover{pg_backup.RAW_SUFFIX}"
+    visible.write_text("PLAINTEXT SECRET DUMP", encoding="utf-8")
+    abandoned_tmp = outdir / pg_backup.PRIVATE_WORKDIR_NAME
+    abandoned_tmp.mkdir()
+    (abandoned_tmp / "dump.sql").write_text("PLAINTEXT SECRET DUMP", encoding="utf-8")
     old_work = work / f"{pg_backup.WORK_PREFIX}abandoned"
     old_work.mkdir(parents=True)
     (old_work / "dump.sql").write_text("PLAINTEXT SECRET DUMP", encoding="utf-8")
@@ -813,6 +824,8 @@ def test_stale_plaintext_from_killed_run_is_purged(env, tmp_path, monkeypatch):
     assert run_backup(outdir, now=_moment(10), connect=_fake_connect,
                       dump_runner=_DumpRunner(), tool=Path("pg_dump")) == 0
     assert not legacy.exists()
+    assert not visible.exists()
+    assert not abandoned_tmp.exists()
     assert not old_work.exists()
     assert list(work.iterdir()) == []
 
@@ -851,6 +864,7 @@ def test_encryption_required_with_invalid_key_fails_before_dump(env, tmp_path, m
     monkeypatch.setenv("BACKUP_ENCRYPTION_ENABLED", "true")
     key_file = tmp_path / "short.key"
     key_file.write_bytes(b"too-short")
+    key_file.chmod(0o600)
     monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", str(key_file))
     _workdir(tmp_path, monkeypatch)
     runner = _DumpRunner()
@@ -864,6 +878,7 @@ def test_encrypted_run_publishes_no_plaintext_and_declares_encryption(env, tmp_p
     key = bytes(range(32))
     key_file = tmp_path / "backup.key"
     key_file.write_bytes(key)
+    key_file.chmod(0o600)
     monkeypatch.setenv("BACKUP_ENCRYPTION_ENABLED", "true")
     monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", str(key_file))
     _workdir(tmp_path, monkeypatch)
@@ -886,10 +901,90 @@ def test_key_with_leading_and_trailing_whitespace_bytes_is_not_corrupted(tmp_pat
     assert len(key) == 32
     path = tmp_path / "ws.key"
     path.write_bytes(key + b"\n")
+    path.chmod(0o600)
     monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", str(path))
     assert pg_backup._load_encryption_key() == key
     path.write_bytes(key)  # and the bare key is accepted as-is
     assert pg_backup._load_encryption_key() == key
+
+
+class _FakeStat:
+    def __init__(self, mode: int) -> None:
+        self.st_mode = mode
+
+
+def _force_posix_mode(monkeypatch, mode: int) -> None:
+    """Make the POSIX-only permission check see `mode`, on every platform."""
+    monkeypatch.setattr(pg_backup.os, "name", "posix", raising=False)
+    monkeypatch.setattr(
+        pg_backup.os, "stat", lambda path, *a, **kw: _FakeStat(mode)
+    )
+
+
+@pytest.mark.parametrize("mode", [0o600, 0o400])
+def test_key_permissions_accept_owner_only_files(monkeypatch, tmp_path, mode):
+    path = tmp_path / "backup.key"
+    path.write_bytes(bytes(32))
+    _force_posix_mode(monkeypatch, stat.S_IFREG | mode)
+    pg_backup._validate_key_file_permissions(path)  # must not raise
+
+
+def test_key_permissions_reject_group_readable_files(monkeypatch, tmp_path):
+    path = tmp_path / "backup.key"
+    path.write_bytes(bytes(32))
+    _force_posix_mode(monkeypatch, stat.S_IFREG | 0o640)
+    with pytest.raises(RuntimeError, match="group-readable or world-readable"):
+        pg_backup._validate_key_file_permissions(path)
+
+
+def test_key_permissions_reject_world_readable_files(monkeypatch, tmp_path):
+    path = tmp_path / "backup.key"
+    path.write_bytes(bytes(32))
+    _force_posix_mode(monkeypatch, stat.S_IFREG | 0o644)
+    with pytest.raises(RuntimeError, match="world-readable"):
+        pg_backup._validate_key_file_permissions(path)
+
+
+def test_key_permissions_reject_non_regular_files(monkeypatch, tmp_path):
+    path = tmp_path / "backup.key"
+    path.write_bytes(bytes(32))
+    _force_posix_mode(monkeypatch, stat.S_IFDIR | 0o600)
+    with pytest.raises(RuntimeError, match="not a regular file"):
+        pg_backup._validate_key_file_permissions(path)
+
+
+def test_key_permissions_fail_closed_when_stat_fails(monkeypatch, tmp_path):
+    path = tmp_path / "backup.key"
+    path.write_bytes(bytes(32))
+
+    def _boom(*args, **kwargs):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(pg_backup.os, "name", "posix", raising=False)
+    monkeypatch.setattr(pg_backup.os, "stat", _boom)
+    with pytest.raises(RuntimeError, match="could not inspect"):
+        pg_backup._validate_key_file_permissions(path)
+
+
+def test_key_permissions_are_a_noop_on_windows(monkeypatch, tmp_path):
+    path = tmp_path / "backup.key"
+    path.write_bytes(bytes(32))
+
+    def _must_not_run(*args, **kwargs):  # pragma: no cover - asserted by not running
+        raise AssertionError("POSIX permission check ran on Windows")
+
+    monkeypatch.setattr(pg_backup.os, "name", "nt", raising=False)
+    monkeypatch.setattr(pg_backup.os, "stat", _must_not_run)
+    pg_backup._validate_key_file_permissions(path)  # must not raise
+
+
+def test_group_readable_key_makes_the_loader_fail_closed(monkeypatch, tmp_path):
+    key_path = tmp_path / "backup.key"
+    key_path.write_bytes(bytes(32))
+    monkeypatch.setenv("BACKUP_ENCRYPTION_KEY_FILE", str(key_path))
+    _force_posix_mode(monkeypatch, stat.S_IFREG | 0o644)
+    with pytest.raises(RuntimeError, match="world-readable"):
+        pg_backup._load_encryption_key(required=True)
 
 
 def test_scheduler_refuses_to_start_without_encryption(monkeypatch, tmp_path):
@@ -917,10 +1012,25 @@ def _fake_tool(directory: Path, name: str = "pg_dump") -> Path:
     return tool
 
 
+def _path_tool(directory: Path, name: str = "pg_dump") -> Path:
+    """A fake tool resolvable through PATH on every supported platform.
+
+    POSIX resolves an executable extensionless file; Windows `shutil.which`
+    consults PATHEXT, so on win32 the fixture also writes a `.bat` twin and
+    the lookup is expected to return that one.
+    """
+    tool = _fake_tool(directory, name)
+    if os.name != "nt":
+        return tool
+    bat = directory / (name + ".bat")
+    bat.write_text("@exit /b 0\r\n", encoding="utf-8")
+    return bat
+
+
 def test_find_tool_uses_path_when_pg_bin_is_unset(monkeypatch, tmp_path):
     """Regression: the backup image sets no PG_BIN. The old lookup checked
     relative paths only, so a valid pg_dump on PATH was reported missing."""
-    tool = _fake_tool(tmp_path / "bin")
+    tool = _path_tool(tmp_path / "bin")
     monkeypatch.delenv("PG_BIN", raising=False)
     monkeypatch.setenv("PATH", str(tool.parent))
     assert pg_backup.find_tool("pg_dump") == tool
@@ -949,7 +1059,120 @@ def test_restore_drill_resolves_psql_from_path_without_pg_bin(monkeypatch, tmp_p
     (the backup image) the restore failed with 'Could not find psql'."""
     from scripts import pg_restore_drill
 
-    tool = _fake_tool(tmp_path / "bin", name="psql")
+    tool = _path_tool(tmp_path / "bin", name="psql")
     monkeypatch.delenv("PG_BIN", raising=False)
     monkeypatch.setenv("PATH", str(tool.parent))
     assert pg_restore_drill.find_tool("psql") == tool
+
+
+# ==================== PostgreSQL TLS propagation ==================== #
+
+
+def test_postgres_tls_kwargs_reads_env(monkeypatch):
+    monkeypatch.setenv("DB_SSLMODE", "verify-full")
+    monkeypatch.setenv("DB_SSL_ROOT_CERT", "/ca.pem")
+    monkeypatch.setenv("DB_SSL_CERT", "/client.crt")
+    monkeypatch.setenv("DB_SSL_KEY", "/client.key")
+    assert pg_backup.postgres_tls_kwargs() == {
+        "sslmode": "verify-full",
+        "sslrootcert": "/ca.pem",
+        "sslcert": "/client.crt",
+        "sslkey": "/client.key",
+    }
+
+
+def test_postgres_tls_env_overrides_inherited(monkeypatch):
+    monkeypatch.setenv("DB_SSLMODE", "require")
+    monkeypatch.setenv("DB_SSL_ROOT_CERT", "/ca.pem")
+    monkeypatch.setenv("PGSSLMODE", "disable")  # inherited, must be overridden
+    env = pg_backup.postgres_tls_env()
+    assert env["PGSSLMODE"] == "require"
+    assert env["PGSSLROOTCERT"] == "/ca.pem"
+
+
+def test_assert_remote_tls_rejects_prefer_for_remote(monkeypatch):
+    monkeypatch.delenv("DB_ALLOW_INSECURE", raising=False)
+    monkeypatch.setenv("DB_SSLMODE", "prefer")
+    with pytest.raises(RuntimeError, match="DB_SSLMODE"):
+        pg_backup._assert_remote_tls("db.example.test")
+
+
+def test_assert_remote_tls_accepts_require_for_remote(monkeypatch):
+    monkeypatch.delenv("DB_ALLOW_INSECURE", raising=False)
+    monkeypatch.setenv("DB_SSLMODE", "require")
+    pg_backup._assert_remote_tls("db.example.test")  # must not raise
+
+
+def test_assert_remote_tls_allows_local_prefer(monkeypatch):
+    monkeypatch.setenv("DB_SSLMODE", "prefer")
+    pg_backup._assert_remote_tls("127.0.0.1")  # must not raise
+
+
+def test_snapshot_row_counts_propagates_tls(monkeypatch, tmp_path):
+    monkeypatch.setenv("DB_HOST", "db.example.test")
+    monkeypatch.setenv("DB_SSLMODE", "require")
+    monkeypatch.setenv("DB_SSL_ROOT_CERT", "/ca.pem")
+    monkeypatch.setenv("DB_PASSWORD", "secret")
+    captured = {}
+
+    def connect(**kwargs):
+        captured.update(kwargs)
+        return _fake_connect(**kwargs)
+
+    dsn = {"PGHOST": "db.example.test", "PGPORT": "5432",
+           "PGDATABASE": "austro_ai", "PGUSER": "austro"}
+    pg_backup.snapshot_row_counts(dsn, connect)
+    assert captured["sslmode"] == "require"
+    assert captured["sslrootcert"] == "/ca.pem"
+    assert "password" in captured
+
+
+def test_snapshot_row_counts_fails_closed_for_remote_prefer(monkeypatch, tmp_path):
+    monkeypatch.setenv("DB_HOST", "db.example.test")
+    monkeypatch.setenv("DB_SSLMODE", "prefer")
+    monkeypatch.delenv("DB_ALLOW_INSECURE", raising=False)
+    called = {"n": 0}
+
+    def connect(**kwargs):
+        called["n"] += 1
+        return _fake_connect(**kwargs)
+
+    dsn = {"PGHOST": "db.example.test", "PGPORT": "5432",
+           "PGDATABASE": "austro_ai", "PGUSER": "austro"}
+    with pytest.raises(RuntimeError, match="DB_SSLMODE"):
+        pg_backup.snapshot_row_counts(dsn, connect)
+    assert called["n"] == 0
+
+
+def test_run_pg_dump_propagates_tls_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("DB_HOST", "db.example.test")
+    monkeypatch.setenv("DB_SSLMODE", "verify-full")
+    monkeypatch.setenv("DB_SSL_ROOT_CERT", "/ca.pem")
+    monkeypatch.setenv("DB_PASSWORD", "secret")
+    runner = _DumpRunner()
+    dsn = {"PGHOST": "db.example.test", "PGPORT": "5432",
+           "PGDATABASE": "austro_ai", "PGUSER": "austro"}
+    raw = tmp_path / "dump.sql.part"
+    pg_backup.run_pg_dump(raw, dsn=dsn, password="secret", runner=runner,
+                          tool=Path("pg_dump"))
+    assert runner.calls, "pg_dump was not invoked"
+    env = runner.calls[0]["env"]
+    assert env["PGSSLMODE"] == "verify-full"
+    assert env["PGSSLROOTCERT"] == "/ca.pem"
+    assert "PGPASSWORD" not in env
+    assert "secret" not in " ".join(runner.calls[0]["argv"])
+    # PGPASSFILE mechanism remains intact.
+    assert env.get("PGPASSFILE")
+
+
+def test_run_pg_dump_fails_closed_for_remote_disable(monkeypatch, tmp_path):
+    monkeypatch.setenv("DB_HOST", "db.example.test")
+    monkeypatch.setenv("DB_SSLMODE", "disable")
+    monkeypatch.delenv("DB_ALLOW_INSECURE", raising=False)
+    runner = _DumpRunner()
+    dsn = {"PGHOST": "db.example.test", "PGPORT": "5432",
+           "PGDATABASE": "austro_ai", "PGUSER": "austro"}
+    raw = tmp_path / "dump.sql.part"
+    with pytest.raises(RuntimeError, match="DB_SSLMODE"):
+        pg_backup.run_pg_dump(raw, dsn=dsn, password="secret", runner=runner)
+    assert runner.calls == []

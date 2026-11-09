@@ -262,6 +262,582 @@ def test_privacy_export_and_delete(engine):
 # ============================ GOLDEN EVAL + HANDLERS ============================
 
 
+
+def _make_plans(engine, owner: int, count: int) -> None:
+    """Create `count` plans for the owner to exceed any arbitrary limit."""
+    for i in range(count):
+        engine._store.plans.save(
+            owner_user_id=owner,
+            plan_date=f"2026-01-{i + 1:02d}",
+            items=[{"kind": "lesson", "title": f"plan {i}", "minutes": 10}],
+            source="test",
+            total_minutes=10,
+            adjusted=False,
+        )
+
+
+def _make_assessments(engine, owner: int, objective_id: int, count: int) -> None:
+    """Create `count` assessment records for the owner/objective."""
+    for i in range(count):
+        questions = engine.assessment(owner, objective_id, count=1,
+                                      kinds=["multiple_choice"])
+        answers = {0: questions[0]["answer"]}
+        engine.submit_assessment(
+            owner, objective_id, questions=questions, answers=answers,
+            session_id=None,
+        )
+
+
+def test_export_learning_includes_lessons(engine):
+    goal_id, objective_ids, curriculum_id = _seed_goal(engine)
+    outcome = _start_lesson(engine, curriculum_id)
+    lesson_id = outcome["lesson"]["lesson_id"]
+
+    exported = engine.export_learning(OWNER)
+    lesson_ids = {l["lesson_id"] for l in exported.get("lessons", [])}
+    assert lesson_id in lesson_ids, f"lesson {lesson_id} not in export"
+
+
+def test_export_learning_includes_sessions_completed_and_not(engine):
+    goal_id, objective_ids, curriculum_id = _seed_goal(engine)
+
+    # Create a session directly
+    session = engine.sessions.start(
+        OWNER, objective_ids[0], goal_id, curriculum_id, "READ"
+    )
+    session_id = session.session_id
+
+    # Complete the session
+    engine.sessions.complete(session, minutes=10)
+
+    exported = engine.export_learning(OWNER)
+    session_ids = {s["session_id"] for s in exported.get("sessions", [])}
+    assert session_id in session_ids, f"session {session_id} not in export"
+    assert any(s.get("state") == "COMPLETED" for s in exported.get("sessions", []))
+
+
+def test_export_learning_includes_events(engine):
+    goal_id, objective_ids, curriculum_id = _seed_goal(engine)
+    engine._store.events.log(OWNER, "test_event", None, None,
+                             {"custom": "data"})
+
+    exported = engine.export_learning(OWNER)
+    event_actions = {e["action"] for e in exported.get("events", [])}
+    assert "test_event" in event_actions, "test_event not in export"
+
+
+def test_export_learning_more_than_500_assessments(engine):
+    goal_id, objective_ids, curriculum_id = _seed_goal(engine)
+    objective_id = objective_ids[0]
+    _make_assessments(engine, OWNER, objective_id, count=600)
+
+    exported = engine.export_learning(OWNER)
+    assessments = exported.get("assessments", [])
+    assert len(assessments) >= 600, f"expected >=600 assessments, got {len(assessments)}"
+
+
+def test_export_learning_more_than_30_plans(engine):
+    _make_plans(engine, OWNER, count=50)
+
+    exported = engine.export_learning(OWNER)
+    plans = exported.get("plans", [])
+    assert len(plans) >= 50, f"expected >=50 plans, got {len(plans)}"
+
+
+def test_export_learning_cross_user_isolation(engine):
+    goal_id, objective_ids, curriculum_id = _seed_goal(engine)
+    _start_lesson(engine, curriculum_id)
+
+    # Owner 2 creates their own data with their own goal
+    owner2_goal_id = engine.create_goal(200, kind="long_term", title="owner2 goal")
+    assert owner2_goal_id is not None, "owner2 goal creation failed"
+    obj2 = engine.add_objective(200, goal_id=owner2_goal_id, title="owner2 obj")
+    engine.add_objective(OWNER, goal_id, title="owner1 obj")
+
+    exported = engine.export_learning(OWNER)
+    exported_goal_ids = {g["goal_id"] for g in exported.get("goals", [])}
+    exported_obj_ids = {o["objective_id"] for o in exported.get("objectives", [])}
+
+    assert goal_id in exported_goal_ids
+    assert all(oid in exported_obj_ids for oid in objective_ids)
+    # Owner 2's goal and objective must NOT appear
+    assert owner2_goal_id not in exported_goal_ids, "cross-user leakage: owner 2 goal in export"
+    # Verify no cross-user leakage: objective 2 (owner2) should not appear
+    all_obj_ids = [o["objective_id"] for o in exported.get("objectives", [])]
+    assert obj2 not in all_obj_ids, "cross-user leakage: owner 2 objective in export"
+    # Verify all exported records belong to owner 1
+    for g in exported.get("goals", []):
+        assert g.get("owner_user_id") == OWNER, f"goal {g.get('goal_id')} has wrong owner"
+    for o in exported.get("objectives", []):
+        assert o.get("owner_user_id") == OWNER, f"objective {o.get('objective_id')} has wrong owner"
+
+
+def test_export_learning_json_safe(engine):
+    goal_id, objective_ids, curriculum_id = _seed_goal(engine)
+    _start_lesson(engine, curriculum_id)
+    _make_plans(engine, OWNER, count=5)
+    _make_assessments(engine, OWNER, objective_ids[0], count=10)
+
+    exported = engine.export_learning(OWNER)
+    import json
+    # Must be JSON-serializable
+    json_str = json.dumps(exported, ensure_ascii=False)
+    reparsed = json.loads(json_str)
+    assert "goals" in reparsed
+    assert "objectives" in reparsed
+    assert "lessons" in reparsed
+    assert "sessions" in reparsed
+    assert "events" in reparsed
+
+
+def test_export_learning_empty_owner(engine):
+    # Owner with no data at all
+    exported = engine.export_learning(99999)
+    assert exported["goals"] == []
+    assert exported["objectives"] == []
+    assert exported["curricula"] == []
+    assert exported["lessons"] == []
+    assert exported["sessions"] == []
+    assert exported["events"] == []
+    assert exported["mastery"] == []
+    assert exported["reviews"] == []
+    assert exported["assessments"] == []
+    assert exported["misconceptions"] == []
+    assert exported["plans"] == []
+    assert exported["progress"] == []
+
+
+def test_export_learning_no_db_changes(engine):
+    goal_id, objective_ids, curriculum_id = _seed_goal(engine)
+
+    # Capture state before export
+    before_goals = len(engine._store.goals.list(OWNER))
+    before_objectives = len(engine._store.objectives.list_for_goal(OWNER, goal_id))
+    before_lessons = len(engine._store.lessons.list_for_owner(OWNER))
+    before_sessions = len(engine._store.sessions.list_for_owner(OWNER))
+
+    exported = engine.export_learning(OWNER)
+
+    # After export, no data should have changed
+    after_goals = len(engine._store.goals.list(OWNER))
+    after_objectives = len(engine._store.objectives.list_for_goal(OWNER, goal_id))
+    after_lessons = len(engine._store.lessons.list_for_owner(OWNER))
+    after_sessions = len(engine._store.sessions.list_for_owner(OWNER))
+
+    assert before_goals == after_goals
+    assert before_objectives == after_objectives
+    assert before_lessons == after_lessons
+    assert before_sessions == after_sessions
+
+    # Exported data should still reflect the pre-export state
+    assert len(exported.get("goals", [])) == before_goals
+    assert len(exported.get("lessons", [])) == before_lessons
+    assert len(exported.get("sessions", [])) == before_sessions
+
+
+# ----------------------------------------------------------------------
+# Export error-tracking tests (operation-scoped error collector)
+# ----------------------------------------------------------------------
+
+
+def test_export_succeeds_after_unrelated_db_error(engine, monkeypatch):
+    """A previous unrelated DB error must not cause a later export to fail."""
+    _seed_goal(engine)
+
+    # Simulate a previous DB error by directly appending to manager's legacy list
+    engine._store._manager._errors.append("legacy: some old error")
+
+    # Export should succeed because it uses its own operation-scoped collector
+    exported = engine.export_learning(OWNER)
+    assert "goals" in exported
+    assert len(exported["goals"]) >= 1
+
+
+def test_export_fails_when_repository_query_fails(engine, monkeypatch):
+    """Export must fail when a required repository query fails."""
+    _seed_goal(engine)
+
+    import sqlite3
+    from app.learning.repositories import _LearningBase
+
+    # Create wrapper classes for connection and cursor
+    class FailingCursor:
+        def __init__(self, real_cursor):
+            self._real_cursor = real_cursor
+        def execute(self, sql, params=None):
+            if "learning_goals" in sql and "SELECT" in sql:
+                raise sqlite3.Error("simulated db failure")
+            return self._real_cursor.execute(sql, params)
+        def __getattr__(self, name):
+            return getattr(self._real_cursor, name)
+
+    class FailingConnection:
+        def __init__(self, real_conn):
+            self._real_conn = real_conn
+        def cursor(self, *args, **kwargs):
+            real_cursor = self._real_conn.cursor(*args, **kwargs)
+            return FailingCursor(real_cursor)
+        def __getattr__(self, name):
+            return getattr(self._real_conn, name)
+
+    original_connection = _LearningBase._connection
+
+    def failing_connection(self):
+        real_conn = original_connection(self)
+        return FailingConnection(real_conn)
+
+    monkeypatch.setattr(_LearningBase, "_connection", failing_connection)
+
+    # Export must raise RuntimeError with repository/operation identification
+    try:
+        engine.export_learning(OWNER)
+        assert False, "Expected RuntimeError"
+    except RuntimeError as e:
+        err_msg = str(e)
+        assert "EducationalGoalsRepository" in err_msg
+        assert "list" in err_msg
+        # Sanitized error format
+        assert "Error: database operation failed" in err_msg
+
+
+def test_concurrent_exports_independent_failures(engine, monkeypatch):
+    """Concurrent exports for two owners must have independent error state.
+
+    This test runs 25 iterations to verify deterministic behavior with
+    proven overlap inside the export execution path.
+    Owner 1's export always fails; owner 2's export always succeeds.
+    """
+    import threading
+    import sqlite3
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from app.learning.repositories import _LearningBase, EducationalGoalsRepository
+
+    original_connection = _LearningBase._connection
+    original_list = EducationalGoalsRepository.list
+
+    # Thread-local storage for owner ID - deterministic per thread
+    thread_owner = threading.local()
+
+    # Synchronization: counter + condition variable to prove both threads
+    # enter the repository's list method before either completes the query.
+    # This avoids the lock contention issue where the repository's internal
+    # lock serializes access to the database.
+    sync_lock = threading.Lock()
+    entered_count = 0
+    both_entered = threading.Condition(sync_lock)
+
+    class FailingCursor:
+        def __init__(self, real_cursor):
+            self._real_cursor = real_cursor
+        def execute(self, sql, params=None):
+            if "learning_goals" in sql and "SELECT" in sql:
+                # After both threads have entered list(), only owner1 fails
+                if getattr(thread_owner, "owner_id", None) == "owner1":
+                    raise sqlite3.Error("simulated db failure for owner1")
+            return self._real_cursor.execute(sql, params)
+        def __getattr__(self, name):
+            return getattr(self._real_cursor, name)
+
+    class FailingConnection:
+        def __init__(self, real_conn):
+            self._real_conn = real_conn
+        def cursor(self, *args, **kwargs):
+            real_cursor = self._real_conn.cursor(*args, **kwargs)
+            return FailingCursor(real_cursor)
+        def __getattr__(self, name):
+            return getattr(self._real_conn, name)
+
+    def make_failing_connection_factory():
+        def failing_connection(self):
+            real_conn = original_connection(self)
+            return FailingConnection(real_conn)
+        return failing_connection
+
+    # Patched list method that adds synchronization at the start
+    def patched_list(self, owner_user_id, error_collector=None):
+        nonlocal entered_count
+        with sync_lock:
+            entered_count += 1
+            if entered_count == 2:
+                both_entered.notify_all()
+            else:
+                # Wait for the other thread to enter (with timeout)
+                both_entered.wait(timeout=5)
+                if entered_count < 2:
+                    raise RuntimeError("Timeout waiting for concurrent thread")
+        # Call original list method
+        return original_list(self, owner_user_id, error_collector)
+
+    def run_single_iteration():
+        """Run one iteration of concurrent exports with proven overlap inside export path."""
+        nonlocal entered_count
+        with sync_lock:
+            entered_count = 0
+
+        # Pre-create owner2's data once per iteration
+        owner2 = 200
+        owner2_goal_id = engine.create_goal(owner2, kind="long_term", title="owner2 goal")
+        assert owner2_goal_id is not None
+        owner2_obj_id = engine.add_objective(owner2, goal_id=owner2_goal_id, title="owner2 obj")
+        assert owner2_obj_id is not None
+
+        # Patch the connection and the list method
+        monkeypatch.setattr(_LearningBase, "_connection", make_failing_connection_factory())
+        monkeypatch.setattr(EducationalGoalsRepository, "list", patched_list)
+
+        def export_for_owner(owner_key, owner_id):
+            """Run export for a specific owner with deterministic failure injection."""
+            thread_owner.owner_id = owner_key
+            try:
+                result = engine.export_learning(owner_id)
+                return ("success", owner_key, result)
+            except RuntimeError as e:
+                return ("error", owner_key, str(e))
+            except Exception as e:
+                return ("unexpected", owner_key, str(e))
+
+        owner1 = OWNER
+
+        # Run both exports concurrently
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future1 = executor.submit(export_for_owner, "owner1", owner1)
+            future2 = executor.submit(export_for_owner, "owner2", owner2)
+
+            outcomes = {}
+            for future in as_completed([future1, future2]):
+                status, owner_key, data = future.result()
+                outcomes[owner_key] = (status, data)
+
+        # Verify exactly one failure (owner1) and one success (owner2)
+        assert len(outcomes) == 2
+        status1, data1 = outcomes["owner1"]
+        status2, data2 = outcomes["owner2"]
+        assert status1 == "error", f"owner1 should fail, got {status1}: {data1}"
+        assert status2 == "success", f"owner2 should succeed, got {status2}"
+
+        # Verify error message contains repo/operation info (sanitized)
+        assert "EducationalGoalsRepository" in data1
+        assert "Error: database operation failed" in data1
+
+        # Verify successful export has goals and correct ownership
+        assert "goals" in data2
+        assert len(data2["goals"]) >= 1
+        for g in data2["goals"]:
+            assert g.get("owner_user_id") == 200
+
+        return True
+
+    # Run multiple iterations to verify deterministic behavior
+    for iteration in range(25):
+        assert run_single_iteration(), f"iteration {iteration} failed"
+
+
+def test_export_empty_owner_produces_valid_empty_export(engine):
+    """An owner with no data must produce a valid empty export, not an error."""
+    exported = engine.export_learning(99999)  # Non-existent owner
+    assert exported == {
+        "goals": [],
+        "objectives": [],
+        "curricula": [],
+        "lessons": [],
+        "sessions": [],
+        "events": [],
+        "mastery": [],
+        "reviews": [],
+        "assessments": [],
+        "misconceptions": [],
+        "plans": [],
+        "progress": [],
+    }
+
+
+def test_export_no_partial_data_on_failure(engine, monkeypatch):
+    """On failure, export must not return partial data - must raise."""
+    _seed_goal(engine)
+
+    import sqlite3
+    from app.learning.repositories import _LearningBase
+
+    original_connection = _LearningBase._connection
+
+    class FailingCursor:
+        def __init__(self, real_cursor):
+            self._real_cursor = real_cursor
+        def execute(self, sql, params=None):
+            if "learning_objectives" in sql and "SELECT" in sql:
+                raise sqlite3.Error("objectives failure")
+            return self._real_cursor.execute(sql, params)
+        def __getattr__(self, name):
+            return getattr(self._real_cursor, name)
+
+    class FailingConnection:
+        def __init__(self, real_conn):
+            self._real_conn = real_conn
+        def cursor(self, *args, **kwargs):
+            real_cursor = self._real_conn.cursor(*args, **kwargs)
+            return FailingCursor(real_cursor)
+        def __getattr__(self, name):
+            return getattr(self._real_conn, name)
+
+    def failing_connection(self):
+        real_conn = original_connection(self)
+        return FailingConnection(real_conn)
+
+    monkeypatch.setattr(_LearningBase, "_connection", failing_connection)
+
+    try:
+        engine.export_learning(OWNER)
+        assert False, "Expected RuntimeError"
+    except RuntimeError as e:
+        err_msg = str(e)
+        assert "LearningObjectivesRepository" in err_msg
+        assert "list_for_goal" in err_msg
+    # Verify no partial export was returned (exception was raised)
+
+
+def test_export_error_identifies_repository_and_operation(engine, monkeypatch):
+    """Error messages must identify the repository and operation."""
+    _seed_goal(engine)
+
+    import sqlite3
+    from app.learning.repositories import _LearningBase
+
+    original_connection = _LearningBase._connection
+
+    class FailingCursor:
+        def __init__(self, real_cursor):
+            self._real_cursor = real_cursor
+        def execute(self, sql, params=None):
+            if "learning_sessions" in sql and "SELECT" in sql:
+                raise sqlite3.Error("sessions table locked")
+            return self._real_cursor.execute(sql, params)
+        def __getattr__(self, name):
+            return getattr(self._real_cursor, name)
+
+    class FailingConnection:
+        def __init__(self, real_conn):
+            self._real_conn = real_conn
+        def cursor(self, *args, **kwargs):
+            real_cursor = self._real_conn.cursor(*args, **kwargs)
+            return FailingCursor(real_cursor)
+        def __getattr__(self, name):
+            return getattr(self._real_conn, name)
+
+    def failing_connection(self):
+        real_conn = original_connection(self)
+        return FailingConnection(real_conn)
+
+    monkeypatch.setattr(_LearningBase, "_connection", failing_connection)
+
+    try:
+        engine.export_learning(OWNER)
+        assert False, "Expected RuntimeError"
+    except RuntimeError as e:
+        err_msg = str(e)
+        # Repository and operation must be identified
+        assert "SessionsRepository" in err_msg
+        assert "list_for_owner" in err_msg
+        # Raw database error details must NOT appear (sanitized)
+        assert "sessions table locked" not in err_msg, "Raw DB error leaked in export error"
+        # Sanitized error format should be present
+        assert "Error: database operation failed" in err_msg, f"Expected sanitized error format, got: {err_msg}"
+
+
+def test_export_error_sanitization_no_raw_details(engine, monkeypatch):
+    """Export errors must not expose raw database exception details."""
+    _seed_goal(engine)
+
+    import sqlite3
+    from app.learning.repositories import _LearningBase
+
+    original_connection = _LearningBase._connection
+
+    # Simulate a database error with sensitive-looking content
+    sensitive_error = sqlite3.Error(
+        "UNIQUE constraint failed: learning_goals.owner_user_id, learning_goals.title "
+        "INSERT INTO learning_goals (owner_user_id, kind, title) VALUES (12345, 'long_term', 'secret-project')"
+    )
+
+    class FailingCursor:
+        def __init__(self, real_cursor):
+            self._real_cursor = real_cursor
+        def execute(self, sql, params=None):
+            if "learning_goals" in sql and "SELECT" in sql:
+                raise sensitive_error
+            return self._real_cursor.execute(sql, params)
+        def __getattr__(self, name):
+            return getattr(self._real_cursor, name)
+
+    class FailingConnection:
+        def __init__(self, real_conn):
+            self._real_conn = real_conn
+        def cursor(self, *args, **kwargs):
+            real_cursor = self._real_conn.cursor(*args, **kwargs)
+            return FailingCursor(real_cursor)
+        def __getattr__(self, name):
+            return getattr(self._real_conn, name)
+
+    def failing_connection(self):
+        real_conn = original_connection(self)
+        return FailingConnection(real_conn)
+
+    monkeypatch.setattr(_LearningBase, "_connection", failing_connection)
+
+    try:
+        engine.export_learning(OWNER)
+        assert False, "Expected RuntimeError"
+    except RuntimeError as e:
+        err_msg = str(e)
+        # Repository and operation must be identified
+        assert "EducationalGoalsRepository" in err_msg
+        assert "list" in err_msg
+        # Raw SQL, values, constraint names must NOT appear
+        assert "UNIQUE constraint failed" not in err_msg
+        assert "INSERT INTO" not in err_msg
+        assert "VALUES" not in err_msg
+        assert "12345" not in err_msg
+        assert "secret-project" not in err_msg
+        assert "learning_goals.owner_user_id" not in err_msg
+        # Sanitized error format should be present
+        assert "Error: database operation failed" in err_msg
+
+
+def test_export_no_cross_user_leakage(engine):
+    """Export must not leak data from other users."""
+    # Owner 1 data
+    goal_id1, obj_ids1, curr_id1 = _seed_goal(engine)
+    _start_lesson(engine, curr_id1)
+
+    # Owner 2 data (create goal, objective, curriculum, but skip lesson for simplicity)
+    owner2 = 200
+    goal_id2 = engine.create_goal(owner2, kind="long_term", title="owner2 goal")
+    obj_id2 = engine.add_objective(owner2, goal_id=goal_id2, title="owner2 obj")
+    _ = engine.build_curriculum(owner2, goal_id2, title="owner2 curriculum")
+
+    # Export owner 1
+    exported = engine.export_learning(OWNER)
+
+    # Verify owner 1 data present
+    exported_goal_ids = {g["goal_id"] for g in exported["goals"]}
+    exported_obj_ids = {o["objective_id"] for o in exported["objectives"]}
+    assert goal_id1 in exported_goal_ids
+    assert all(oid in exported_obj_ids for oid in obj_ids1)
+
+    # Verify owner 2 data absent
+    assert goal_id2 not in exported_goal_ids
+    assert obj_id2 not in exported_obj_ids
+
+    # Verify all records belong to owner 1
+    for g in exported["goals"]:
+        assert g.get("owner_user_id") == OWNER
+    for o in exported["objectives"]:
+        assert o.get("owner_user_id") == OWNER
+    for c in exported["curricula"]:
+        assert c.get("owner_user_id") == OWNER
+    for l in exported["lessons"]:
+        assert l.get("owner_user_id") == OWNER
+
+
 def test_golden_eval_still_passes():
     results = run_all()
     assert results["all_passed"] is True
@@ -361,7 +937,7 @@ def test_session_set_step_and_complete_are_owner_scoped(engine):
     # The session must be untouched by the non-owner.
     row = store.sessions.get(OWNER, session_id)
     assert row["step"] != "COMPLETED"
-    assert store.events.list(OTHER, limit=50) == [] or True
+    assert store.events.list(OTHER, limit=50) == []
 
 
 def test_session_manager_get_rejects_other_owner(engine):

@@ -41,6 +41,55 @@ def _today() -> str:
     return datetime.utcnow().strftime(_DATE_FMT)
 
 
+class ExportErrorCollector:
+    """Operation-scoped error collector for export_learning.
+
+    Each export operation creates its own collector instance, ensuring
+    errors from one export never contaminate another. The collector
+    tracks repository name and operation for accurate error reporting
+    without exposing SQL parameters or sensitive data.
+    """
+
+    def __init__(self) -> None:
+        self._errors: List[Dict[str, str]] = []
+
+    def record(self, repository: str, operation: str, error: Exception) -> None:
+        """Record an error with repository and operation context.
+
+        The raw error message is sanitized before storage to prevent
+        leakage of SQL parameters, credentials, or sensitive data.
+        """
+        error_type = type(error).__name__
+        # Sanitize: keep only error type and a generic message
+        # Avoid exposing SQL details, credentials, or user data
+        sanitized_error = f"{error_type}: database operation failed"
+        self._errors.append({
+            "repository": repository,
+            "operation": operation,
+            "error": sanitized_error,
+        })
+
+    def has_errors(self) -> bool:
+        return len(self._errors) > 0
+
+    def get_errors(self) -> List[Dict[str, str]]:
+        return list(self._errors)
+
+    def clear(self) -> None:
+        self._errors.clear()
+
+    def summary(self) -> str:
+        """Return a concise summary for error messages (sanitized)."""
+        if not self._errors:
+            return ""
+        parts = []
+        for e in self._errors[:5]:
+            parts.append(f"{e['repository']}.{e['operation']}: {e['error']}")
+        if len(self._errors) > 5:
+            parts.append(f"... and {len(self._errors) - 5} more")
+        return "; ".join(parts)
+
+
 class AdaptiveLearningEngine:
     """Composition root for all Phase E learning use cases."""
 
@@ -186,8 +235,8 @@ class AdaptiveLearningEngine:
     # Curriculum
     # ------------------------------------------------------------------
     def build_curriculum(self, owner_user_id: int, goal_id: int, *,
-                         title: str, mode: str = "READ",
-                         objective_ids: Optional[List[int]] = None) -> Optional[Dict[str, Any]]:
+                          title: str, mode: str = "READ",
+                          objective_ids: Optional[List[int]] = None) -> Optional[Dict[str, Any]]:
         return self.curricula.build(
             owner_user_id=owner_user_id, goal_id=goal_id, title=title,
             mode=mode, objective_ids=objective_ids,
@@ -348,8 +397,8 @@ class AdaptiveLearningEngine:
                 "questions": [a.to_dict() for a in parsed]}
 
     def assessment(self, owner_user_id: int, objective_id: int, *,
-                   count: int = 3,
-                   kinds: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+                    count: int = 3,
+                    kinds: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         objective = self._store.objectives.get(owner_user_id, objective_id)
         lesson = None
         if objective is not None:
@@ -368,9 +417,9 @@ class AdaptiveLearningEngine:
         return [q.to_dict() for q in questions]
 
     def submit_assessment(self, owner_user_id: int, objective_id: int, *,
-                          questions: List[Dict[str, Any]],
-                          answers: Dict[int, str],
-                          session_id: Optional[int] = None) -> Dict[str, Any]:
+                           questions: List[Dict[str, Any]],
+                           answers: Dict[int, str],
+                           session_id: Optional[int] = None) -> Dict[str, Any]:
         parsed = [_question_from_dict(q) for q in questions]
         result = self.assessments.submit(
             owner_user_id=owner_user_id, objective_id=objective_id,
@@ -491,17 +540,17 @@ class AdaptiveLearningEngine:
             objectives_engaged=len(masteries),
             mastered=sum(1 for m in masteries if m.get("state") == "MASTERED"),
             near_mastery=sum(1 for m in masteries
-                             if m.get("state") == "NEAR_MASTERY"),
+                              if m.get("state") == "NEAR_MASTERY"),
             regressed=sum(1 for m in masteries if m.get("state") == "REGRESSED"),
             due_reviews=len(self.due_reviews(owner_user_id)),
             study_minutes_total=sum(
                 int(p.get("study_minutes") or 0)
                 for p in self._store.progress.range(owner_user_id, "0000-01-01",
-                                                    self._today())),
+                                                     self._today())),
             practice_count=sum(
                 int(p.get("practice_count") or 0)
                 for p in self._store.progress.range(owner_user_id, "0000-01-01",
-                                                    self._today())),
+                                                     self._today())),
             assessment_score_avg=self._avg_assessment(owner_user_id),
             misconceptions=len(self.misconceptions.for_owner(owner_user_id)),
         )
@@ -515,12 +564,12 @@ class AdaptiveLearningEngine:
         return round(100.0 * correct / len(rows), 2)
 
     def daily_plan(self, owner_user_id: int, *,
-                   day: Optional[str] = None,
-                   time_minutes: Optional[int] = None) -> Dict[str, Any]:
+                    day: Optional[str] = None,
+                    time_minutes: Optional[int] = None) -> Dict[str, Any]:
         return _as_dict(self.planner.plan_day(owner_user_id, day, time_minutes))
 
     def weekly_review(self, owner_user_id: int,
-                      days: int = 7) -> Dict[str, Any]:
+                       days: int = 7) -> Dict[str, Any]:
         result = self.review.weekly(owner_user_id, days)
         self._store.events.log(owner_user_id, "weekly_review", None, None,
                                {"period_end": result.period_end})
@@ -533,8 +582,8 @@ class AdaptiveLearningEngine:
     # Book-to-course
     # ------------------------------------------------------------------
     def book_course(self, owner_user_id: int, source_id: int, *,
-                    title: Optional[str] = None,
-                    mode: str = "READ") -> Optional[Dict[str, Any]]:
+                     title: Optional[str] = None,
+                     mode: str = "READ") -> Optional[Dict[str, Any]]:
         return self.books.create_course(
             owner_user_id=owner_user_id, source_id=source_id, title=title,
             mode=mode,
@@ -544,28 +593,61 @@ class AdaptiveLearningEngine:
     # Privacy
     # ------------------------------------------------------------------
     def export_learning(self, owner_user_id: int) -> Dict[str, Any]:
+        """Export all learning data for an owner.
+
+        Uses an operation-scoped error collector to ensure errors from
+        this export only affect this export. If any required repository
+        query fails, the entire export fails with a RuntimeError.
+        A genuinely empty dataset produces a valid empty export.
+        """
+        collector = ExportErrorCollector()
+
+        # Collect all data - pass collector to each repository call
+        goals = self._store.goals.list(owner_user_id, error_collector=collector)
+        objectives = [
+            dict(o) for g in goals
+            for o in self._store.objectives.list_for_goal(owner_user_id, g["goal_id"], error_collector=collector)
+        ]
+        curricula = [
+            dict(c) for g in goals
+            for c in self._store.curricula.list_for_goal(owner_user_id, g["goal_id"], error_collector=collector)
+        ]
+        lessons = self._store.lessons.list_for_owner(owner_user_id, error_collector=collector)
+        sessions = self._store.sessions.list_for_owner(owner_user_id, error_collector=collector)
+        events = self._store.events.list(owner_user_id, error_collector=collector)
+        mastery = self._store.mastery.list_for_owner(owner_user_id, error_collector=collector)
+        reviews = self._store.reviews.list(owner_user_id, error_collector=collector)
+        assessments = self._store.assessments.list(owner_user_id, error_collector=collector)
+        misconceptions = [
+            dict(m) for m in self.misconceptions.for_owner(owner_user_id, error_collector=collector)
+        ]
+        plans = self._store.plans.recent(owner_user_id, error_collector=collector)
+        progress = [
+            dict(p) for p in self._store.progress.range(owner_user_id,
+                                                        "0000-01-01", "9999-12-31",
+                                                        error_collector=collector)
+        ]
+
+        # Fail closed: if any repository call failed, raise RuntimeError
+        if collector.has_errors():
+            summary = collector.summary()
+            raise RuntimeError(
+                f"Export failed: {summary}"
+            )
+
         return {
-            "goals": self._store.goals.list(owner_user_id),
-            "objectives": [
-                dict(o) for g in self._store.goals.list(owner_user_id)
-                for o in self._store.objectives.list_for_goal(owner_user_id, g["goal_id"])
-            ],
-            "curricula": [
-                dict(c) for g in self._store.goals.list(owner_user_id)
-                for c in self._store.curricula.list_for_goal(owner_user_id, g["goal_id"])
-            ],
-            "mastery": self._store.mastery.list_for_owner(owner_user_id),
-            "reviews": self._store.reviews.list(owner_user_id),
-            "assessments": self._store.assessments.list(owner_user_id, limit=500),
-            "misconceptions": [
-                dict(m) for m in self.misconceptions.for_owner(owner_user_id)
-            ],
-            "plans": self._store.plans.recent(owner_user_id, 30),
-            "progress": [
-                dict(p) for p in self._store.progress.range(owner_user_id,
-                                                            "0000-01-01",
-                                                            "9999-12-31")
-            ],
+            "goals": goals,
+            "objectives": objectives,
+            "curricula": curricula,
+            "lessons": lessons,
+            "sessions": sessions,
+            "events": events,
+            "mastery": mastery,
+            "reviews": reviews,
+            "assessments": assessments,
+            "misconceptions": misconceptions,
+            "plans": plans,
+            "progress": progress,
         }
 
     def delete_learning(self, owner_user_id: int) -> bool:

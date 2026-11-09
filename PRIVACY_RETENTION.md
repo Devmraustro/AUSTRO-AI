@@ -24,7 +24,7 @@ This document describes the privacy guarantees, data retention rules, and deleti
 ### 1.3 What AUSTRO Does NOT Store
 - **Raw LLM Prompts:** User messages and AI prompts are NOT persisted to the database.
 - **LLM Responses:** AI-generated responses are NOT stored in the database (see telemetry below).
-- **API Keys/Secrets:** Bot token, Gemini key, or any secrets are never stored in database records.
+- **API Keys/Secrets:** Bot token, OpenRouter key, or any secrets are never stored in database records.
 - **Conversation Text:** Full conversation history is not stored as a monolithic blob; only audited events are logged.
 - **Knowledge search queries:** the text a user types into a knowledge search is NOT stored. Each
   search writes a `knowledge_retrieval_events` row with the counts, latency, generator and cited chunks,
