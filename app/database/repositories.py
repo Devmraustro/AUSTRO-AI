@@ -87,6 +87,38 @@ def _load_flags(raw: Any, length: int) -> List[bool]:
     return flags
 
 
+#: Maximum optimistic retries when two workers flip *different* tasks of the
+#: same plan at the same moment. Each loser re-reads and re-issues; the loop is
+#: bounded so a pathological writer cannot spin a bot worker forever.
+_CAS_MAX_ATTEMPTS = 5
+
+
+def _cas_key(raw: Any) -> Optional[str]:
+    """Normalise a raw ``daily_plans.completed_tasks`` value for comparison.
+
+    The column is ``TEXT`` on SQLite *and* PostgreSQL, and legacy rows hold a
+    JSON array, a ``{index: bool}`` object, ``''`` or ``NULL``. Instead of
+    asking the engine to parse JSON (``json_each`` on SQLite vs ``jsonb`` casts
+    on PostgreSQL - not portable), the compare-and-set is done on the *exact
+    text that was read*:
+
+    * a non-empty value is compared verbatim, so the UPDATE can only match a row
+      that still holds the state this worker saw;
+    * ``NULL`` and ``''`` are folded to ``None`` so a brand-new plan (``NULL``)
+      and an emptied one (``''``) compare alike.
+
+    Returning ``None`` means "the column is empty", and the statement then uses
+    ``IS NULL``/``= ''`` semantics explicitly.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        # A driver may hand back an already-decoded value; re-encode it so the
+        # comparison is still against the exact text in the column.
+        raw = json.dumps(raw)
+    return raw if raw != "" else None
+
+
 class _BaseRepository:
     """Shared helpers: locked access to the thread-local connection."""
 
@@ -337,32 +369,69 @@ class PlanRepository(_BaseRepository):
 
     def set_task_state(self, user_id: int, date: str, index: int,
                        done: bool) -> Optional[Dict[str, Any]]:
-        """Move one task to an explicit state, exactly once.
+        """Move one task to an explicit state, exactly once - across processes.
 
-        WHY THIS EXISTS (delivered-callback idempotency)
-        ------------------------------------------------
+        WHY THIS EXISTS (delivered-callback idempotency + atomicity)
+        -----------------------------------------------------------
         Telegram retries a callback query when the bot does not answer fast
-        enough, and two application workers can deliver the same tap
-        concurrently. A blind "flip whatever is stored" write is not
-        idempotent: two deliveries of ONE tap flip the task twice, so the
-        completion is silently lost (and, before the progress counter became
-        transition-aware, the weekly total flip-flopped 1 -> 0).
+        enough, and several application workers (each with its own Python
+        process, its own ``Database`` instance and therefore its own
+        ``threading.RLock``) can handle the same tap concurrently. Two
+        properties are required and neither can be provided by a Python lock:
 
-        The caller therefore states the state it wants (``done``), not a flip.
-        The read and the compare-and-set happen under the repository lock, so a
-        duplicate delivery finds the row already in the requested state and
-        writes nothing.
+        1. **Exactly one successful transition.** Two workers that both read
+           "not done" and both write "done" must not both report a transition,
+           otherwise ``progress.tasks_completed`` is incremented twice.
+        2. **Atomicity of state + accounting.** ``daily_plans.completed_tasks``
+           and ``progress.tasks_completed`` must move together - a failure
+           after one of them must leave neither applied.
+
+        Implementation
+        --------------
+        The transition is a single **conditional UPDATE**::
+
+            UPDATE daily_plans
+               SET completed_tasks = <json with index flipped>, status = ?
+             WHERE user_id = ? AND date = ?
+               AND COALESCE(completed_tasks, '') = ?
+
+        The ``WHERE`` clause carries the *exact text* this worker read (see
+        ``_cas_key``), so the storage engine - not Python - decides the race:
+        ``cursor.rowcount`` is 1 only for the statement that actually replaced
+        the old state, and 0 for every worker that arrived after it. This is
+        plain SQL-92 (``UPDATE``, ``COALESCE``, ``SET``/``WHERE``) and therefore
+        identical on SQLite and PostgreSQL; no ``RETURNING``, no ``json_each``,
+        no ``group_concat``/``string_agg`` and no engine-specific branch is
+        needed, so there is no dialect that can silently diverge.
+
+        ``rowcount == 0`` is not always a lost *transition*: it can also mean
+        two workers flipped two *different* tasks at the same time, in which
+        case the losing worker's intended state was never applied. The loop
+        therefore re-reads and re-issues a bounded number of times
+        (``_CAS_MAX_ATTEMPTS``); if the target state is already in place, the
+        answer is ``already`` - a repeated callback never counts twice no matter
+        which branch it takes.
+
+        The plan write and the accounting write share ONE transaction that is
+        committed here, right after the accounting ``INSERT ... ON CONFLICT``
+        (``ON CONFLICT`` on ``(user_id, date)`` is supported by SQLite 3.24+ and
+        PostgreSQL 9.5+, and the ``progress`` table already carries the
+        ``uq_progress_user_date`` unique index that the clause needs), so on any
+        failure both are rolled back.
 
         Returns ``None`` when the plan or the task index does not exist,
         otherwise:
-          * ``{"status": "changed", "done": <bool>, "task": <title>}``
-          * ``{"status": "already", "done": <bool>, "task": <title>}``
-        Only ``changed`` represents a real transition; callers must count
-        statistics from that status alone.
+          * ``{"status": "changed", "done": <bool>, "task": <title>,
+               "flags": [...]}``
+          * ``{"status": "already", "done": <bool>, "task": <title>,
+               "flags": [...]}``
+        Only ``changed`` represents a real transition; statistics are written
+        from that status alone.
         """
         try:
             with self._manager._lock:
-                cursor = self._connection().cursor()
+                connection = self._connection()
+                cursor = connection.cursor()
                 cursor.execute(
                     "SELECT tasks, completed_tasks FROM daily_plans "
                     "WHERE user_id = ? AND date = ?",
@@ -378,29 +447,114 @@ class PlanRepository(_BaseRepository):
                 tasks = _load_json_list(_col("tasks", 0))
                 if not 0 <= index < len(tasks):
                     return None
-                flags = _load_flags(_col("completed_tasks", 1), len(tasks))
 
                 task = tasks[index]
                 title = (task.get("task") or task.get("title")
                          if isinstance(task, dict) else str(task))
 
-                if flags[index] == bool(done):
-                    return {"status": "already", "done": bool(done),
-                            "task": title}
+                # Optimistic compare-and-set. Each attempt re-reads the raw
+                # column and issues ONE conditional UPDATE; the engine grants it
+                # to exactly one writer, so a repeated or concurrent callback
+                # can never produce two transitions.
+                for _attempt in range(_CAS_MAX_ATTEMPTS):
+                    raw_flags = _col("completed_tasks", 1)
+                    stored = _load_flags(raw_flags, len(tasks))
+                    if stored[index] == bool(done):
+                        return {"status": "already", "done": bool(done),
+                                "task": title, "flags": stored}
 
-                flags[index] = bool(done)
+                    flags = list(stored)
+                    flags[index] = bool(done)
+                    status = "completed" if flags and all(flags) else "pending"
+                    expected = _cas_key(raw_flags)
+
+                    # Two COMPLETE literal statements rather than a built-up
+                    # string: no SQL is ever assembled at runtime, so the
+                    # injection surface of a string-concatenated query is absent
+                    # (and static checkers see plain constants).
+                    if expected is None:
+                        # Empty/NULL column: match only rows still empty.
+                        cursor.execute(
+                            "UPDATE daily_plans SET completed_tasks = ?, status = ? "
+                            "WHERE user_id = ? AND date = ? "
+                            "AND COALESCE(completed_tasks, '') = ''",
+                            (json.dumps(flags), status, user_id, date),
+                        )
+                    else:
+                        cursor.execute(
+                            "UPDATE daily_plans SET completed_tasks = ?, status = ? "
+                            "WHERE user_id = ? AND date = ? "
+                            "AND COALESCE(completed_tasks, '') = ?",
+                            (json.dumps(flags), status, user_id, date, expected),
+                        )
+                    if cursor.rowcount == 1:
+                        break  # this worker owns the transition
+
+                    # Lost the race. Either the same task was just flipped by
+                    # another worker (=> "already" on the next read) or a
+                    # different task changed and our state was never applied
+                    # (=> retry with fresh text). Re-read and decide.
+                    connection.rollback()
+                    cursor.execute(
+                        "SELECT tasks, completed_tasks FROM daily_plans "
+                        "WHERE user_id = ? AND date = ?",
+                        (user_id, date),
+                    )
+                    row = cursor.fetchone()
+                    if row is None:
+                        return None
+                    tasks = _load_json_list(_col("tasks", 0))
+                    if not 0 <= index < len(tasks):
+                        return None
+                    task = tasks[index]
+                    title = (task.get("task") or task.get("title")
+                             if isinstance(task, dict) else str(task))
+                else:
+                    # The loop exhausted its attempts without owning the
+                    # transition: report no change rather than guess.
+                    current = self._read_flags(user_id, date, len(tasks))
+                    return {"status": "already", "done": bool(done),
+                            "task": title, "flags": current or
+                            [False] * len(tasks)}
+
+                # Accounting in the SAME transaction, then a single commit.
+                # The +1 only ever happens for a not-done -> done transition,
+                # which this statement has just owned.
+                delta = 1 if done else -1
                 cursor.execute(
-                    "UPDATE daily_plans SET completed_tasks = ?, status = ? "
-                    "WHERE user_id = ? AND date = ?",
-                    (json.dumps(flags),
-                     "completed" if flags and all(flags) else "pending",
-                     user_id, date),
+                    "INSERT INTO progress (user_id, date, tasks_completed) "
+                    "VALUES (?, ?, ?) "
+                    "ON CONFLICT (user_id, date) DO UPDATE SET "
+                    "tasks_completed = MAX(COALESCE(progress.tasks_completed, 0) + ?, 0)",
+                    (user_id, date, max(delta, 0), delta),
                 )
-                self._connection().commit()
-                return {"status": "changed", "done": bool(done), "task": title}
+                connection.commit()
+                return {"status": "changed", "done": bool(done),
+                        "task": title, "flags": flags}
         except DB_ERROR as e:
             self._rollback()
             logger.error(f"Database error in set_task_state: {e}")
+            return None
+
+    def _read_flags(self, user_id: int, date: str,
+                    length: int) -> Optional[List[bool]]:
+        """Read the current completion flags (helper for the lost-race path)."""
+        try:
+            with self._manager._lock:
+                cursor = self._connection().cursor()
+                cursor.execute(
+                    "SELECT completed_tasks FROM daily_plans "
+                    "WHERE user_id = ? AND date = ?",
+                    (user_id, date),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                raw = row["completed_tasks"] if isinstance(row, dict) else row[0]
+                return _load_flags(raw, length)
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in _read_flags: {e}")
             return None
 
     def set_completed(self, user_id: int, date: str,

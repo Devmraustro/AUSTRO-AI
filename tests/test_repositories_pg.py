@@ -618,6 +618,209 @@ def test_concurrent_writes_across_threads(pg_db):
     assert len(pg_db.get_all_user_ids()) == 9
 
 
+# ============================ TASK COMPLETION ATOMICITY ============================
+#
+# Real PostgreSQL, two independent connections (own DatabaseManager => own lock
+# and own psycopg2 connection). These are the engine-specific counterpart of
+# ``tests/test_task_completion_atomicity.py``: they prove the SAME conditional
+# UPDATE + accounting upsert is correct on PostgreSQL, where ``rowcount``,
+# ``ON CONFLICT`` and ``GREATEST`` replace the SQLite behaviour.
+
+
+def _pg_plan(pg_db, user_id=1, date=None):
+    """Seed a user + two-task plan; return the date used."""
+    from datetime import datetime
+
+    date = date or datetime.utcnow().strftime("%Y-%m-%d")
+    pg_db.create_user(user_id, f"u{user_id}", f"U{user_id}", "")
+    pg_db.plans.create(
+        user_id, date, [{"task": "A"}, {"task": "B"}], [], "20:00", "10",
+    )
+    return date
+
+
+def _pg_second_database():
+    """A second, fully independent Database (separate lock and connection)."""
+    from app.database.connection import DatabaseManager
+    from app.database.repositories import Database
+
+    manager = DatabaseManager()
+    return Database(manager), manager
+
+
+def _pg_weekly(database, user_id=1):
+    try:
+        return database.stats.dashboard(user_id)["weekly_tasks"]
+    finally:
+        database._manager._close_connection()
+
+
+def test_pg_repeated_completion_counts_once(pg_db):
+    date = _pg_plan(pg_db)
+
+    assert pg_db.plans.set_task_state(1, date, 0, True)["status"] == "changed"
+    for _ in range(3):
+        assert pg_db.plans.set_task_state(1, date, 0, True)["status"] == "already"
+
+    assert _pg_weekly(pg_db) == 1
+    assert pg_db.plans.get(1, date)["completed_tasks"] == [True, False]
+
+
+def test_pg_reopen_then_complete_again(pg_db):
+    date = _pg_plan(pg_db)
+
+    assert pg_db.plans.set_task_state(1, date, 0, True)["status"] == "changed"
+    assert _pg_weekly(pg_db) == 1
+    assert pg_db.plans.set_task_state(1, date, 0, False)["status"] == "changed"
+    assert _pg_weekly(pg_db) == 0
+    assert pg_db.plans.set_task_state(1, date, 0, True)["status"] == "changed"
+    assert _pg_weekly(pg_db) == 1
+
+
+def test_pg_two_independent_connections_race(pg_db):
+    """Two independent psycopg2 connections race one transition on real PG."""
+    date = _pg_plan(pg_db)
+    second, second_manager = _pg_second_database()
+    barrier = threading.Barrier(2)
+    statuses = {}
+
+    def worker(tag, database, manager):
+        try:
+            barrier.wait(timeout=30)
+            statuses[tag] = database.plans.set_task_state(1, date, 0, True)["status"]
+        finally:
+            manager._close_connection()
+
+    threads = [
+        threading.Thread(target=worker, args=("a", pg_db, pg_db._manager)),
+        threading.Thread(target=worker, args=("b", second, second_manager)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    assert sorted(statuses.values()) == ["already", "changed"], statuses
+    assert _pg_weekly(pg_db) == 1
+    assert pg_db.plans.get(1, date)["completed_tasks"] == [True, False]
+
+
+def test_pg_complete_vs_reopen_race_stays_consistent(pg_db):
+    """Concurrent complete + reopen must never double-credit on PostgreSQL."""
+    date = _pg_plan(pg_db)
+    barrier = threading.Barrier(4)
+    errors = []
+
+    def worker(done, tag):
+        database, manager = _pg_second_database() if tag else (pg_db, pg_db._manager)
+        try:
+            barrier.wait(timeout=30)
+            database.plans.set_task_state(1, date, 0, done)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+        finally:
+            manager._close_connection()
+
+    threads = [threading.Thread(target=worker, args=(index % 2 == 0, index % 2))
+               for index in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    assert errors == []
+    flags = pg_db.plans.get(1, date)["completed_tasks"]
+    # Counter is the exact inverse of the flag: no surplus from the race.
+    assert _pg_weekly(pg_db) == (1 if flags[0] else 0), flags
+
+
+def test_pg_failure_between_writes_rolls_back(pg_db, monkeypatch):
+    """A failure after the plan UPDATE must roll back the whole transaction."""
+    date = _pg_plan(pg_db)
+    from app.database.repositories import _BaseRepository
+
+    state = {"armed": False}
+    original = _BaseRepository._connection
+
+    class FailingCursor:
+        def __init__(self, cursor):
+            self._cursor = cursor
+
+        def execute(self, sql, *args, **kwargs):
+            upper = str(sql).upper()
+            if not state["armed"] and upper.lstrip().startswith("UPDATE DAILY_PLANS"):
+                state["armed"] = True
+            elif state["armed"] and "INSERT INTO PROGRESS" in upper:
+                state["armed"] = False
+                raise psycopg2.OperationalError("injected failure between writes")
+            return self._cursor.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._cursor, name)
+
+    class FailingConnection:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def cursor(self):
+            return FailingCursor(self._connection.cursor())
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    monkeypatch.setattr(
+        _BaseRepository, "_connection",
+        lambda self: FailingConnection(original(self)),
+    )
+    try:
+        outcome = pg_db.plans.set_task_state(1, date, 0, True)
+    finally:
+        monkeypatch.undo()
+
+    assert state["armed"] is False, "the failure was never injected"
+    assert outcome is None
+    assert pg_db.plans.get(1, date)["completed_tasks"] in (None, [False, False])
+    assert _pg_weekly(pg_db) == 0
+
+    # Retry succeeds and counts exactly once.
+    assert pg_db.plans.set_task_state(1, date, 0, True)["status"] == "changed"
+    assert pg_db.plans.set_task_state(1, date, 0, True)["status"] == "already"
+    assert _pg_weekly(pg_db) == 1
+
+
+def test_pg_accounting_uses_greatest_clamp(pg_db):
+    """A reopen with no matching credit clamps at 0, not -1."""
+    from datetime import datetime
+
+    date = _pg_plan(pg_db)
+    conn = pg_db._get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE daily_plans SET completed_tasks = %s WHERE user_id = %s AND date = %s",
+        ("[true, false]", 1, date),
+    )
+    cursor.execute(
+        "INSERT INTO progress (user_id, date, tasks_completed) VALUES (%s, %s, 0) "
+        "ON CONFLICT (user_id, date) DO UPDATE SET tasks_completed = 0",
+        (1, date),
+    )
+    conn.commit()
+
+    assert pg_db.plans.set_task_state(1, date, 0, False)["status"] == "changed"
+    assert _pg_weekly(pg_db) == 0
+
+    cursor.execute(
+        "SELECT tasks_completed FROM progress WHERE user_id = %s AND date = %s",
+        (1, date),
+    )
+    assert cursor.fetchone()[0] == 0
+
+    # And a real completion afterwards still counts once.
+    assert pg_db.plans.set_task_state(1, date, 0, True)["status"] == "changed"
+    assert _pg_weekly(pg_db) == 1
+    assert datetime.utcnow()  # keep the import meaningful for readers
+
+
 # ============================ SCHEDULER ============================
 
 

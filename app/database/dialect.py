@@ -21,6 +21,7 @@ Two layers:
    - INSERT OR IGNORE INTO <t> ...   ->  INSERT ... ON CONFLICT DO NOTHING
    - scalar MAX(a, b)                ->  GREATEST(a, b)  (SQLite-only aggregate
                                           form; e.g. longest_streak rule)
+   - INSERT ... RETURNING <pk>       ->  unchanged (PostgreSQL native)
    - INSERT INTO <auto-id table> ... ->  INSERT ... RETURNING <pk>
    It also emulates `cursor.lastrowid` (not available in psycopg2) and
    normalizes result rows so PostgreSQL values match what SQLite returns to the

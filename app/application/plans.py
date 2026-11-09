@@ -41,12 +41,14 @@ class PlanService:
                       done: bool) -> Optional[Dict[str, Any]]:
         """Move one task to an explicit completion state, exactly once.
 
-        Statistics are incremented from the repository's *transition* status
-        only ("changed"), never from the request: a duplicate Telegram delivery
-        (a retried callback query, or two workers handling the same tap) must
-        not count the same completion twice. ``done=False`` reverses a single
-        completion, clamped at zero.
+        The state write and the ``progress.tasks_completed`` accounting happen
+        in ONE database transaction inside ``PlanRepository.set_task_state``:
+        there is deliberately no second write here. Splitting them (the earlier
+        shape) left a committed plan row with an uncounted statistic whenever
+        the second step failed, and let two independent processes - each with
+        its own Python lock - both report a transition.
 
+        ``done=False`` reverses a single completion (clamped at zero).
         Returns the updated plan with ``just_completed_task`` /
         ``just_reopened_task`` set, or ``None`` when the plan/task is missing.
         """
@@ -54,18 +56,18 @@ class PlanService:
         if outcome is None:
             return None
 
-        if outcome["status"] == "changed":
-            self._db.stats.log_completed_task(
-                user_id, date, delta=1 if outcome["done"] else -1,
-            )
-
         plan = self.for_date(user_id, date)
         if plan is None:
             return None
+        # Announce a completion/reopen ONLY when this call owned a real
+        # transition. ``outcome["status"] == "already"`` means the task was
+        # already in the requested state (a retried callback, or a second
+        # worker), so the user must not be congratulated twice.
+        changed = outcome["status"] == "changed"
         plan["just_completed_task"] = (
-            outcome["task"] if outcome["done"] else None)
+            outcome["task"] if changed and outcome["done"] else None)
         plan["just_reopened_task"] = (
-            None if outcome["done"] else outcome["task"])
+            outcome["task"] if changed and not outcome["done"] else None)
         plan["transition"] = outcome["status"]
         plan.update(self.task_progress(plan))
         return plan
