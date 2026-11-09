@@ -424,9 +424,15 @@ class PlanRepository(_BaseRepository):
           * ``{"status": "changed", "done": <bool>, "task": <title>,
                "flags": [...]}``
           * ``{"status": "already", "done": <bool>, "task": <title>,
-               "flags": [...]}``
+               "flags": [...]}``      - the task is provably in the requested
+               state; this call did not move it
+          * ``{"status": "contended", "done": <bool>, "task": <title>,
+               "flags": [...]}``      - the state is UNKNOWN/unchanged after
+               ``_CAS_MAX_ATTEMPTS`` attempts because the row kept changing;
+               nothing was applied and the caller may retry
         Only ``changed`` represents a real transition; statistics are written
-        from that status alone.
+        from that status alone. ``already`` is never reported without a read
+        that proves the requested state, and ``contended`` never claims one.
         """
         try:
             with self._manager._lock:
@@ -510,12 +516,24 @@ class PlanRepository(_BaseRepository):
                     title = (task.get("task") or task.get("title")
                              if isinstance(task, dict) else str(task))
                 else:
-                    # The loop exhausted its attempts without owning the
-                    # transition: report no change rather than guess.
-                    current = self._read_flags(user_id, date, len(tasks))
-                    return {"status": "already", "done": bool(done),
-                            "task": title, "flags": current or
-                            [False] * len(tasks)}
+                    # Attempts exhausted without this worker ever owning the
+                    # transition. This does NOT prove the task reached the
+                    # requested state: another writer may still be flipping it,
+                    # and the last compare-and-set may have been rejected
+                    # because the row kept changing under us. Reporting
+                    # "already" here would claim a success nobody verified, so
+                    # the outcome is decided by a real read (and only a read):
+                    #   * target state present  -> "already" (genuinely applied)
+                    #   * target state absent   -> "contended" (nothing applied,
+                    #                              safe to retry)
+                    verified = self._read_flags(user_id, date, len(tasks))
+                    if verified is None:
+                        return None
+                    if verified[index] == bool(done):
+                        return {"status": "already", "done": bool(done),
+                                "task": title, "flags": verified}
+                    return {"status": "contended", "done": bool(done),
+                            "task": title, "flags": verified}
 
                 # Accounting in the SAME transaction, then a single commit.
                 # The +1 only ever happens for a not-done -> done transition,

@@ -821,6 +821,65 @@ def test_pg_accounting_uses_greatest_clamp(pg_db):
     assert _pg_weekly(pg_db) == 1
 
 
+def test_pg_exhausted_attempts_report_contended_not_already(pg_db, monkeypatch):
+    """Exhaustion on real PostgreSQL must not claim an unverified success."""
+    import app.database.repositories as repositories
+    from app.database.repositories import _BaseRepository
+
+    date = _pg_plan(pg_db)
+    monkeypatch.setattr(repositories, "_CAS_MAX_ATTEMPTS", 1)
+    original = _BaseRepository._connection
+    state = {"lost": False}
+
+    class _StubbornCursor:
+        def __init__(self, cursor):
+            self._cursor = cursor
+
+        def execute(self, sql, *args, **kwargs):
+            if str(sql).lstrip().upper().startswith("UPDATE DAILY_PLANS"):
+                state["lost"] = True
+                self._cursor.execute("SELECT 1 WHERE 1 = 0")
+                return None
+            self._cursor.execute(sql, *args, **kwargs)
+            return None
+
+        @property
+        def rowcount(self):
+            return 0 if state["lost"] else self._cursor.rowcount
+
+        def __getattr__(self, name):
+            return getattr(self._cursor, name)
+
+    class _Connection:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def cursor(self):
+            return _StubbornCursor(self._connection.cursor())
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    monkeypatch.setattr(
+        _BaseRepository, "_connection",
+        lambda self: _Connection(original(self)),
+    )
+    try:
+        outcome = pg_db.plans.set_task_state(1, date, 0, True)
+    finally:
+        monkeypatch.undo()
+
+    assert state["lost"] is True
+    assert outcome["status"] == "contended"
+    assert pg_db.plans.get(1, date)["completed_tasks"] in (None, [False, False])
+    assert _pg_weekly(pg_db) == 0
+
+    # A retry after the contention clears counts exactly once.
+    assert pg_db.plans.set_task_state(1, date, 0, True)["status"] == "changed"
+    assert pg_db.plans.set_task_state(1, date, 0, True)["status"] == "already"
+    assert _pg_weekly(pg_db) == 1
+
+
 # ============================ SCHEDULER ============================
 
 

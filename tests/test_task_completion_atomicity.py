@@ -163,6 +163,60 @@ def _install_failure(monkeypatch, trigger="INSERT INTO PROGRESS"):
     return state
 
 
+class _StubbornCursor:
+    """Cursor whose compare-and-set always LOSES (``rowcount`` stays 0).
+
+    Simulates a row that keeps changing under the writer, i.e. the one situation
+    the optimistic loop can run out of attempts in. Reads work normally, so the
+    post-loop verification sees the real state.
+    """
+
+    def __init__(self, cursor, state):
+        self._cursor = cursor
+        self._state = state
+
+    def execute(self, sql, *args, **kwargs):
+        if sql.lstrip().upper().startswith("UPDATE DAILY_PLANS"):
+            self._state["lost"] = True
+            self._cursor.execute(
+                "SELECT 1 WHERE 0"  # a statement that matches no rows
+            )
+            return None
+        self._cursor.execute(sql, *args, **kwargs)
+        return None
+
+    @property
+    def rowcount(self):
+        return 0 if self._state["lost"] else self._cursor.rowcount
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
+def _always_lose(monkeypatch):
+    """Make every compare-and-set in the next transition lose."""
+    from app.database.repositories import _BaseRepository
+
+    state = {"lost": False}
+    original = _BaseRepository._connection
+
+    class _Connection:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def cursor(self):
+            return _StubbornCursor(self._connection.cursor(), state)
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    monkeypatch.setattr(
+        _BaseRepository, "_connection", lambda self: _Connection(original(self)),
+    )
+    return state
+
+
+
 # ---------------------------------------------------------------------------
 # 1. Sequential repetition
 # ---------------------------------------------------------------------------
@@ -655,3 +709,137 @@ def test_service_missing_plan_returns_none(db_path):
         assert service.set_task_done(OWNER, "1999-01-01", 0, False) is None
     finally:
         database._manager._close_connection()
+
+
+# ---------------------------------------------------------------------------
+# 6. Exhausted attempts must never be reported as a success
+# ---------------------------------------------------------------------------
+
+
+def test_exhausted_attempts_report_contended_not_already(db_path, monkeypatch):
+    """THE failure this section exists for.
+
+    When the optimistic loop runs out of attempts it has applied NOTHING, so it
+    must not answer "already" (which the bot renders as "the task is already
+    updated"). The outcome must be ``contended`` and the task must still be
+    incomplete.
+    """
+    import app.database.repositories as repositories
+
+    date = _seed(db_path)
+    monkeypatch.setattr(repositories, "_CAS_MAX_ATTEMPTS", 1)
+    state = _always_lose(monkeypatch)
+
+    database = _database(db_path)
+    try:
+        outcome = database.plans.set_task_state(OWNER, date, 0, True)
+    finally:
+        database._manager._close_connection()
+        monkeypatch.undo()
+
+    assert state["lost"] is True, "the compare-and-set never ran"
+    assert outcome is not None
+    assert outcome["status"] == "contended", (
+        f"exhaustion was reported as {outcome['status']!r}, which claims a "
+        "success nobody verified"
+    )
+    # Nothing was applied, and nothing was counted.
+    assert _flags(db_path, date) in (None, [False, False])
+    assert _weekly_tasks(db_path) == 0
+
+
+def test_contended_transition_is_safe_to_retry(db_path, monkeypatch):
+    """A contended result leaves the data retryable, and a retry counts once."""
+    import app.database.repositories as repositories
+
+    date = _seed(db_path)
+    monkeypatch.setattr(repositories, "_CAS_MAX_ATTEMPTS", 1)
+    _always_lose(monkeypatch)
+    database = _database(db_path)
+    try:
+        first = database.plans.set_task_state(OWNER, date, 0, True)
+    finally:
+        database._manager._close_connection()
+        monkeypatch.undo()
+
+    assert first["status"] == "contended"
+    assert _weekly_tasks(db_path) == 0
+
+    # The user taps again (the handler tells them to): a real transition now
+    # happens, exactly once.
+    assert _transition(db_path, 0, True, date) == "changed"
+    assert _transition(db_path, 0, True, date) == "already"
+    assert _weekly_tasks(db_path) == 1
+    assert _flags(db_path, date) == [True, False]
+
+
+def test_already_is_only_reported_after_a_read_that_proves_it(db_path, monkeypatch):
+    """``already`` requires the requested state to be verifiably present.
+
+    With zero attempts available the loop cannot change anything, so both
+    outcomes come from the verification read alone: the requested state present
+    => ``already``; absent => ``contended``. A blank "already" is impossible.
+    """
+    import app.database.repositories as repositories
+
+    date = _seed(db_path)
+    monkeypatch.setattr(repositories, "_CAS_MAX_ATTEMPTS", 0)
+
+    # (a) The task really is done already -> "already" is the truth.
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "UPDATE daily_plans SET completed_tasks = ? WHERE user_id = ? AND date = ?",
+        ("[true, false]", OWNER, date),
+    )
+    conn.commit()
+    conn.close()
+
+    database = _database(db_path)
+    try:
+        proven = database.plans.set_task_state(OWNER, date, 0, True)
+    finally:
+        database._manager._close_connection()
+
+    assert proven["status"] == "already"
+    assert proven["flags"] == [True, False], "the proven state was misread"
+
+    # (b) The task is NOT done -> the same exhaustion must not say "already".
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "UPDATE daily_plans SET completed_tasks = NULL WHERE user_id = ? AND date = ?",
+        (OWNER, date),
+    )
+    conn.commit()
+    conn.close()
+
+    database = _database(db_path)
+    try:
+        unproven = database.plans.set_task_state(OWNER, date, 0, True)
+    finally:
+        database._manager._close_connection()
+
+    assert unproven["status"] == "contended", (
+        "reported 'already' for a task that is demonstrably not done"
+    )
+    assert _weekly_tasks(db_path) == 0
+
+
+def test_service_announces_nothing_for_a_contended_transition(db_path, monkeypatch):
+    """No completion/reopen banner may be produced for a contended result."""
+    import app.database.repositories as repositories
+
+    date = _seed(db_path)
+    monkeypatch.setattr(repositories, "_CAS_MAX_ATTEMPTS", 1)
+    _always_lose(monkeypatch)
+    service, database = _service(db_path)
+    try:
+        plan = service.set_task_done(OWNER, date, 0, True)
+    finally:
+        database._manager._close_connection()
+        monkeypatch.undo()
+
+    assert plan is not None
+    assert plan["transition"] == "contended"
+    assert plan["just_completed_task"] is None, "announced a completion that never happened"
+    assert plan["just_reopened_task"] is None
+    assert _weekly_tasks(db_path) == 0

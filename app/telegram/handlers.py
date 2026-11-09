@@ -685,6 +685,15 @@ async def plan_complete_task(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("تعذر تحديث المهمة", show_alert=True)
         return None
 
+    if plan.get("transition") == "contended":
+        # The transition was NOT applied (the row kept changing under the
+        # compare-and-set). Never tell the user it succeeded: state it plainly
+        # and let them tap again.
+        await query.answer(
+            "⏳ تعذّر تحديث المهمة مؤقتًا، حاول مرة أخرى بعد لحظات",
+            show_alert=True,
+        )
+        return None
     if plan.get("transition") == "already":
         note = "ℹ️ هذه المهمة محدَّثة بالفعل" + (" ✅" if done else "")
     elif done:

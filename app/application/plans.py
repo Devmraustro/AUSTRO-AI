@@ -60,9 +60,10 @@ class PlanService:
         if plan is None:
             return None
         # Announce a completion/reopen ONLY when this call owned a real
-        # transition. ``outcome["status"] == "already"`` means the task was
-        # already in the requested state (a retried callback, or a second
-        # worker), so the user must not be congratulated twice.
+        # transition. ``"already"`` means the task was already in the requested
+        # state (a retried callback, or a second worker), so the user must not
+        # be congratulated twice. ``"contended"`` means the requested state is
+        # NOT established either - nothing may be announced for it.
         changed = outcome["status"] == "changed"
         plan["just_completed_task"] = (
             outcome["task"] if changed and outcome["done"] else None)

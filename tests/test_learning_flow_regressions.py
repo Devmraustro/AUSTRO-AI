@@ -833,3 +833,144 @@ def test_study_session_has_a_deterministic_local_generator():
     assert "جلسة دراسة" in out
     assert "التشفير" in out
     assert "دقائق" in out
+
+
+@pytest.mark.asyncio
+async def test_contended_completion_never_claims_the_task_was_updated(monkeypatch):
+    """A transition that was NOT applied must never be reported as done.
+
+    The optimistic compare-and-set can run out of attempts while the row keeps
+    changing. That outcome used to be reported as "already", so the bot told the
+    user the task was updated when in fact nothing had been written. The handler
+    must instead say the update could not be applied right now (and allow a
+    retry), and it must not re-render the plan as if it had succeeded.
+    """
+    container = _container()
+    _plan_owner(container)
+    today = _today()
+    container.plans.create(NewPlan(
+        user_id=OWNER, date=today, tasks=[{"task": "مهمة"}],
+        priorities=[], review_time="20:00", break_time="10",
+    ))
+
+    import app.database.repositories as repositories
+
+    # Force exhaustion (one attempt) and make every compare-and-set lose.
+    monkeypatch.setattr(repositories, "_CAS_MAX_ATTEMPTS", 1)
+    original = repositories._BaseRepository._connection
+    state = {"lost": False}
+
+    class _StubbornCursor:
+        def __init__(self, cursor):
+            self._cursor = cursor
+
+        def execute(self, sql, *args, **kwargs):
+            if sql.lstrip().upper().startswith("UPDATE DAILY_PLANS"):
+                state["lost"] = True
+                self._cursor.execute("SELECT 1 WHERE 0")
+                return None
+            self._cursor.execute(sql, *args, **kwargs)
+            return None
+
+        @property
+        def rowcount(self):
+            return 0 if state["lost"] else self._cursor.rowcount
+
+        def __getattr__(self, name):
+            return getattr(self._cursor, name)
+
+    class _Connection:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def cursor(self):
+            return _StubbornCursor(self._connection.cursor())
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    monkeypatch.setattr(
+        repositories._BaseRepository, "_connection",
+        lambda self: _Connection(original(self)),
+    )
+
+    update = _FakeUpdate(callback=True, data="plan_task_0")
+    await H.plan_complete_task(update, _FakeContext(container))
+
+    assert state["lost"] is True, "the compare-and-set never ran"
+    message = update.callback_query.answer.call_args
+    text = message.args[0] if message.args else ""
+    assert "بالفعل" not in text, (
+        f"the bot claimed the task was already updated: {text!r}"
+    )
+    assert "تعذّر" in text or "حاول" in text, f"no retry hint given: {text!r}"
+    assert message.kwargs.get("show_alert") is True
+
+    # Nothing was written and nothing was counted.
+    assert container.plans.for_date(OWNER, today)["completed_tasks"] in (None, [False])
+    assert container.dashboard.stats(OWNER)["weekly_tasks"] == 0
+    assert not _rendered(update).strip(), "the plan was re-rendered as if updated"
+
+
+@pytest.mark.asyncio
+async def test_contended_completion_still_allows_a_successful_retry(monkeypatch):
+    """The user can simply tap again once the contention clears."""
+    container = _container()
+    _plan_owner(container)
+    today = _today()
+    container.plans.create(NewPlan(
+        user_id=OWNER, date=today, tasks=[{"task": "مهمة"}],
+        priorities=[], review_time="20:00", break_time="10",
+    ))
+
+    import app.database.repositories as repositories
+
+    monkeypatch.setattr(repositories, "_CAS_MAX_ATTEMPTS", 1)
+    original = repositories._BaseRepository._connection
+    state = {"lost": False}
+
+    class _StubbornCursor:
+        def __init__(self, cursor):
+            self._cursor = cursor
+
+        def execute(self, sql, *args, **kwargs):
+            if sql.lstrip().upper().startswith("UPDATE DAILY_PLANS"):
+                state["lost"] = True
+                self._cursor.execute("SELECT 1 WHERE 0")
+                return None
+            self._cursor.execute(sql, *args, **kwargs)
+            return None
+
+        @property
+        def rowcount(self):
+            return 0 if state["lost"] else self._cursor.rowcount
+
+        def __getattr__(self, name):
+            return getattr(self._cursor, name)
+
+    class _Connection:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def cursor(self):
+            return _StubbornCursor(self._connection.cursor())
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    monkeypatch.setattr(
+        repositories._BaseRepository, "_connection",
+        lambda self: _Connection(original(self)),
+    )
+    first = _FakeUpdate(callback=True, data="plan_task_0")
+    await H.plan_complete_task(first, _FakeContext(container))
+    assert container.dashboard.stats(OWNER)["weekly_tasks"] == 0
+
+    # Contention clears; the same tap now really completes the task.
+    monkeypatch.undo()
+    monkeypatch.setattr(repositories, "_CAS_MAX_ATTEMPTS", 5)
+    retry = _FakeUpdate(callback=True, data="plan_task_0")
+    await H.plan_complete_task(retry, _FakeContext(container))
+
+    assert container.dashboard.stats(OWNER)["weekly_tasks"] == 1
+    assert "✅" in (retry.callback_query.answer.call_args.args[0] or "")
