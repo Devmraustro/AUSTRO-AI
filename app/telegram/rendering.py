@@ -107,61 +107,74 @@ def strip_markdown(text: str) -> str:
     return cleaned
 
 
-def _unescaped_count(text: str, marker: str) -> int:
-    """Count ``marker`` occurrences that are neither escaped nor inside code.
+def _marker_positions(text: str, marker: str) -> List[int]:
+    """Return unescaped delimiter positions outside inline/fenced code.
 
-    Telegram's legacy Markdown supports ``\\*``/``\\_``/``\\```` escapes, so an
-    escaped marker is *valid* markup and must never be stripped - doing that
-    turned ``@Mr\\_Austro`` into ``@Mr\\Austro`` and broke the rendered name.
+    Delimiters inside code and escaped delimiters are literal content. Keeping
+    their positions ensures repair removes the actual unmatched delimiter,
+    never a later escaped character or a literal delimiter inside code.
     """
-    count = 0
+    positions: List[int] = []
     index = 0
-    in_code = False
+    in_fence = False
+    in_inline = False
+    tick = chr(96)
+    triple = tick * 3
     while index < len(text):
         char = text[index]
-        if text.startswith("```", index):
-            in_code = not in_code
+        if char == "\\" and index + 1 < len(text):
+            index += 2
+            continue
+        if text.startswith(triple, index) and not in_inline:
+            if marker == triple:
+                positions.append(index)
+            in_fence = not in_fence
             index += 3
             continue
-        if char == "`":
-            in_code = not in_code
+        if char == tick and not in_fence:
+            if marker == tick:
+                positions.append(index)
+            in_inline = not in_inline
             index += 1
             continue
-        if char == "\\" and index + 1 < len(text):
-            index += 2  # the escaped character is literal content
-            continue
-        if not in_code and text.startswith(marker, index):
-            count += 1
+        if not in_fence and not in_inline and text.startswith(marker, index):
+            positions.append(index)
             index += len(marker)
             continue
         index += 1
-    return count
+    return positions
+
+
+def _unescaped_count(text: str, marker: str) -> int:
+    """Count unescaped marker delimiters outside code spans."""
+    return len(_marker_positions(text, marker))
 
 
 def _balanced(text: str, marker: str) -> bool:
-    """True when ``marker`` occurs an even number of unescaped times."""
+    """True when marker occurs an even number of unescaped times."""
     return _unescaped_count(text, marker) % 2 == 0
 
 
 def normalize_markup(text: str) -> str:
-    """Return ``text`` with Telegram-Markdown-breaking input neutralised.
+    """Return text with Telegram-Markdown-breaking input neutralised.
 
     The legacy parser has no escaping for plain text, so the only safe repair
     is to drop stray emphasis/code markers. This keeps the message sendable
-    *with* formatting for the parts that are valid, instead of falling back to
+    with formatting for the parts that are valid, instead of falling back to
     plain text for the entire answer.
     """
     cleaned = text or ""
-    for marker in ("*", "_", "`", "~~"):
+    for marker in (chr(96) * 3, chr(96), "*", "_", "~~"):
         while not _balanced(cleaned, marker):
-            # Drop the last unmatched occurrence, which is the one the parser
-            # would choke on; keep everything before it intact.
-            index = cleaned.rfind(marker)
-            if index < 0:
+            # The final unescaped delimiter is unmatched. Remove that exact
+            # occurrence; raw substring search could consume a valid escape
+            # or a literal delimiter inside a code span.
+            positions = _marker_positions(cleaned, marker)
+            if not positions:
                 break
+            index = positions[-1]
             cleaned = cleaned[:index] + cleaned[index + len(marker):]
     return cleaned
-
 
 def _is_parse_error(error: BaseException) -> bool:
     """True when Telegram rejected the *formatting* of a message.
