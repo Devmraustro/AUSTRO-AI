@@ -392,6 +392,12 @@ async def test_unbalanced_markers_are_repaired_before_sending():
     assert render.normalize_markup("2 * 3 = 6") == "2  3 = 6"
     # An ESCAPED underscore is valid markup and must be preserved.
     assert render.normalize_markup("@Mr\\_Austro") == "@Mr\\_Austro"
+    tick = chr(96)
+    assert render.normalize_markup("_broken @Mr\\_Austro") == "broken @Mr\\_Austro"
+    assert render.normalize_markup("bad *text\\*") == "bad text\\*"
+    assert render.normalize_markup("_broken " + tick + "code_" + tick) == "broken " + tick + "code_" + tick
+    assert render.normalize_markup("unclosed " + tick + "code") == "unclosed code"
+    assert render.normalize_markup("unclosed " + tick * 3 + "python\\nprint(1)") == "unclosed python\\nprint(1)"
 
 
 @pytest.mark.asyncio
