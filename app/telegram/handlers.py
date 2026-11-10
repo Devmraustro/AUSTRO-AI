@@ -49,9 +49,11 @@ from app.core.container import get_services
 from app.core.errors import ValidationError
 from app.domain.entities import DailyReviewData, NewGoal, NewHabit, NewPlan
 from app.security.rate_limiter import get_rate_limit_middleware
+from app.telegram import rendering as render
 
 import io
 import json
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +116,8 @@ ENTRY_POINT_RATELIMITS: dict[str, str] = {
     "learn_review_grade": COMMAND,
     "menu_learn_plan": COMMAND,
     "menu_learn_week": COMMAND,
+    "progress_stats": COMMAND,
+    "plan_complete_task": COMMAND,
     # --- conversation entry points: charged once per started flow ---
     "start_registration": COMMAND,
     "goal_new": COMMAND,
@@ -125,6 +129,7 @@ ENTRY_POINT_RATELIMITS: dict[str, str] = {
     "review_daily": COMMAND,
     "habit_new": COMMAND,
     "learn_newgoal": COMMAND,
+    "study_session": COMMAND,
     # --- AI-producing entry points: per-user AI + global AI budget ---
     "study_topic": AI,
     "study_duration": AI,
@@ -136,6 +141,9 @@ ENTRY_POINT_RATELIMITS: dict[str, str] = {
     "menu_learn_next": AI,
     "learn_objectives_text": AI,
     "knowledge_question": AI,
+    "prog_concept": AI,
+    "study_session_topic": AI,
+    "discipline_challenge": COMMAND,
     # --- document upload: transfer budget + ingestion pipeline budget ---
     "knowledge_document": UPLOAD,
     # --- expensive operation: makes a real, billable provider health call ---
@@ -146,6 +154,9 @@ ENTRY_POINT_RATELIMITS: dict[str, str] = {
     # Single dispatcher for every plain-text message; the flows it forwards to
     # are charged at their own entry points (see text_router's docstring).
     "text_router": NONE,
+    # Second target of text_router (prog_concept_mode); the flow is charged at
+    # `prog_concept` when the user taps the button.
+    "prog_concept_text": NONE,
     "_ingest_book": NONE,      # background task; charged at knowledge_document
 }
 
@@ -223,7 +234,7 @@ async def fallback_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Never rate limited: a throttled user must always be able to escape.
     """
     if update and getattr(update, "message", None):
-        await update.message.reply_text("تم الإلغاء")
+        await render.reply(update.message, "تم الإلغاء")
     elif update and getattr(update, "callback_query", None):
         await update.callback_query.answer("تم الإلغاء")
     return ConversationHandler.END
@@ -257,7 +268,7 @@ async def start_registration(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
 
-    await query.edit_message_text(
+    await render.edit(query,
         "📝 **التسجيل - الخطوة 1/5**\n\nما هو عمرك؟",
         parse_mode="Markdown",
     )
@@ -277,7 +288,7 @@ async def reg_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.message.reply_text(
+    await render.reply(update.message,
         "📝 **التسجيل - الخطوة 2/5**\n\nما هو مستواك التعليمي؟",
         reply_markup=reply_markup,
         parse_mode="Markdown",
@@ -299,7 +310,7 @@ async def reg_education(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["education"] = education_map.get(query.data, "غير محدد")
 
-    await query.edit_message_text(
+    await render.edit(query,
         "📝 **التسجيل - الخطوة 3/5**\n\nما هي أهدافك الرئيسية؟ (اكتبها مفصولة بفواصل)\n"
         "مثال: تعلم البرمجة, تحسين الإنجليزية, بناء عادات صحية"
     )
@@ -311,7 +322,7 @@ async def reg_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     goals = [g.strip() for g in update.message.text.split(",")]
     context.user_data["goals"] = goals
 
-    await update.message.reply_text(
+    await render.reply(update.message,
         "📝 **التسجيل - الخطوة 4/5**\n\nكم ساعة متاحة لديك يومياً للدراسة/التعلم؟\n"
         "مثال: 2-3 ساعات"
     )
@@ -335,7 +346,7 @@ async def reg_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("🚀 ابدأ الآن", callback_data="menu_main")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.message.reply_text(
+    await render.reply(update.message,
         ARABIC_RESPONSES["profile_created"],
         reply_markup=reply_markup,
         parse_mode="Markdown",
@@ -365,7 +376,7 @@ async def menu_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     goals_text = "لا توجد أهداف حالياً." if not goals else f"لديك {len(goals)} هدف/أهداف."
 
-    await query.edit_message_text(
+    await render.edit(query,
         f"🎯 **أهدافك**\n\n{goals_text}",
         reply_markup=reply_markup,
         parse_mode="Markdown",
@@ -379,7 +390,7 @@ async def goal_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    await query.edit_message_text(
+    await render.edit(query,
         "🎯 **هدف جديد - الخطوة 1/5**\n\nما هو عنوان هدفك؟"
     )
     return GOAL_TITLE
@@ -388,7 +399,7 @@ async def goal_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def goal_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle goal title."""
     context.user_data["goal_title"] = update.message.text
-    await update.message.reply_text(
+    await render.reply(update.message,
         "🎯 **هدف جديد - الخطوة 2/5**\n\nصف هدفك باختصار:"
     )
     return GOAL_DESC
@@ -407,7 +418,7 @@ async def goal_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.message.reply_text(
+    await render.reply(update.message,
         "🎯 **هدف جديد - الخطوة 3/5**\n\nاختر تصنيف الهدف:",
         reply_markup=reply_markup,
     )
@@ -429,7 +440,7 @@ async def goal_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["goal_category"] = category_map.get(query.data, "عام")
 
-    await query.edit_message_text(
+    await render.edit(query,
         "🎯 **هدف جديد - الخطوة 4/5**\n\nما هي المراحل/الخطوات لتحقيق هذا الهدف؟ "
         "(مفصولة بفواصل)\nمثال: تعلم الأساسيات, التطبيق العملي, بناء مشروع"
     )
@@ -441,7 +452,7 @@ async def goal_stages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stages = [s.strip() for s in update.message.text.split(",")]
     context.user_data["goal_stages"] = stages
 
-    await update.message.reply_text(
+    await render.reply(update.message,
         "🎯 **هدف جديد - الخطوة 5/5**\n\nما هو الموعد النهائي للهدف؟ "
         "(YYYY-MM-DD أو اكتب 'لا يوجد')"
     )
@@ -469,7 +480,7 @@ async def goal_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     if goal_id:
-        await update.message.reply_text(
+        await render.reply(update.message,
             "✅ **تم إنشاء الهدف بنجاح!**\n\n"
             f"🎯 {context.user_data.get('goal_title')}\n"
             f"📂 {context.user_data.get('goal_category')}",
@@ -477,7 +488,7 @@ async def goal_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
     else:
-        await update.message.reply_text(
+        await render.reply(update.message,
             "❌ حدث خطأ أثناء إنشاء الهدف. حاول مرة أخرى.",
             reply_markup=reply_markup,
         )
@@ -499,7 +510,7 @@ async def goal_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not goals:
         keyboard = [[InlineKeyboardButton("➕ إضافة هدف", callback_data="goal_new")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(
+        await render.edit(query,
             "لا توجد أهداف حالياً.",
             reply_markup=reply_markup,
         )
@@ -518,7 +529,7 @@ async def goal_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await query.edit_message_text(
+    await render.edit(query,
         goals_text,
         reply_markup=reply_markup,
         parse_mode="Markdown",
@@ -541,15 +552,85 @@ async def menu_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await query.edit_message_text(
+    await render.edit(query,
         "📅 **الخطة اليومية**\n\nاختر ما تريد:",
         reply_markup=reply_markup,
         parse_mode="Markdown",
     )
 
 
+PLAN_TASK_PATTERN = "^plan_task_\\d+$"
+
+
+def _plan_task_title(task) -> str:
+    if isinstance(task, dict):
+        return str(task.get("task") or task.get("title") or "").strip() or "مهمة"
+    return str(task).strip()
+
+
+def plan_message(plan) -> str:
+    """Render a plan with a real per-task completion state and a progress bar."""
+    tasks = plan.get("tasks") or []
+    done_flags = plan.get("completed_tasks") or []
+    progress = plan.get("done"), plan.get("total"), plan.get("percent")
+    if None in progress:  # renderer called with a raw DB row
+        done = sum(1 for index in range(len(tasks)) if _is_task_done(done_flags, index))
+        total, percent = len(tasks), int(round(done * 100 / len(tasks))) if tasks else 0
+    else:
+        done, total, percent = progress
+    lines = [f"📅 **خطة اليوم**  —  {done}/{total} ({percent}%)"]
+    filled = int(round(percent / 10))
+    lines.append("█" * filled + "░" * (10 - filled))
+    lines.append("")
+    if tasks:
+        for index, task in enumerate(tasks):
+            mark = "✅" if _is_task_done(done_flags, index) else "▫️"
+            lines.append(f"{mark} {index + 1}. {_plan_task_title(task)}")
+    else:
+        lines.append("لا توجد مهام في هذه الخطة.")
+    lines.append("")
+    lines.append(f"⏰ **وقت المراجعة:** {plan.get('review_time') or 'غير محدد'}")
+    lines.append(f"☕ **وقت الراحة:** {plan.get('break_time') or 'غير محدد'}")
+    return "\n".join(lines)
+
+
+def _is_task_done(flags, index: int) -> bool:
+    if isinstance(flags, list):
+        return index < len(flags) and bool(flags[index])
+    if isinstance(flags, dict):
+        return bool(flags.get(index) or flags.get(str(index)))
+    return False
+
+
+def plan_keyboard(plan) -> InlineKeyboardMarkup:
+    """Buttons for one task each, so completing a plan takes one tap.
+
+    The callback carries the state the tap *asks for* (``plan_task_1`` done,
+    ``plan_task_1_0`` reopened) instead of a blind toggle: a re-delivered
+    callback then repeats the same request, and the service treats it as a
+    no-op instead of undoing the user's completion.
+    """
+    tasks = plan.get("tasks") or []
+    done_flags = plan.get("completed_tasks") or []
+    keyboard = []
+    for index, task in enumerate(tasks):
+        is_done = _is_task_done(done_flags, index)
+        mark = "✅" if is_done else "⬜"
+        label = f"{mark} {_plan_task_title(task)}"
+        if len(label) > 60:  # Telegram caps button text
+            label = label[:57] + "…"
+        if is_done:
+            data = f"plan_task_{index}_0"   # ask for "not done"
+        else:
+            data = f"plan_task_{index}"     # ask for "done"
+        keyboard.append([InlineKeyboardButton(label, callback_data=data)])
+    keyboard.append([InlineKeyboardButton("📅 خطة جديدة", callback_data="plan_new")])
+    keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="menu_plan")])
+    return InlineKeyboardMarkup(keyboard)
+
+
 async def plan_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show today's plan."""
+    """Show today's plan with per-task completion."""
     if not await guard_command_action(update, context):
         return None
     services = get_services(context)
@@ -557,45 +638,74 @@ async def plan_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     user_id = update.effective_user.id
-    today = datetime.now().strftime("%Y-%m-%d")
-    plan = services.plans.for_date(user_id, today)
+    plan = services.plans.today(user_id)
 
     if plan:
-        tasks = plan.get("tasks", [])
-
-        def _format_task(task):
-            if isinstance(task, dict):
-                return task.get("task") or str(task)
-            return str(task)
-
-        tasks_text = "\n".join([f"• {_format_task(task)}" for task in tasks]) if tasks else "لا توجد مهام"
-
-        keyboard = [
-            [InlineKeyboardButton("✅ أكملت مهمة", callback_data="plan_complete")],
-            [InlineKeyboardButton("🔙 رجوع", callback_data="menu_plan")],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await query.edit_message_text(
-            ARABIC_RESPONSES["daily_plan"].format(
-                tasks=tasks_text,
-                review_time=plan.get("review_time", "غير محدد"),
-                break_time=plan.get("break_time", "غير محدد"),
-            ),
-            reply_markup=reply_markup,
-            parse_mode="Markdown",
-        )
+        await render.edit(query, plan_message(plan),
+                          reply_markup=plan_keyboard(plan), parse_mode="Markdown")
     else:
         keyboard = [
             [InlineKeyboardButton("📅 إنشاء خطة", callback_data="plan_new")],
             [InlineKeyboardButton("🔙 رجوع", callback_data="menu_plan")],
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await query.edit_message_text(
+        await render.edit(query,
             "لا توجد خطة لليوم. أنشئ واحدة!",
-            reply_markup=reply_markup,
+            reply_markup=InlineKeyboardMarkup(keyboard),
         )
+
+
+async def plan_complete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set one task of today's plan (button `plan_task_<n>` / `plan_task_<n>_0`).
+
+    Idempotent by construction: the callback names the desired state, so a
+    retried or concurrently delivered tap repeats the same request and is
+    reported as "already" instead of flipping the completion back.
+    """
+    if not await guard_command_action(update, context):
+        return None
+    query = update.callback_query
+    services = get_services(context)
+    user_id = update.effective_user.id
+
+    parts = (query.data or "").split("_")
+    try:
+        index = int(parts[2])
+        done = not (len(parts) > 3 and parts[3] == "0")
+    except (IndexError, ValueError):
+        await query.answer("اختيار غير صالح", show_alert=True)
+        return None
+
+    plan = services.plans.today(user_id)
+    if plan is None:
+        await query.answer("لا توجد خطة اليوم", show_alert=True)
+        return None
+
+    plan = services.plans.set_task_done(user_id, plan["date"], index, done)
+    if plan is None:
+        await query.answer("تعذر تحديث المهمة", show_alert=True)
+        return None
+
+    if plan.get("transition") == "contended":
+        # The transition was NOT applied (the row kept changing under the
+        # compare-and-set). Never tell the user it succeeded: state it plainly
+        # and let them tap again.
+        await query.answer(
+            "⏳ تعذّر تحديث المهمة مؤقتًا، حاول مرة أخرى بعد لحظات",
+            show_alert=True,
+        )
+        return None
+    if plan.get("transition") == "already":
+        note = "ℹ️ هذه المهمة محدَّثة بالفعل" + (" ✅" if done else "")
+    elif done:
+        note = f"✅ أُنجزت: {plan.get('just_completed_task')}"
+        if services.plans.all_done(plan):
+            note += "\n🎉 أكملت كل مهام اليوم!"
+    else:
+        note = "↩️ أُعيدت المهمة إلى قائمة الانتظار"
+    await query.answer(note, show_alert=False)
+    await render.edit(query, plan_message(plan),
+                      reply_markup=plan_keyboard(plan), parse_mode="Markdown")
+    return None
 
 
 async def plan_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -605,7 +715,7 @@ async def plan_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    await query.edit_message_text(
+    await render.edit(query,
         "📅 **خطة جديدة - الخطوة 1/4**\n\nما هي المهام التي تريد إنجازها اليوم؟ "
         "(مفصولة بفواصل)"
     )
@@ -617,7 +727,7 @@ async def plan_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tasks = [{"task": t.strip(), "done": False} for t in update.message.text.split(",")]
     context.user_data["plan_tasks"] = tasks
 
-    await update.message.reply_text(
+    await render.reply(update.message,
         "📅 **خطة جديدة - الخطوة 2/4**\n\nما هي أولوياتك؟ (مفصولة بفواصل)"
     )
     return PLAN_PRIORITIES
@@ -628,7 +738,7 @@ async def plan_priorities(update: Update, context: ContextTypes.DEFAULT_TYPE):
     priorities = [p.strip() for p in update.message.text.split(",")]
     context.user_data["plan_priorities"] = priorities
 
-    await update.message.reply_text(
+    await render.reply(update.message,
         "📅 **خطة جديدة - الخطوة 3/4**\n\nمتى وقت المراجعة؟ (مثال: 20:00)"
     )
     return PLAN_REVIEW_TIME
@@ -638,7 +748,7 @@ async def plan_review_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle review time."""
     context.user_data["plan_review_time"] = update.message.text
 
-    await update.message.reply_text(
+    await render.reply(update.message,
         "📅 **خطة جديدة - الخطوة 4/4**\n\nمتى وقت الراحة بين المهام؟ (مثال: 10 دقائق)"
     )
     return PLAN_BREAK_TIME
@@ -665,13 +775,13 @@ async def plan_break_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     if success:
-        await update.message.reply_text(
+        await render.reply(update.message,
             "✅ **تم إنشاء الخطة بنجاح!**\n\nلنبدأ العمل! 💪",
             reply_markup=reply_markup,
             parse_mode="Markdown",
         )
     else:
-        await update.message.reply_text(
+        await render.reply(update.message,
             "❌ حدث خطأ. حاول مرة أخرى.",
             reply_markup=reply_markup,
         )
@@ -696,11 +806,50 @@ async def menu_study(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await query.edit_message_text(
+    await render.edit(query,
         "📚 **وضع الدراسة**\n\nاختر ما تريد:",
         reply_markup=reply_markup,
         parse_mode="Markdown",
     )
+
+
+async def study_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A short, structured study session for the topic the user names next."""
+    if not await guard_command_action(update, context):
+        return None
+    query = update.callback_query
+    await query.answer()
+    context.user_data["study_session_mode"] = True
+    await render.edit(query,
+        "📚 **جلسة دراسة**\n\nما الموضوع الذي تريد أن تدرسه في هذه الجلسة؟",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🔙 رجوع", callback_data="menu_study")]]),
+        parse_mode="Markdown",
+    )
+    return None
+
+
+async def study_session_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Build a 25-minute, three-step session plan for the topic (AI)."""
+    if not await guard_ai_action(update, context):
+        return None
+    services = get_services(context)
+    topic = (update.message.text or "").strip()
+    context.user_data["study_session_mode"] = None
+    if not topic:
+        await render.reply(update.message, "أرسل موضوع الجلسة من فضلك.")
+        return None
+
+    await render.reply(update.message, "⏳ جاري تجهيز جلسة الدراسة...")
+    plan = await services.learning.study_session(topic)
+    keyboard = [
+        [InlineKeyboardButton("📝 اختبرني في الموضوع", callback_data="study_test")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="menu_study")],
+    ]
+    await render.reply(update.message, plan,
+                       reply_markup=InlineKeyboardMarkup(keyboard),
+                       parse_mode="Markdown")
+    return None
 
 
 async def study_explain(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -710,7 +859,7 @@ async def study_explain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    await query.edit_message_text(
+    await render.edit(query,
         "📖 **شرح مفهوم**\n\nما هو المفهوم الذي تريد شرحه؟"
     )
     return STUDY_SUBJECT
@@ -720,7 +869,7 @@ async def study_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle subject input."""
     context.user_data["study_subject"] = update.message.text
 
-    await update.message.reply_text(
+    await render.reply(update.message,
         "📖 **شرح مفهوم**\n\nفي أي مجال/مادة؟"
     )
     return STUDY_TOPIC
@@ -734,7 +883,7 @@ async def study_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     concept = context.user_data.get("study_subject")
     subject = update.message.text
 
-    await update.message.reply_text("⏳ جاري توليد الشرح...")
+    await render.reply(update.message, "⏳ جاري توليد الشرح...")
 
     explanation = await services.learning.explain_concept(concept, subject)
 
@@ -744,7 +893,7 @@ async def study_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.message.reply_text(
+    await render.reply(update.message,
         explanation,
         reply_markup=reply_markup,
         parse_mode="Markdown",
@@ -759,7 +908,7 @@ async def study_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    await query.edit_message_text(
+    await render.edit(query,
         "📝 **اختبار**\n\nما هو الموضوع الذي تريد اختباره؟"
     )
     return STUDY_DURATION  # Reuse state
@@ -772,7 +921,7 @@ async def study_duration(update: Update, context: ContextTypes.DEFAULT_TYPE):
     services = get_services(context)
     topic = update.message.text
 
-    await update.message.reply_text("⏳ جاري توليد الاختبار...")
+    await render.reply(update.message, "⏳ جاري توليد الاختبار...")
 
     test = await services.learning.generate_test(topic)
 
@@ -781,7 +930,7 @@ async def study_duration(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.message.reply_text(
+    await render.reply(update.message,
         test,
         reply_markup=reply_markup,
         parse_mode="Markdown",
@@ -805,7 +954,7 @@ async def menu_english(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await query.edit_message_text(
+    await render.edit(query,
         "🇬🇧 **وضع الإنجليزية**\n\nاختر ما تريد:",
         reply_markup=reply_markup,
         parse_mode="Markdown",
@@ -820,7 +969,7 @@ async def english_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    await query.edit_message_text("⏳ جاري توليد الدرس...")
+    await render.edit(query, "⏳ جاري توليد الدرس...")
 
     lesson = await services.learning.english_lesson()
 
@@ -830,7 +979,7 @@ async def english_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await query.edit_message_text(
+    await render.edit(query,
         lesson,
         reply_markup=reply_markup,
         parse_mode="Markdown",
@@ -844,7 +993,7 @@ async def english_correct(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    await query.edit_message_text(
+    await render.edit(query,
         "✏️ **تصحيح إنجليزي**\n\nأرسل النص الذي تريد تصحيحه:"
     )
     return ENGLISH_TEXT
@@ -857,7 +1006,7 @@ async def english_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     services = get_services(context)
     text = update.message.text
 
-    await update.message.reply_text("⏳ جاري التصحيح...")
+    await render.reply(update.message, "⏳ جاري التصحيح...")
 
     correction = await services.learning.correct_english(text)
 
@@ -867,7 +1016,7 @@ async def english_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.message.reply_text(
+    await render.reply(update.message,
         correction,
         reply_markup=reply_markup,
         parse_mode="Markdown",
@@ -891,11 +1040,91 @@ async def menu_programming(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await query.edit_message_text(
+    await render.edit(query,
         "💻 **وضع البرمجة**\n\nاختر ما تريد:",
         reply_markup=reply_markup,
         parse_mode="Markdown",
     )
+
+
+async def prog_concept(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Explain a programming concept (button used to be dead).
+
+    Serves two entry points with the same rendering:
+      * the inline button   -> callback update, answers the query and edits in place;
+      * the typed concept   -> message update (via `text_router`), replies anew.
+    Both are handled here so the answer never depends on which surface was used
+    (the text path previously re-entered this function with a message update,
+    where the callback query attribute was None and the handler crashed while
+    acknowledging that nonexistent query).
+    """
+    if not await guard_ai_action(update, context):
+        return None
+    # NOTE: nothing may be read from the update before the guard above - the
+    # contract checker in `_assert_entry_point_guard_contracts` enforces that
+    # the limit is spent before any side effect (and `getattr(update, ...)` on
+    # an update object counts as one).
+    services = get_services(context)
+    query = getattr(update, "callback_query", None)
+    message = getattr(update, "message", None)
+    is_callback = query is not None
+
+    def _surface():
+        return query if is_callback else message
+
+    concept = context.user_data.pop("prog_concept_topic", None)
+    if not concept:
+        if is_callback:
+            await query.answer()
+            await render.edit(
+                query,
+                "📖 **شرح مفهوم برمجي**\n\nأرسل اسم المفهوم الذي تريد شرحه.\n"
+                "مثال: الوراثة في بايثون، أو Big-O",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🔙 رجوع",
+                                           callback_data="menu_programming")]]),
+                parse_mode="Markdown",
+            )
+        else:
+            await render.reply(
+                message,
+                "أرسل اسم المفهوم من فضلك.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🔙 رجوع",
+                                           callback_data="menu_programming")]]),
+            )
+        context.user_data["prog_concept_mode"] = True
+        return None
+
+    if is_callback:
+        await query.answer()
+        await render.edit(query, "⏳ جاري تجهيز الشرح...")
+    else:
+        await render.reply(message, "⏳ جاري تجهيز الشرح...")
+
+    explanation = await services.learning.explain_concept(concept, "البرمجة")
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📖 مفهوم آخر", callback_data="prog_concept")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="menu_programming")],
+    ])
+    if is_callback:
+        await render.edit(query, explanation, reply_markup=keyboard,
+                          parse_mode="Markdown")
+    else:
+        await render.reply(message, explanation, reply_markup=keyboard,
+                           parse_mode="Markdown")
+    return None
+
+
+async def prog_concept_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive the concept name for `prog_concept` from the text router."""
+    concept = (update.message.text or "").strip()
+    context.user_data["prog_concept_mode"] = None
+    if not concept:
+        await render.reply(update.message, "أرسل اسم المفهوم من فضلك.")
+        return None
+    context.user_data["prog_concept_topic"] = concept
+    return await prog_concept(update, context)
 
 
 async def prog_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -905,7 +1134,7 @@ async def prog_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    await query.edit_message_text(
+    await render.edit(query,
         "💻 **مراجعة كود**\n\nما هي لغة البرمجة؟"
     )
     return CODE_LANGUAGE
@@ -915,7 +1144,7 @@ async def code_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle language input."""
     context.user_data["code_language"] = update.message.text
 
-    await update.message.reply_text(
+    await render.reply(update.message,
         "💻 **مراجعة كود**\n\nأرسل الكود الذي تريد مراجعته:"
     )
     return CODE_REVIEW
@@ -929,7 +1158,7 @@ async def code_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = update.message.text
     language = context.user_data.get("code_language", "python")
 
-    await update.message.reply_text("⏳ جاري مراجعة الكود...")
+    await render.reply(update.message, "⏳ جاري مراجعة الكود...")
 
     review = await services.learning.review_code(code, language)
 
@@ -939,7 +1168,7 @@ async def code_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.message.reply_text(
+    await render.reply(update.message,
         review,
         reply_markup=reply_markup,
         parse_mode="Markdown",
@@ -963,7 +1192,7 @@ async def menu_discipline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await query.edit_message_text(
+    await render.edit(query,
         "⚡ **وضع الانضباط**\n\nاختر ما تريد:",
         reply_markup=reply_markup,
         parse_mode="Markdown",
@@ -977,10 +1206,70 @@ async def discipline_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    await query.edit_message_text(
+    await render.edit(query,
         ARABIC_RESPONSES["discipline_check"],
         parse_mode="Markdown",
     )
+
+
+async def discipline_challenge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Today's one micro-challenge, chosen from the user's real state.
+
+    Deterministic on purpose: the challenge must be instant, offline-safe and
+    identical for the same data (no AI budget spent, no random flapping).
+    """
+    if not await guard_command_action(update, context):
+        return None
+    query = update.callback_query
+    await query.answer()
+    services = get_services(context)
+    user_id = update.effective_user.id
+
+    stats = services.dashboard.stats(user_id)
+    plan = services.plans.today(user_id)
+    habits = services.habits.list(user_id)
+
+    candidates = []
+    if plan:
+        progress = services.plans.task_progress(plan)
+        if progress["total"] and progress["done"] < progress["total"]:
+            pending = [_plan_task_title(task) for index, task in
+                       enumerate(plan.get("tasks") or [])
+                       if not _is_task_done(plan.get("completed_tasks") or [], index)]
+            candidates.append(
+                ("🎯 أنهِ مهمة واحدة الآن", f"ابدأ بـ: {pending[0]}\n"
+                 f"المتبقي: {progress['total'] - progress['done']} مهام")
+            )
+    if habits:
+        weak = min(habits, key=lambda habit: habit.get("current_streak") or 0)
+        candidates.append(
+            ("🔄 لا تكسر السلسلة", f"سجّل عادة «{weak.get('name')}» اليوم "
+             f"(السلسلة الحالية: {weak.get('current_streak') or 0} يوم)")
+        )
+    if not stats.get("weekly_tasks"):
+        candidates.append(("⏱️ 15 دقيقة بلا مشتتات",
+                           "اختر مهمة واحدة وأنجزها في جلسة تركيز واحدة."))
+    candidates.append(("🌙 محاسبة صادقة",
+                       "أجب على ثلاثة أسئلة: ماذا أنجزت؟ ما العقبة؟ ماذا غداً؟"))
+
+    title, body = candidates[0]
+    lines = [
+        "🎯 **تحدي اليوم**",
+        "━━━━━━━━━━━━━━━━━━━━",
+        title,
+        "",
+        body,
+        "",
+        "_أنجزه الآن، ثم عد وسجّله في المحاسبة._",
+    ]
+    keyboard = [
+        [InlineKeyboardButton("🌙 المحاسبة اليومية", callback_data="review_daily")],
+        [InlineKeyboardButton("📅 خطة اليوم", callback_data="plan_today")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="menu_discipline")],
+    ]
+    await render.edit(query, "\n".join(lines),
+                      reply_markup=InlineKeyboardMarkup(keyboard),
+                      parse_mode="Markdown")
 
 
 # ==================== HABIT HANDLERS ====================
@@ -1005,7 +1294,7 @@ async def menu_habits(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     habits_text = f"لديك {len(habits)} عادة/عادات." if habits else "لا توجد عادات حالياً."
 
-    await query.edit_message_text(
+    await render.edit(query,
         f"🔄 **العادات**\n\n{habits_text}",
         reply_markup=reply_markup,
         parse_mode="Markdown",
@@ -1019,7 +1308,7 @@ async def habit_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    await query.edit_message_text(
+    await render.edit(query,
         "🔄 **عادة جديدة - الخطوة 1/4**\n\nما اسم العادة؟"
     )
     return HABIT_NAME
@@ -1029,7 +1318,7 @@ async def habit_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle habit name."""
     context.user_data["habit_name"] = update.message.text
 
-    await update.message.reply_text(
+    await render.reply(update.message,
         "🔄 **عادة جديدة - الخطوة 2/4**\n\nصف العادة باختصار:"
     )
     return HABIT_DESC
@@ -1045,7 +1334,7 @@ async def habit_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.message.reply_text(
+    await render.reply(update.message,
         "🔄 **عادة جديدة - الخطوة 3/4**\n\nما هي تكرار العادة؟",
         reply_markup=reply_markup,
     )
@@ -1060,7 +1349,7 @@ async def habit_frequency(update: Update, context: ContextTypes.DEFAULT_TYPE):
     freq_map = {"freq_daily": "daily", "freq_weekly": "weekly"}
     context.user_data["habit_frequency"] = freq_map.get(query.data, "daily")
 
-    await query.edit_message_text(
+    await render.edit(query,
         "🔄 **عادة جديدة - الخطوة 4/4**\n\nمتى تريد التذكير؟ (مثال: 08:00)"
     )
     return HABIT_TIME
@@ -1084,14 +1373,14 @@ async def habit_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     if habit_id:
-        await update.message.reply_text(
+        await render.reply(update.message,
             f"✅ **تم إنشاء العادة بنجاح!**\n\n🔄 {context.user_data.get('habit_name')}\n"
             f"⏰ تذكير يومي الساعة {reminder_time}",
             reply_markup=reply_markup,
             parse_mode="Markdown",
         )
     else:
-        await update.message.reply_text(
+        await render.reply(update.message,
             "❌ حدث خطأ. حاول مرة أخرى.",
             reply_markup=reply_markup,
         )
@@ -1113,7 +1402,7 @@ async def habit_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not habits:
         keyboard = [[InlineKeyboardButton("➕ إضافة عادة", callback_data="habit_new")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(
+        await render.edit(query,
             "لا توجد عادات حالياً.",
             reply_markup=reply_markup,
         )
@@ -1131,7 +1420,7 @@ async def habit_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await query.edit_message_text(
+    await render.edit(query,
         habits_text,
         reply_markup=reply_markup,
         parse_mode="Markdown",
@@ -1157,7 +1446,7 @@ async def menu_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await query.edit_message_text(
+    await render.edit(query,
         "📈 **تقدمك (آخر 7 أيام)**\n\n"
         f"⏰ ساعات الدراسة: {summary['total_hours']}\n"
         f"✅ المهام المنجزة: {summary['total_tasks']}\n"
@@ -1165,6 +1454,64 @@ async def menu_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=reply_markup,
         parse_mode="Markdown",
     )
+
+
+async def progress_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Detailed stats: dashboard numbers + the last days of logged progress."""
+    if not await guard_command_action(update, context):
+        return None
+    services = get_services(context)
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+
+    stats = services.dashboard.stats(user_id)
+    summary = services.progress.weekly_summary(user_id)
+    goals = services.goals.list(user_id)
+    habits = services.habits.list(user_id)
+
+    completion = 0
+    if stats.get("total_goals"):
+        completion = int(round(
+            (stats.get("completed_goals") or 0) * 100 / stats["total_goals"]))
+
+    lines = [
+        "📊 **إحصائيات مفصلة**",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "🎯 **الأهداف**",
+        f"• الإجمالي: {stats.get('total_goals', 0)}",
+        f"• المكتملة: {stats.get('completed_goals', 0)} ({completion}%)",
+        "",
+        "🔄 **العادات**",
+        f"• العدد: {stats.get('total_habits', 0)}",
+        f"• مجموع السلاسل: {stats.get('total_streaks', 0)} يوم",
+    ]
+    if habits:
+        best = max(habits, key=lambda habit: habit.get("current_streak") or 0)
+        lines.append(f"• الأقوى: {best.get('name')} "
+                     f"({best.get('current_streak') or 0} يوم)")
+    lines += [
+        "",
+        "📈 **آخر 7 أيام**",
+        f"• ساعات الدراسة: {summary.get('total_hours', 0)}",
+        f"• المهام المنجزة: {summary.get('total_tasks', 0)}",
+        f"• الأيام المسجلة: {summary.get('days', 0)}",
+        "",
+        "🌙 **المحاسبة**",
+        f"• المراجعات: {stats.get('total_reviews', 0)}",
+    ]
+    if goals:
+        lines += ["", "🧭 **أقرب أهدافك**"]
+        for goal in goals[:3]:
+            lines.append(f"• {goal.get('title')} — {goal.get('progress', 0)}%")
+
+    keyboard = [
+        [InlineKeyboardButton("🌙 محاسبة اليوم", callback_data="review_daily")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="menu_progress")],
+    ]
+    await render.edit(query, "\n".join(lines),
+                      reply_markup=InlineKeyboardMarkup(keyboard),
+                      parse_mode="Markdown")
 
 
 # ==================== COACH HANDLERS ====================
@@ -1180,7 +1527,7 @@ async def menu_coach(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     stats = services.dashboard.stats(user_id)
 
-    await query.edit_message_text("⏳ جاري تحليل أدائك...")
+    await render.edit(query, "⏳ جاري تحليل أدائك...")
 
     memory_block = services.memory.memory_block(user_id, subject="training")
     advice = await services.coaching.advice(
@@ -1194,7 +1541,7 @@ async def menu_coach(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await query.edit_message_text(
+    await render.edit(query,
         advice,
         reply_markup=reply_markup,
         parse_mode="Markdown",
@@ -1212,7 +1559,7 @@ async def coach_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     stats = services.dashboard.stats(user_id)
 
-    await query.edit_message_text("⏳ جاري التحليل...")
+    await render.edit(query, "⏳ جاري التحليل...")
 
     analysis = await services.coaching.analyze(stats)
 
@@ -1221,7 +1568,7 @@ async def coach_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await query.edit_message_text(
+    await render.edit(query,
         analysis,
         reply_markup=reply_markup,
         parse_mode="Markdown",
@@ -1266,7 +1613,7 @@ async def menu_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await query.edit_message_text(
+    await render.edit(query,
         dashboard_text,
         reply_markup=reply_markup,
         parse_mode="Markdown",
@@ -1289,7 +1636,7 @@ async def menu_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await query.edit_message_text(
+    await render.edit(query,
         "🌙 **المحاسبة اليومية**\n\nاختر ما تريد:",
         reply_markup=reply_markup,
         parse_mode="Markdown",
@@ -1303,7 +1650,7 @@ async def review_daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    await query.edit_message_text(
+    await render.edit(query,
         ARABIC_RESPONSES["night_review_step_1"]
     )
     return REVIEW_ACCOMPLISHED
@@ -1313,7 +1660,7 @@ async def review_accomplished(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Handle accomplished input."""
     context.user_data["review_accomplished"] = update.message.text
 
-    await update.message.reply_text(
+    await render.reply(update.message,
         ARABIC_RESPONSES["night_review_step_2"]
     )
     return REVIEW_LEARNED
@@ -1323,7 +1670,7 @@ async def review_learned(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle learned input."""
     context.user_data["review_learned"] = update.message.text
 
-    await update.message.reply_text(
+    await render.reply(update.message,
         ARABIC_RESPONSES["night_review_step_3"]
     )
     return REVIEW_OBSTACLES
@@ -1333,7 +1680,7 @@ async def review_obstacles(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle obstacles input."""
     context.user_data["review_obstacles"] = update.message.text
 
-    await update.message.reply_text(
+    await render.reply(update.message,
         ARABIC_RESPONSES["night_review_step_4"]
     )
     return REVIEW_TOMORROW
@@ -1350,7 +1697,7 @@ async def review_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.message.reply_text(
+    await render.reply(update.message,
         ARABIC_RESPONSES["night_review_step_5"],
         reply_markup=reply_markup,
     )
@@ -1383,14 +1730,14 @@ async def review_mood(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     if success:
-        await query.edit_message_text(
+        await render.edit(query,
             "✅ **تم حفظ المحاسبة اليومية!**\n\n"
             "أحسنت على الالتزام! 💪",
             reply_markup=reply_markup,
             parse_mode="Markdown",
         )
     else:
-        await query.edit_message_text(
+        await render.edit(query,
             "❌ حدث خطأ. حاول مرة أخرى.",
             reply_markup=reply_markup,
         )
@@ -1415,7 +1762,7 @@ async def menu_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await query.edit_message_text(
+    await render.edit(query,
         "⚙️ **الإعدادات**\n\nاختر ما تريد تعديله:",
         reply_markup=reply_markup,
         parse_mode="Markdown",
@@ -1453,7 +1800,7 @@ async def settings_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await query.edit_message_text(
+    await render.edit(query,
         profile_text,
         reply_markup=reply_markup,
         parse_mode="Markdown",
@@ -1492,7 +1839,7 @@ async def settings_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE)
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await query.edit_message_text(
+    await render.edit(query,
         reminders_text,
         reply_markup=reply_markup,
         parse_mode="Markdown",
@@ -1506,7 +1853,7 @@ async def reminder_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    await query.edit_message_text(
+    await render.edit(query,
         "🔔 **تذكير جديد**\n\nما عنوان التذكير؟"
     )
     return REMINDER_TITLE
@@ -1516,7 +1863,7 @@ async def reminder_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle reminder title."""
     context.user_data["reminder_title"] = update.message.text
 
-    await update.message.reply_text(
+    await render.reply(update.message,
         "🔔 **تذكير جديد**\n\nما رسالة التذكير؟"
     )
     return REMINDER_MESSAGE
@@ -1526,7 +1873,7 @@ async def reminder_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle reminder message."""
     context.user_data["reminder_message"] = update.message.text
 
-    await update.message.reply_text(
+    await render.reply(update.message,
         "🔔 **تذكير جديد**\n\nمتى تريد التذكير؟ (HH:MM)"
     )
     return REMINDER_TIME
@@ -1542,7 +1889,7 @@ async def reminder_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.message.reply_text(
+    await render.reply(update.message,
         f"🔔 **تأكيد التذكير**\n\n"
         f"العنوان: {context.user_data.get('reminder_title')}\n"
         f"الرسالة: {context.user_data.get('reminder_message')}\n"
@@ -1571,7 +1918,7 @@ async def reminder_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValidationError:
         # Keep the flow and the typed values so the user can correct the time
         # instead of being dropped back to the menu with "something failed".
-        await query.edit_message_text(
+        await render.edit(query,
             "❌ وقت غير صالح. اكتب الوقت بصيغة HH:MM، مثال: 08:30\n\n"
             "أعد إرسال الوقت:"
         )
@@ -1587,14 +1934,14 @@ async def reminder_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # silently skipped until the next hour's resync.
         activated = await _resync_reminders(context)
         note = "" if activated else "\n\n⏳ سيُجدول عند أول تحديث تلقائي."
-        await query.edit_message_text(
+        await render.edit(query,
             "✅ **تم إنشاء التذكير بنجاح!**\n\nسيتم إرسال التذكير في الوقت المحدد."
             + note,
             reply_markup=reply_markup,
             parse_mode="Markdown",
         )
     else:
-        await query.edit_message_text(
+        await render.edit(query,
             "❌ حدث خطأ. حاول مرة أخرى.",
             reply_markup=reply_markup,
         )
@@ -1635,7 +1982,7 @@ async def settings_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await query.edit_message_text(
+    await render.edit(query,
         f"🤖 **حالة الذكاء الاصطناعي**\n\n{status}",
         reply_markup=reply_markup,
         parse_mode="Markdown",
@@ -1655,7 +2002,7 @@ async def settings_ai_reconnect(update: Update, context: ContextTypes.DEFAULT_TY
     keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="menu_settings")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await query.edit_message_text(
+    await render.edit(query,
         f"🔄 **تم إعادة الاتصال**\n\n{status}",
         reply_markup=reply_markup,
         parse_mode="Markdown",
@@ -1703,7 +2050,7 @@ async def menu_knowledge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     services = get_services(context)
     user_id = update.effective_user.id
     text, markup = _knowledge_menu_content_for(services.knowledge.counts(user_id))
-    await query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
+    await render.edit(query, text, reply_markup=markup, parse_mode="Markdown")
 
 
 async def knowledge_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1719,7 +2066,7 @@ async def knowledge_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not sources:
         keyboard = [[InlineKeyboardButton("📥 إضافة كتاب", callback_data="knowledge_upload")],
                     [InlineKeyboardButton("🔙 رجوع", callback_data="menu_knowledge")]]
-        await query.edit_message_text(
+        await render.edit(query,
             "📚 لا توجد كتب في مكتبتك بعد. أضف كتابك الأول!",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
@@ -1734,7 +2081,7 @@ async def knowledge_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📥 إضافة كتاب", callback_data="knowledge_upload")],
         [InlineKeyboardButton("🔙 رجوع", callback_data="menu_knowledge")],
     ]
-    await query.edit_message_text(
+    await render.edit(query,
         "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
@@ -1757,7 +2104,7 @@ async def knowledge_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"الحد الأقصى للحجم: {max_mb}MB\n\n"
         "بعد المعالجة سيعتبر الكتاب جاهزاً ويمكنك السؤال عنه."
     )
-    await query.edit_message_text(
+    await render.edit(query,
         hint, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
     )
 
@@ -1770,7 +2117,7 @@ async def knowledge_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     context.user_data["knowledge_mode"] = "ask"
     keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="menu_knowledge")]]
-    await query.edit_message_text(
+    await render.edit(query,
         "🔍 **السؤال عن كتبك**\n\n"
         "اكتب سؤالك الآن وسأجيب عليه بالاعتماد على كتبك فقط.\n"
         "مثال: ما هي أهم طريقة لتنظيم الوقت حسب كتابي؟",
@@ -1790,7 +2137,7 @@ async def knowledge_collections(update: Update, context: ContextTypes.DEFAULT_TY
     collections = services.knowledge.collections.list(user_id)
     keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="menu_knowledge")]]
     if not collections:
-        await query.edit_message_text(
+        await render.edit(query,
             "🗂️ لا توجد مجموعات بعد.\n\n"
             "ستتوفر المجموعات في تحديث قادم لتنظيم كتبك.",
             reply_markup=InlineKeyboardMarkup(keyboard),
@@ -1799,7 +2146,7 @@ async def knowledge_collections(update: Update, context: ContextTypes.DEFAULT_TY
     lines = ["🗂️ **مجموعاتك:**\n"]
     for collection in collections[:12]:
         lines.append(f"• {collection.name}")
-    await query.edit_message_text(
+    await render.edit(query,
         "\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
@@ -1816,7 +2163,7 @@ async def knowledge_processing(update: Update, context: ContextTypes.DEFAULT_TYP
     processing = services.knowledge.processing_sources(user_id)
     keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="menu_knowledge")]]
     if not processing:
-        await query.edit_message_text(
+        await render.edit(query,
             "⏳ لا توجد كتب قيد المعالجة حالياً.",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
@@ -1827,7 +2174,7 @@ async def knowledge_processing(update: Update, context: ContextTypes.DEFAULT_TYP
         title = source.get("title") or source.get("file_name") or "بدون عنوان"
         lines.append(f"• {title} ({state})")
     lines.append("\nسيتم إعلامك عندما تصبح جاهزة.")
-    await query.edit_message_text(
+    await render.edit(query,
         "\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
@@ -1851,7 +2198,7 @@ async def knowledge_settings(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"v{info['embedding_version']} ({info['dimensions']})\n"
         f"🔍 نتائج البحث: {info['top_k']}"
     )
-    await query.edit_message_text(
+    await render.edit(query,
         text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
     )
 
@@ -1863,14 +2210,14 @@ async def knowledge_document(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = update.effective_user.id
     allowed, msg = await _rl.check_upload_limit(user_id)
     if not allowed:
-        await update.message.reply_text(msg)
+        await render.reply(update.message, msg)
         return
 
     # Check ingestion budget BEFORE download/validate/register so a blocked
     # request can never leave an orphaned pending knowledge source behind.
     allowed, msg = await _rl.check_ingestion_limit(user_id)
     if not allowed:
-        await update.message.reply_text(msg)
+        await render.reply(update.message, msg)
         return
 
     document = update.message.document
@@ -1880,7 +2227,7 @@ async def knowledge_document(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     max_size = services.knowledge.settings_info()["max_file_size_mb"] * 1024 * 1024
     if (document.file_size or 0) > max_size:
-        await update.message.reply_text(
+        await render.reply(update.message,
             f"❌ حجم الملف يتجاوز الحد المسموح ({max_size // (1024*1024)}MB)."
         )
         return
@@ -1915,7 +2262,7 @@ async def knowledge_document(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     source_id = result.get("source_id")
     chat_id = update.message.chat_id
-    await update.message.reply_text(
+    await render.reply(update.message,
         f"📥 تم استلام الكتاب **{file_name}**!\n"
         "بدأت المعالجة وسأعلمك عندما يصبح جاهزاً.",
         parse_mode="Markdown",
@@ -1975,19 +2322,19 @@ async def knowledge_question(update: Update, context: ContextTypes.DEFAULT_TYPE)
     services = get_services(context)
     user_id = update.effective_user.id
     question = update.message.text or ""
-    await update.message.reply_text("🔍 جاري البحث في كتبك...")
+    await render.reply(update.message, "🔍 جاري البحث في كتبك...")
     try:
         answer = await services.knowledge.answer(user_id, question)
     except Exception as e:  # noqa: BLE001
         logger.error(f"Knowledge answer failed for user {user_id}: {e}")
-        await update.message.reply_text("❌ حدث خطأ أثناء البحث. حاول مجدداً.")
+        await render.reply(update.message, "❌ حدث خطأ أثناء البحث. حاول مجدداً.")
         return
 
     text = answer.text
     if answer.citations:
         citations = "\n\n".join(c.formatted() for c in answer.citations)
         text = f"{text}\n\n{citations}"
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await render.reply(update.message, text, parse_mode="Markdown")
 
 
 # ==================== MEMORY ENGINE HANDLERS ====================
@@ -2053,7 +2400,7 @@ async def menu_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     enabled = services.memory.enabled(user_id)
     pending = len(services.memory.pending(user_id))
     text, markup = _memory_menu_content_for(counts, enabled, pending)
-    await query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
+    await render.edit(query, text, reply_markup=markup, parse_mode="Markdown")
 
 
 def _format_memory_line(title: str, items: list, limit: int = 12) -> str:
@@ -2086,7 +2433,7 @@ async def memory_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔍 بحث", callback_data="memory_search")],
         [InlineKeyboardButton("🔙 رجوع", callback_data="menu_memory")],
     ]
-    await query.edit_message_text(
+    await render.edit(query,
         _format_memory_line("👁️ **ما أتذكره عنك:**", items),
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
@@ -2100,7 +2447,7 @@ async def memory_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     context.user_data["memory_mode"] = "search"
     keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="menu_memory")]]
-    await query.edit_message_text(
+    await render.edit(query,
         "🔍 **البحث في الذاكرة**\n\n"
         "اكتب كلمة أو موضوعاً ليبحث عنه من ذكرياتك.\n"
         "مثال: Write \"لغة برمجة\" للبحث عنها.",
@@ -2116,7 +2463,7 @@ async def memory_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     context.user_data["memory_mode"] = "edit"
     keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="menu_memory")]]
-    await query.edit_message_text(
+    await render.edit(query,
         "✏️ **تعديل ذاكرة**\n\n"
         "أرسل رقم # الذاكرة ثم النص الجديد.\n"
         "مثال: 3 أحب القهوة العربية فقط\n\n"
@@ -2133,7 +2480,7 @@ async def memory_forget(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     context.user_data["memory_mode"] = "forget"
     keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="menu_memory")]]
-    await query.edit_message_text(
+    await render.edit(query,
         "🗑️ **نسيان ذاكرة**\n\n"
         "أرسل رقم # الذاكرة لحذفها من ذاكرتي.\n"
         "أو اكتب «all» لنسيان كل الذكريات مرة واحدة.\n\n"
@@ -2152,7 +2499,7 @@ async def memory_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("✅ نعم، انسَ كل شيء", callback_data="memory_clear_confirm")],
         [InlineKeyboardButton("🔙 تراجع", callback_data="memory_settings")],
     ]
-    await query.edit_message_text(
+    await render.edit(query,
         "🧹 **مسح الذاكرة**\n\n"
         "هل تريد نسيان كل الذكريات المحفوظة عنك؟\n"
         "(لا يمكن التراجع عن هذا الإجراء)",
@@ -2171,7 +2518,7 @@ async def memory_clear_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     text, markup = _memory_menu_content_for(
         {"total": 0}, services.memory.enabled(user_id), 0
     )
-    await query.edit_message_text(
+    await render.edit(query,
         f"🧹 تم نسيان {count} ذاكرة.\n\n{text}",
         reply_markup=markup,
         parse_mode="Markdown",
@@ -2209,7 +2556,7 @@ async def memory_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard.append(
         [InlineKeyboardButton("🔙 رجوع", callback_data="menu_memory")]
     )
-    await query.edit_message_text(
+    await render.edit(query,
         "\n".join(body), reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
@@ -2232,7 +2579,7 @@ async def memory_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "\nعندما تكون الذاكرة متوقفة لن أتذكر شيئاً "
         "إلا إذا قلت «تذكر هذا» بصراحة."
     ) if not enabled else "\nسأستمع وأتذكر كل ما يتعلق بك."
-    await query.edit_message_text(
+    await render.edit(query,
         f"{status}{hint}",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
@@ -2248,7 +2595,7 @@ async def memory_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending = services.memory.pending(user_id)
     keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="memory_settings")]]
     if not pending:
-        await query.edit_message_text(
+        await render.edit(query,
             "🔔 لا توجد طلبات تأكيد حالياً.",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
@@ -2266,7 +2613,7 @@ async def memory_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("❌ تجاهل", callback_data=f"memory_reject_{item['memory_id']}"),
         ])
     rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="memory_settings")])
-    await query.edit_message_text(
+    await render.edit(query,
         "\n".join(lines), reply_markup=InlineKeyboardMarkup(rows),
         parse_mode="Markdown",
     )
@@ -2287,7 +2634,7 @@ async def memory_consent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "✅ تم الحفظ في ذاكرتي." if ok and action == "accept" else \
         "❌ تم تجاهل الذاكرة."
     keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="memory_pending")]]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await render.edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def memory_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2301,7 +2648,7 @@ async def memory_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     payload = services.memory.export(user_id)
     if payload is None:
         keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="menu_memory")]]
-        await query.edit_message_text(
+        await render.edit(query,
             "📤 لا توجد ذكريات لتصديرها بعد.",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
@@ -2310,7 +2657,7 @@ async def memory_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
         json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
     )
     buffer.seek(0)
-    await query.edit_message_text("📤 **تصدير الذاكرة**\nجارٍ تجهيز الملف...")
+    await render.edit(query, "📤 **تصدير الذاكرة**\nجارٍ تجهيز الملف...")
     await context.bot.send_document(
         chat_id=update.effective_chat.id,
         document=InputFile(buffer, filename="austro_memory.json"),
@@ -2331,7 +2678,7 @@ async def memory_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if mode == "search":
         context.user_data["memory_mode"] = None
         results = services.memory.search(user_id, text)
-        await update.message.reply_text(
+        await render.reply(update.message,
             _format_memory_line(f"🔍 **نتائج البحث عن: {text}**:", results),
             reply_markup=InlineKeyboardMarkup(back),
             parse_mode="Markdown",
@@ -2341,7 +2688,7 @@ async def memory_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if mode == "edit":
         first, _, rest = text.strip().partition(" ")
         if not first.isdigit() or not rest.strip():
-            await update.message.reply_text(
+            await render.reply(update.message,
                 "اكتب رقم الذاكرة ثم النص الجديد، مثل: 3 أحب الشاي بالنعناع",
                 reply_markup=InlineKeyboardMarkup(back),
             )
@@ -2350,20 +2697,20 @@ async def memory_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ok = services.memory.edit(user_id, int(first), rest.strip())
         reply = "✅ تم تعديل الذاكرة." if ok else \
             "❌ لم أجد ذاكرة بهذا الرقم."
-        await update.message.reply_text(reply, reply_markup=InlineKeyboardMarkup(back))
+        await render.reply(update.message, reply, reply_markup=InlineKeyboardMarkup(back))
         return
 
     if mode == "forget":
         if text.strip().lower() in ("all", "الكل", "انسى الكل"):
             count = services.memory.clear(user_id)
             context.user_data["memory_mode"] = None
-            await update.message.reply_text(
+            await render.reply(update.message,
                 f"🧹 تم نسيان {count} ذاكرة.",
                 reply_markup=InlineKeyboardMarkup(back),
             )
             return
         if not text.strip().isdigit():
-            await update.message.reply_text(
+            await render.reply(update.message,
                 "أرسل رقم الذاكرة فقط، أو «all» لنسيان الكل.",
                 reply_markup=InlineKeyboardMarkup(back),
             )
@@ -2371,7 +2718,7 @@ async def memory_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["memory_mode"] = None
         memory_id = int(text.strip())
         ok = services.memory.forget(user_id, memory_id)
-        await update.message.reply_text(
+        await render.reply(update.message,
             "🗑️ تم نسيان الذاكرة." if ok else "❌ لم أجد ذاكرة بهذا الرقم.",
             reply_markup=InlineKeyboardMarkup(back),
         )
@@ -2379,7 +2726,8 @@ async def memory_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 #: Keys that put the bot into a "the next plain-text message is the input of
 #: this flow" mode. Each is consumed by exactly one branch of `text_router`.
-TEXT_MODE_KEYS = ("knowledge_mode", "memory_mode")
+TEXT_MODE_KEYS = ("knowledge_mode", "memory_mode", "study_session_mode",
+                 "prog_concept_mode")
 
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2407,6 +2755,10 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await knowledge_question(update, context)
     if context.user_data.get("memory_mode"):
         return await memory_text(update, context)
+    if context.user_data.get("study_session_mode"):
+        return await study_session_topic(update, context)
+    if context.user_data.get("prog_concept_mode"):
+        return await prog_concept_text(update, context)
     return None
 
 
@@ -2439,7 +2791,7 @@ async def menu_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await query.edit_message_text(
+    await render.edit(query,
         f"مرحباً بعودتك {user.first_name}! 👋\n\n"
         f"أنا AUSTRO AI، جاهز لمساعدتك اليوم! 💪\n\n"
         f"اختر ما تريد:",
@@ -2450,8 +2802,20 @@ async def menu_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==================== ADAPTIVE LEARNING HUB (PHASE E) ====================
 
 
+def _new_goal_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎯 هدف تعلم جديد", callback_data="learn_newgoal")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="menu_main")],
+    ])
+
+
 async def menu_learn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Learning hub: overview + actions."""
+    """Learning hub: overview + actions.
+
+    Every read is defensive: a single failing sub-query used to make the whole
+    hub answer with the generic "حدث خطأ" bubble and hide the user's own
+    progress, so a degraded overview is always preferred to no overview.
+    """
     if not await guard_command_action(update, context):
         return None
     query = update.callback_query
@@ -2459,34 +2823,37 @@ async def menu_learn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     services = get_services(context)
     user_id = update.effective_user.id
 
-    line = "🧠 **رحلة التعلم**\n━━━━━━━━━━━━━━━━━━━━\n"
-    goals = services.learning_engine.goals(user_id)
-    long_term = [g for g in goals if g.get("kind") == "long_term"]
-    curriculum_id = None
-    curriculum_goal = None
-    if long_term:
-        goal_id = long_term[0]["goal_id"]
-        curricula = services.learning_engine.curricula(user_id, goal_id)
-        curriculum_goal = long_term[0]
-        curriculum_id = curricula[0]["curriculum_id"] if curricula else None
+    pair = await _learning_curriculum(services, user_id)
+    if not pair:
+        line = ("🧠 **رحلة التعلم**\n━━━━━━━━━━━━━━━━━━━━\n"
+                "لا يوجد مسار تعلم بعد.\nابدأ بإنشاء هدف وماذا تريد أن تتعلم.")
+        await render.edit(query, line, reply_markup=_new_goal_keyboard(),
+                          parse_mode="Markdown")
+        return None
 
-    if curriculum_id is None:
-        line += "لا يوجد مسار تعلم بعد.\nلك ابدأ بإنشاء هدف وماذا تريد أن تتعلم."
-        keyboard = [
-            [InlineKeyboardButton("🎯 هدف تعلم جديد", callback_data="learn_newgoal")],
-            [InlineKeyboardButton("🔙 رجوع", callback_data="menu_main")],
-        ]
-        await query.edit_message_text(line, reply_markup=InlineKeyboardMarkup(keyboard),
-                                      parse_mode="Markdown")
-        return
+    goal = pair["goal"]
+    curriculum = pair["curriculum"]
+    line = ("🧠 **رحلة التعلم**\n━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎯 الهدف: **{goal.get('title') or 'هدف'}**\n")
+    try:
+        overview = services.learning_engine.progress_overview(user_id)
+        line += (f"📚 أهداف تعليمية: {overview.objectives_total} — متقن "
+                 f"{overview.mastered} | قريب {overview.near_mastery}\n"
+                 f"🔁 مراجعات مستحقة: {overview.due_reviews}\n")
+    except Exception as exc:  # noqa: BLE001 - degraded overview beats a crash
+        logger.warning("progress_overview failed for user %s: %s", user_id, exc)
 
-    focus = services.learning_engine.coach_today(user_id)
-    overview = services.learning_engine.progress_overview(user_id)
-    line += f"🎯 الهدف: **{curriculum_goal.get('title')}**\n"
-    line += (f"📚 أهداف تعليمية: {overview.objectives_total} — متقن "
-             f"{overview.mastered} | قريب {overview.near_mastery}\n")
-    line += f"🔁 مراجعات مستحقة: {overview.due_reviews}\n\n"
-    line += f"💡 {focus.get('reason') or focus.get('focus')}"
+    modules = curriculum.get("modules") or []
+    if modules:
+        line += f"🗂️ الوحدات: {len(modules)}\n"
+    try:
+        focus = services.learning_engine.coach_today(user_id) or {}
+        hint = focus.get("reason") or focus.get("focus")
+        if hint:
+            line += f"\n💡 {hint}"
+    except Exception as exc:  # noqa: BLE001 - coaching is optional context
+        logger.warning("coach_today failed for user %s: %s", user_id, exc)
+
     keyboard = [
         [InlineKeyboardButton("📖 الدرس التالي", callback_data="menu_learn_next")],
         [InlineKeyboardButton("📝 اختبار سريع", callback_data="menu_learn_quiz"),
@@ -2496,18 +2863,34 @@ async def menu_learn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🎯 هدف جديد", callback_data="learn_newgoal")],
         [InlineKeyboardButton("🔙 رجوع", callback_data="menu_main")],
     ]
-    await query.edit_message_text(line, reply_markup=InlineKeyboardMarkup(keyboard),
-                                  parse_mode="Markdown")
+    await render.edit(query, line, reply_markup=InlineKeyboardMarkup(keyboard),
+                      parse_mode="Markdown")
+    return None
 
 
 async def _learning_curriculum(services, user_id: int) -> dict:
-    """First long-term goal + its first curriculum (or None)."""
-    goals = services.learning_engine.goals(user_id)
+    """First long-term goal + its first curriculum (empty dict when absent).
+
+    Reads go through the *facade* methods (`curricula(...)`, not the
+    `curricula_` sub-engine): before this, the facade method was shadowed by
+    the engine attribute of the same name and every call raised
+    `TypeError: 'CurriculumEngine' object is not callable`, which is what made
+    "الدرس التالي" answer with the generic error bubble.
+    """
+    try:
+        goals = services.learning_engine.goals(user_id)
+    except Exception as exc:  # noqa: BLE001 - a broken read must not crash the UI
+        logger.error("learning goals read failed for user %s: %s", user_id, exc)
+        return {}
     long_term = [g for g in goals if g.get("kind") == "long_term"]
     if not long_term:
         return {}
     goal = long_term[0]
-    curricula = services.learning_engine.curricula(user_id, goal["goal_id"])
+    try:
+        curricula = services.learning_engine.curricula(user_id, goal["goal_id"])
+    except Exception as exc:  # noqa: BLE001
+        logger.error("curricula read failed for user %s: %s", user_id, exc)
+        return {}
     curriculum = curricula[0] if curricula else None
     if curriculum is None:
         return {}
@@ -2527,7 +2910,7 @@ async def menu_learn_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not pair:
         keyboard = [[InlineKeyboardButton("🎯 هدف تعلم جديد", callback_data="learn_newgoal")],
                     [InlineKeyboardButton("🔙 تعلم", callback_data="menu_learn")]]
-        await query.edit_message_text(
+        await render.edit(query,
             "لا يوجد مسار تعلم بعد. ابدأ بإنشاء هدف.",
             reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return
@@ -2539,11 +2922,11 @@ async def menu_learn_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:  # noqa: BLE001
         logger.error(f"Learning next_lesson failed for user {user_id}: {e}")
-        await query.edit_message_text("❌ حدث خطأ أثناء تحضير الدرس. حاول مجدداً.")
+        await render.edit(query, "❌ حدث خطأ أثناء تحضير الدرس. حاول مجدداً.")
         return
     if outcome is None:
         keyboard = [[InlineKeyboardButton("🔙 تعلم", callback_data="menu_learn")]]
-        await query.edit_message_text("لا يوجد هدف تعليمي متاح بعد.", reply_markup=InlineKeyboardMarkup(keyboard))
+        await render.edit(query, "لا يوجد هدف تعليمي متاح بعد.", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     context.user_data["learn_session_state"] = {
@@ -2572,7 +2955,7 @@ async def menu_learn_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔁 المراجعة", callback_data="menu_learn_review")],
         [InlineKeyboardButton("🔙 تعلم", callback_data="menu_learn")],
     ]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard),
+    await render.edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard),
                                   parse_mode="Markdown")
 
 
@@ -2624,10 +3007,10 @@ async def _render_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "\n".join(lines)
     keyboard = _quiz_buttons(questions, answers)
     try:
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard),
+        await render.edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard),
                                       parse_mode="Markdown")
     except Exception:  # noqa: BLE001 - message may be replaced
-        await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard),
+        await render.reply(query.message, text, reply_markup=InlineKeyboardMarkup(keyboard),
                                        parse_mode="Markdown")
 
 
@@ -2649,7 +3032,7 @@ async def menu_learn_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if outcome is None:
                 keyboard = [[InlineKeyboardButton("📖 الدرس التالي", callback_data="menu_learn_next")],
                             [InlineKeyboardButton("🔙 تعلم", callback_data="menu_learn")]]
-                await query.edit_message_text(
+                await render.edit(query,
                     "ابدأ الدرس أولاً حتى يكون لديك اختبار سريع.",
                     reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
                 return
@@ -2731,7 +3114,7 @@ async def _grade_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session_id = state.get("session_id")
     context.user_data["learn_quiz"] = None
     if objective_id is None or not questions:
-        await query.edit_message_text("لا يوجد اختبار نشط.", reply_markup=InlineKeyboardMarkup(
+        await render.edit(query, "لا يوجد اختبار نشط.", reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("🔙 تعلم", callback_data="menu_learn")]]))
         return
     try:
@@ -2740,7 +3123,7 @@ async def _grade_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:  # noqa: BLE001
         logger.error(f"Quick check grading failed for user {user_id}: {e}")
-        await query.edit_message_text("❌ تعذر تقييم الاختبار. حاول مجدداً.")
+        await render.edit(query, "❌ تعذر تقييم الاختبار. حاول مجدداً.")
         return
     result = graded["result"]
     text = (
@@ -2755,7 +3138,7 @@ async def _grade_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔁 المراجعة", callback_data="menu_learn_review")],
         [InlineKeyboardButton("🔙 تعلم", callback_data="menu_learn")],
     ]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard),
+    await render.edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard),
                                   parse_mode="Markdown")
 
 
@@ -2771,11 +3154,11 @@ async def menu_learn_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         due = services.learning_engine.due_reviews(user_id)
     except Exception as e:  # noqa: BLE001
         logger.error(f"Due reviews failed for user {user_id}: {e}")
-        await query.edit_message_text("❌ تعذر تحميل المراجعات.")
+        await render.edit(query, "❌ تعذر تحميل المراجعات.")
         return
     if not due:
         keyboard = [[InlineKeyboardButton("🔙 تعلم", callback_data="menu_learn")]]
-        await query.edit_message_text(
+        await render.edit(query,
             "🎉 لا توجد مراجعات مستحقة اليوم.", reply_markup=InlineKeyboardMarkup(keyboard))
         return
     first = due[0]
@@ -2791,7 +3174,7 @@ async def menu_learn_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("❌ نسيتها", callback_data=f"learn_r_no_{first_id}")],
         [InlineKeyboardButton("🔙 تعلم", callback_data="menu_learn")],
     ]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard),
+    await render.edit(query, text, reply_markup=InlineKeyboardMarkup(keyboard),
                                   parse_mode="Markdown")
 
 
@@ -2815,12 +3198,12 @@ async def learn_review_grade(update: Update, context: ContextTypes.DEFAULT_TYPE)
         services.learning_engine.record_review(user_id, review_id, correct)
     except Exception as e:  # noqa: BLE001
         logger.error(f"Review grading failed for user {user_id}: {e}")
-        await query.edit_message_text("❌ تعذر تسجيل المراجعة.")
+        await render.edit(query, "❌ تعذر تسجيل المراجعة.")
         return
     due = services.learning_engine.due_reviews(user_id)
     if not due:
         keyboard = [[InlineKeyboardButton("🔙 تعلم", callback_data="menu_learn")]]
-        await query.edit_message_text(
+        await render.edit(query,
             f"{reminder}\n\n🎉 لا يوجد المزيد من المراجعات اليوم.",
             reply_markup=InlineKeyboardMarkup(keyboard))
         return
@@ -2838,7 +3221,7 @@ async def menu_learn_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         plan = services.learning_engine.daily_plan(user_id)
     except Exception as e:  # noqa: BLE001
         logger.error(f"Learning plan failed for user {user_id}: {e}")
-        await query.edit_message_text("❌ تعذر إعداد الخطة.")
+        await render.edit(query, "❌ تعذر إعداد الخطة.")
         return
     lines = ["📋 **خطة تعلم اليوم**\n━━━━━━━━━━━━━━━━━━━━"]
     if not plan.get("items"):
@@ -2851,7 +3234,7 @@ async def menu_learn_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("\n_خُفِّضت الخطة لتلائم وقتك المتاح هذه الفترة._")
     lines.append(f"\n⏱️ الإجمالي: {plan.get('total_minutes')} دقيقة")
     keyboard = [[InlineKeyboardButton("🔙 تعلم", callback_data="menu_learn")]]
-    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard),
+    await render.edit(query, "\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard),
                                   parse_mode="Markdown")
 
 
@@ -2866,7 +3249,7 @@ async def menu_learn_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
         week = services.learning_engine.weekly_review(user_id)
     except Exception as e:  # noqa: BLE001
         logger.error(f"Weekly review failed for user {user_id}: {e}")
-        await query.edit_message_text("❌ تعذر إعداد الملخص الأسبوعي.")
+        await render.edit(query, "❌ تعذر إعداد الملخص الأسبوعي.")
         return
     lines = [
         "📊 **ملخص الأسبوع**",
@@ -2884,7 +3267,7 @@ async def menu_learn_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, change in enumerate((week.get("changes") or [])[:2], 1):
         lines.append(f"{i}. {change}")
     keyboard = [[InlineKeyboardButton("🔙 تعلم", callback_data="menu_learn")]]
-    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard),
+    await render.edit(query, "\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard),
                                   parse_mode="Markdown")
 
 
@@ -2895,7 +3278,7 @@ async def learn_newgoal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     keyboard = [[InlineKeyboardButton("🔙 تعلم", callback_data="menu_learn")]]
-    await query.edit_message_text(
+    await render.edit(query,
         "🎯 **هدف تعليمي جديد**\n\nأرسل عنوان الهدف الطويل الأمد.\n"
         "مثال: تعلم لغة البرمجة بايثون",
         reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -2905,11 +3288,11 @@ async def learn_newgoal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def learn_goal_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     title = (update.message.text or "").strip()
     if not title:
-        await update.message.reply_text("أرسل اسم الهدف من فضلك.")
+        await render.reply(update.message, "أرسل اسم الهدف من فضلك.")
         return LEARN_GOAL_TITLE
     context.user_data["learn_pending_title"] = title
     keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="menu_learn")]]
-    await update.message.reply_text(
+    await render.reply(update.message,
         "🌱 **أهداف التعليم**\n\nأرسل الأهداف التعليمية، هدف في كل سطر:\n"
         "مثال:\nالمتغيرات\nالحلقات\nالدوال",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -2917,48 +3300,131 @@ async def learn_goal_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return LEARN_GOAL_OBJECTIVES
 
 
+MAX_LEARN_OBJECTIVES = 12
+
+
+def _parse_objectives(text: str) -> list:
+    """Split the user's message into objective titles.
+
+    Accepts one per line (the documented format) and also comma-separated
+    input, strips bullet/numbering prefixes the user may paste, de-duplicates
+    case-insensitively and caps the list so a pasted document cannot create
+    hundreds of objectives by accident.
+    """
+    raw = (text or "").replace("\r", "\n")
+    candidates = []
+    for chunk in raw.split("\n"):
+        parts = [chunk] if "," not in chunk else chunk.split(",")
+        candidates.extend(parts)
+    titles: list = []
+    seen = set()
+    for candidate in candidates:
+        cleaned = candidate.strip()
+        cleaned = re.sub(r"^(?:[-–—*•]|\d+[.)\-:])\s*", "", cleaned).strip()
+        if not cleaned:
+            continue
+        key = cleaned.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        titles.append(cleaned)
+    return titles[:MAX_LEARN_OBJECTIVES]
+
+
 async def learn_objectives_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Create a long-term learning goal, its objectives and its curriculum."""
+    """Create a long-term learning goal, its objectives and its curriculum.
+
+    The whole creation is one transaction from the user's point of view: if the
+    curriculum cannot be built the goal is still kept (the user's input is real
+    work) and they are told exactly what happened instead of being shown the
+    generic error bubble and losing the goal.
+    """
     if not await guard_ai_action(update, context):
         return None
     services = get_services(context)
     user_id = update.effective_user.id
-    text = (update.message.text or "").strip()
-    title = context.user_data.pop("learn_pending_title", "هدف تعلم")
-    chain = services.learning_engine.create_goal_chain(
-        user_id, vision=f"رؤيتي: {title}", long_term=title,
-    )
+    title = context.user_data.pop("learn_pending_title", "").strip() or "هدف تعلم"
+    lines = _parse_objectives(update.message.text or "")
+    back_keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🔙 تعلم", callback_data="menu_learn")]])
+
+    if not lines:
+        await render.reply(update.message,
+            "لم أجد أي هدف تعليمي في رسالتك.\nأرسل هدفاً واحداً في كل سطر:\n"
+            "المتغيرات\nالحلقات\nالدوال",
+            reply_markup=back_keyboard, parse_mode="Markdown")
+        return LEARN_GOAL_OBJECTIVES  # stay in the state so the user can retry
+
+    try:
+        chain = services.learning_engine.create_goal_chain(
+            user_id, vision=f"رؤيتي: {title}", long_term=title,
+        )
+    except Exception as exc:  # noqa: BLE001 - report, do not crash the flow
+        logger.error("create_goal_chain failed for user %s: %s", user_id, exc)
+        await render.reply(update.message,
+            "❌ تعذر إنشاء الهدف الآن. حاول مرة أخرى بعد قليل.",
+            reply_markup=back_keyboard)
+        return LEARN_GOAL_OBJECTIVES
+
     goal_id = chain.get("long_term_goal_id")
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    objectives = []
+    if not goal_id:
+        await render.reply(update.message,
+            "❌ لم يُحفظ الهدف. حاول مرة أخرى.", reply_markup=back_keyboard)
+        return ConversationHandler.END
+
+    objective_ids: list = []
     previous = None
+    failed = 0
     for line in lines:
-        objective_id = services.learning_engine.add_objective(
-            user_id, goal_id, title=line,
-            prerequisites=[previous] if previous else None,
-        )
+        try:
+            objective_id = services.learning_engine.add_objective(
+                user_id, goal_id, title=line,
+                prerequisites=[previous] if previous else None,
+            )
+        except Exception as exc:  # noqa: BLE001 - one bad row must not lose the rest
+            logger.error("add_objective failed for user %s: %s", user_id, exc)
+            objective_id = None
         if objective_id:
-            objectives.append(objective_id)
+            objective_ids.append(objective_id)
             previous = objective_id
-    if goal_id and objectives:
-        curriculum = services.learning_engine.build_curriculum(
-            user_id, goal_id, title=title, mode="READ",
-        )
-        keyboard = [
-            [InlineKeyboardButton("📖 ابدأ الدرس", callback_data="menu_learn_next")],
-            [InlineKeyboardButton("🔙 تعلم", callback_data="menu_learn")],
-        ]
-        await update.message.reply_text(
-            f"✅ أُنشئ الهدف «{title}» ومعه {len(objectives)} مادة تعليمية، "
-            f"وتم تجهيز المنهج (وحدات {len((curriculum or {}).get('modules') or [])}).",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
-    else:
-        await update.message.reply_text(
+        else:
+            failed += 1
+
+    curriculum = None
+    curriculum_error = None
+    if objective_ids:
+        try:
+            curriculum = services.learning_engine.build_curriculum(
+                user_id, goal_id, title=title, mode="READ",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("build_curriculum failed for user %s: %s", user_id, exc)
+            curriculum_error = str(exc)
+
+    if not objective_ids:
+        await render.reply(update.message,
             "أُنشئ الهدف لكن لم تُضف مواد تعليمية. جرّب مرة أخرى.",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("🔙 تعلم", callback_data="menu_learn")]]),
-        )
+            reply_markup=back_keyboard)
+        return ConversationHandler.END
+
+    modules = len((curriculum or {}).get("modules") or [])
+    text = (f"✅ أُنشئ الهدف «{title}» ومعه {len(objective_ids)} مادة تعليمية.\n")
+    if failed:
+        text += f"⚠️ تعذرت إضافة {failed} مادة. يمكنك إضافتها لاحقاً.\n"
+    if curriculum_error:
+        text += ("⚠️ حُفظ الهدف والمواد، لكن تعذر تجهيز المنهج الآن. "
+                 "اضغط «الدرس التالي» للمحاولة مرة أخرى.\n")
+    elif modules:
+        text += f"🗂️ تم تجهيز المنهج في {modules} وحدة.\n"
+    text += "\nاضغط «ابدأ الدرس» للبدء."
+
+    keyboard = [
+        [InlineKeyboardButton("📖 ابدأ الدرس", callback_data="menu_learn_next")],
+        [InlineKeyboardButton("🔙 تعلم", callback_data="menu_learn")],
+    ]
+    await render.reply(update.message, text,
+                       reply_markup=InlineKeyboardMarkup(keyboard),
+                       parse_mode="Markdown")
     return ConversationHandler.END
 
 
@@ -3214,15 +3680,20 @@ def get_menu_handlers() -> list:
         CallbackQueryHandler(goal_list, pattern="^goal_list$"),
         CallbackQueryHandler(menu_plan, pattern="^menu_plan$"),
         CallbackQueryHandler(plan_today, pattern="^plan_today$"),
+        CallbackQueryHandler(plan_complete_task, pattern="^plan_task_\\d+(_0)?$"),
         CallbackQueryHandler(menu_discipline, pattern="^menu_discipline$"),
+        CallbackQueryHandler(discipline_challenge, pattern="^discipline_challenge$"),
         CallbackQueryHandler(discipline_check, pattern="^discipline_check$"),
         CallbackQueryHandler(menu_study, pattern="^menu_study$"),
+        CallbackQueryHandler(study_session, pattern="^study_session$"),
         CallbackQueryHandler(menu_english, pattern="^menu_english$"),
         CallbackQueryHandler(english_lesson, pattern="^english_lesson$"),
         CallbackQueryHandler(menu_programming, pattern="^menu_programming$"),
+        CallbackQueryHandler(prog_concept, pattern="^prog_concept$"),
         CallbackQueryHandler(menu_habits, pattern="^menu_habits$"),
         CallbackQueryHandler(habit_list, pattern="^habit_list$"),
         CallbackQueryHandler(menu_progress, pattern="^menu_progress$"),
+        CallbackQueryHandler(progress_stats, pattern="^progress_stats$"),
         CallbackQueryHandler(menu_coach, pattern="^menu_coach$"),
         CallbackQueryHandler(coach_analysis, pattern="^coach_analysis$"),
         CallbackQueryHandler(menu_dashboard, pattern="^menu_dashboard$"),
@@ -3278,7 +3749,7 @@ async def review_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not reviews:
         keyboard = [[InlineKeyboardButton("🌙 محاسبة جديدة", callback_data="review_daily")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(
+        await render.edit(query,
             "لا توجد مراجعات سابقة.",
             reply_markup=reply_markup,
         )
@@ -3298,7 +3769,7 @@ async def review_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await query.edit_message_text(
+    await render.edit(query,
         history_text,
         reply_markup=reply_markup,
         parse_mode="Markdown",

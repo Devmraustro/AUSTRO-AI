@@ -329,7 +329,12 @@ def test_router_handles_every_declared_text_mode():
     import inspect
 
     source = inspect.getsource(H.text_router)
-    assert set(H.TEXT_MODE_KEYS) == {"knowledge_mode", "memory_mode"}
+    assert set(H.TEXT_MODE_KEYS) == {
+        "knowledge_mode", "memory_mode", "study_session_mode", "prog_concept_mode",
+    }
     for key in H.TEXT_MODE_KEYS:
         assert key in source, f"text_router ignores the declared mode {key!r}"
-    assert "memory_text(" in source and "knowledge_question(" in source
+    # Every mode must forward to its own handler, not just be mentioned.
+    for handler in ("memory_text(", "knowledge_question(", "study_session_topic(",
+                    "prog_concept_text("):
+        assert handler in source, f"text_router never calls {handler}"

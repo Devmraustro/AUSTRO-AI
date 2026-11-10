@@ -102,6 +102,30 @@ class LearningService:
         )
         return (await self.ai.generate(request)).text
 
+    async def study_session(self, topic: str) -> str:
+        """Build a single, self-contained study session for one topic.
+
+        Kept deterministic in structure (three timed steps) so the learner can
+        follow it without re-reading, while the content comes from the model.
+        """
+        prompt = (
+            f"Design a focused 25-minute study session about '{topic}' in Arabic.\\n\\n"
+            "Structure it exactly like this:\\n"
+            "1. 🔎 تمهيد (3 دقائق): three questions to activate prior knowledge\\n"
+            "2. 📖 تعلّم (12 دقيقة): the core idea, explained simply with one example\\n"
+            "3. ✍️ تطبيق (10 دقائق): one exercise the learner must do now\\n\\n"
+            "Finish with a single line: «ما الذي يجب أن تخرج به من هذه الجلسة؟»\\n"
+            "Use short lines and emojis. Do not add an introduction or a closing."
+        )
+        request = AIRequest(
+            capability="study_session",
+            prompt=prompt,
+            system_prompt=AUSTRO_STUDY_PROMPT,
+            max_tokens=1536,
+            data={"topic": topic},
+        )
+        return (await self.ai.generate(request)).text
+
     async def english_lesson(self, level: str = "beginner") -> str:
         prompt = (
             f"Create a daily English lesson for {level} level.\n\n"

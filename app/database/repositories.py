@@ -45,6 +45,80 @@ _PROGRESS_FIELDS = frozenset({
 })
 
 
+def _load_json_list(raw: Any) -> List[Any]:
+    """Decode a JSON-array column into a list; any bad shape becomes []."""
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return raw
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return value if isinstance(value, list) else []
+
+
+def _load_flags(raw: Any, length: int) -> List[bool]:
+    """Decode ``daily_plans.completed_tasks`` into exactly ``length`` booleans.
+
+    Legacy rows may hold a JSON array, a ``{index: bool}`` object or NULL; every
+    shape is coerced so an old plan can still be completed from the bot.
+    """
+    flags = [False] * length
+    if isinstance(raw, list):
+        for index in range(min(length, len(raw))):
+            flags[index] = bool(raw[index])
+        return flags
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            try:
+                index = int(key)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= index < length:
+                flags[index] = bool(value)
+        return flags
+    if raw:
+        try:
+            decoded = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return flags
+        return _load_flags(decoded, length)
+    return flags
+
+
+#: Maximum optimistic retries when two workers flip *different* tasks of the
+#: same plan at the same moment. Each loser re-reads and re-issues; the loop is
+#: bounded so a pathological writer cannot spin a bot worker forever.
+_CAS_MAX_ATTEMPTS = 5
+
+
+def _cas_key(raw: Any) -> Optional[str]:
+    """Normalise a raw ``daily_plans.completed_tasks`` value for comparison.
+
+    The column is ``TEXT`` on SQLite *and* PostgreSQL, and legacy rows hold a
+    JSON array, a ``{index: bool}`` object, ``''`` or ``NULL``. Instead of
+    asking the engine to parse JSON (``json_each`` on SQLite vs ``jsonb`` casts
+    on PostgreSQL - not portable), the compare-and-set is done on the *exact
+    text that was read*:
+
+    * a non-empty value is compared verbatim, so the UPDATE can only match a row
+      that still holds the state this worker saw;
+    * ``NULL`` and ``''`` are folded to ``None`` so a brand-new plan (``NULL``)
+      and an emptied one (``''``) compare alike.
+
+    Returning ``None`` means "the column is empty", and the statement then uses
+    ``IS NULL``/``= ''`` semantics explicitly.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        # A driver may hand back an already-decoded value; re-encode it so the
+        # comparison is still against the exact text in the column.
+        raw = json.dumps(raw)
+    return raw if raw != "" else None
+
+
 class _BaseRepository:
     """Shared helpers: locked access to the thread-local connection."""
 
@@ -292,6 +366,245 @@ class PlanRepository(_BaseRepository):
             self._rollback()
             logger.error(f"Database error in get_daily_plan: {e}")
             return None
+
+    def set_task_state(self, user_id: int, date: str, index: int,
+                       done: bool) -> Optional[Dict[str, Any]]:
+        """Move one task to an explicit state, exactly once - across processes.
+
+        WHY THIS EXISTS (delivered-callback idempotency + atomicity)
+        -----------------------------------------------------------
+        Telegram retries a callback query when the bot does not answer fast
+        enough, and several application workers (each with its own Python
+        process, its own ``Database`` instance and therefore its own
+        ``threading.RLock``) can handle the same tap concurrently. Two
+        properties are required and neither can be provided by a Python lock:
+
+        1. **Exactly one successful transition.** Two workers that both read
+           "not done" and both write "done" must not both report a transition,
+           otherwise ``progress.tasks_completed`` is incremented twice.
+        2. **Atomicity of state + accounting.** ``daily_plans.completed_tasks``
+           and ``progress.tasks_completed`` must move together - a failure
+           after one of them must leave neither applied.
+
+        Implementation
+        --------------
+        The transition is a single **conditional UPDATE**::
+
+            UPDATE daily_plans
+               SET completed_tasks = <json with index flipped>, status = ?
+             WHERE user_id = ? AND date = ?
+               AND COALESCE(completed_tasks, '') = ?
+
+        The ``WHERE`` clause carries the *exact text* this worker read (see
+        ``_cas_key``), so the storage engine - not Python - decides the race:
+        ``cursor.rowcount`` is 1 only for the statement that actually replaced
+        the old state, and 0 for every worker that arrived after it. This is
+        plain SQL-92 (``UPDATE``, ``COALESCE``, ``SET``/``WHERE``) and therefore
+        identical on SQLite and PostgreSQL; no ``RETURNING``, no ``json_each``,
+        no ``group_concat``/``string_agg`` and no engine-specific branch is
+        needed, so there is no dialect that can silently diverge.
+
+        ``rowcount == 0`` is not always a lost *transition*: it can also mean
+        two workers flipped two *different* tasks at the same time, in which
+        case the losing worker's intended state was never applied. The loop
+        therefore re-reads and re-issues a bounded number of times
+        (``_CAS_MAX_ATTEMPTS``); if the target state is already in place, the
+        answer is ``already`` - a repeated callback never counts twice no matter
+        which branch it takes.
+
+        The plan write and the accounting write share ONE transaction that is
+        committed here, right after the accounting ``INSERT ... ON CONFLICT``
+        (``ON CONFLICT`` on ``(user_id, date)`` is supported by SQLite 3.24+ and
+        PostgreSQL 9.5+, and the ``progress`` table already carries the
+        ``uq_progress_user_date`` unique index that the clause needs), so on any
+        failure both are rolled back.
+
+        Returns ``None`` when the plan or the task index does not exist,
+        otherwise:
+          * ``{"status": "changed", "done": <bool>, "task": <title>,
+               "flags": [...]}``
+          * ``{"status": "already", "done": <bool>, "task": <title>,
+               "flags": [...]}``      - the task is provably in the requested
+               state; this call did not move it
+          * ``{"status": "contended", "done": <bool>, "task": <title>,
+               "flags": [...]}``      - the state is UNKNOWN/unchanged after
+               ``_CAS_MAX_ATTEMPTS`` attempts because the row kept changing;
+               nothing was applied and the caller may retry
+        Only ``changed`` represents a real transition; statistics are written
+        from that status alone. ``already`` is never reported without a read
+        that proves the requested state, and ``contended`` never claims one.
+        """
+        try:
+            with self._manager._lock:
+                connection = self._connection()
+                cursor = connection.cursor()
+                cursor.execute(
+                    "SELECT tasks, completed_tasks FROM daily_plans "
+                    "WHERE user_id = ? AND date = ?",
+                    (user_id, date),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+
+                def _col(name: str, position: int):
+                    return row[name] if isinstance(row, dict) else row[position]
+
+                tasks = _load_json_list(_col("tasks", 0))
+                if not 0 <= index < len(tasks):
+                    return None
+
+                task = tasks[index]
+                title = (task.get("task") or task.get("title")
+                         if isinstance(task, dict) else str(task))
+
+                # Optimistic compare-and-set. Each attempt re-reads the raw
+                # column and issues ONE conditional UPDATE; the engine grants it
+                # to exactly one writer, so a repeated or concurrent callback
+                # can never produce two transitions.
+                for _attempt in range(_CAS_MAX_ATTEMPTS):
+                    raw_flags = _col("completed_tasks", 1)
+                    stored = _load_flags(raw_flags, len(tasks))
+                    if stored[index] == bool(done):
+                        return {"status": "already", "done": bool(done),
+                                "task": title, "flags": stored}
+
+                    flags = list(stored)
+                    flags[index] = bool(done)
+                    status = "completed" if flags and all(flags) else "pending"
+                    expected = _cas_key(raw_flags)
+
+                    # Two COMPLETE literal statements rather than a built-up
+                    # string: no SQL is ever assembled at runtime, so the
+                    # injection surface of a string-concatenated query is absent
+                    # (and static checkers see plain constants).
+                    if expected is None:
+                        # Empty/NULL column: match only rows still empty.
+                        cursor.execute(
+                            "UPDATE daily_plans SET completed_tasks = ?, status = ? "
+                            "WHERE user_id = ? AND date = ? "
+                            "AND COALESCE(completed_tasks, '') = ''",
+                            (json.dumps(flags), status, user_id, date),
+                        )
+                    else:
+                        cursor.execute(
+                            "UPDATE daily_plans SET completed_tasks = ?, status = ? "
+                            "WHERE user_id = ? AND date = ? "
+                            "AND COALESCE(completed_tasks, '') = ?",
+                            (json.dumps(flags), status, user_id, date, expected),
+                        )
+                    if cursor.rowcount == 1:
+                        break  # this worker owns the transition
+
+                    # Lost the race. Either the same task was just flipped by
+                    # another worker (=> "already" on the next read) or a
+                    # different task changed and our state was never applied
+                    # (=> retry with fresh text). Re-read and decide.
+                    connection.rollback()
+                    cursor.execute(
+                        "SELECT tasks, completed_tasks FROM daily_plans "
+                        "WHERE user_id = ? AND date = ?",
+                        (user_id, date),
+                    )
+                    row = cursor.fetchone()
+                    if row is None:
+                        return None
+                    tasks = _load_json_list(_col("tasks", 0))
+                    if not 0 <= index < len(tasks):
+                        return None
+                    task = tasks[index]
+                    title = (task.get("task") or task.get("title")
+                             if isinstance(task, dict) else str(task))
+                else:
+                    # Attempts exhausted without this worker ever owning the
+                    # transition. This does NOT prove the task reached the
+                    # requested state: another writer may still be flipping it,
+                    # and the last compare-and-set may have been rejected
+                    # because the row kept changing under us. Reporting
+                    # "already" here would claim a success nobody verified, so
+                    # the outcome is decided by a real read (and only a read):
+                    #   * target state present  -> "already" (genuinely applied)
+                    #   * target state absent   -> "contended" (nothing applied,
+                    #                              safe to retry)
+                    verified = self._read_flags(user_id, date, len(tasks))
+                    if verified is None:
+                        return None
+                    if verified[index] == bool(done):
+                        return {"status": "already", "done": bool(done),
+                                "task": title, "flags": verified}
+                    return {"status": "contended", "done": bool(done),
+                            "task": title, "flags": verified}
+
+                # Accounting in the SAME transaction, then a single commit.
+                # The +1 only ever happens for a not-done -> done transition,
+                # which this statement has just owned.
+                delta = 1 if done else -1
+                cursor.execute(
+                    "INSERT INTO progress (user_id, date, tasks_completed) "
+                    "VALUES (?, ?, ?) "
+                    "ON CONFLICT (user_id, date) DO UPDATE SET "
+                    "tasks_completed = MAX(COALESCE(progress.tasks_completed, 0) + ?, 0)",
+                    (user_id, date, max(delta, 0), delta),
+                )
+                connection.commit()
+                return {"status": "changed", "done": bool(done),
+                        "task": title, "flags": flags}
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in set_task_state: {e}")
+            return None
+
+    def _read_flags(self, user_id: int, date: str,
+                    length: int) -> Optional[List[bool]]:
+        """Read the current completion flags (helper for the lost-race path)."""
+        try:
+            with self._manager._lock:
+                cursor = self._connection().cursor()
+                cursor.execute(
+                    "SELECT completed_tasks FROM daily_plans "
+                    "WHERE user_id = ? AND date = ?",
+                    (user_id, date),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                raw = row["completed_tasks"] if isinstance(row, dict) else row[0]
+                return _load_flags(raw, length)
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in _read_flags: {e}")
+            return None
+
+    def set_completed(self, user_id: int, date: str,
+                      completed: List[bool]) -> bool:
+        """Persist per-task completion flags for one user's plan.
+
+        Scoped by ``user_id`` as well as ``date`` so a stale callback from
+        another account can never mark someone else's tasks. ``completed`` is
+        stored as a JSON array parallel to ``tasks``.
+        """
+        try:
+            with self._manager._lock:
+                flags = [bool(value) for value in completed]
+                cursor = self._connection().cursor()
+                cursor.execute(
+                    "UPDATE daily_plans SET completed_tasks = ? "
+                    "WHERE user_id = ? AND date = ?",
+                    (json.dumps(flags), user_id, date),
+                )
+                updated = cursor.rowcount
+                if updated:
+                    status = "completed" if flags and all(flags) else "pending"
+                    cursor.execute(
+                        "UPDATE daily_plans SET status = ? WHERE user_id = ? AND date = ?",
+                        (status, user_id, date),
+                    )
+                self._connection().commit()
+                return updated > 0
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in set_completed_tasks: {e}")
+            return False
 
 
 class HabitRepository(_BaseRepository):
@@ -630,6 +943,42 @@ class StatsRepository(_BaseRepository):
         "total_reviews": 0,
     }
 
+    def log_completed_task(self, user_id: int, date: str, delta: int = 1) -> bool:
+        """Adjust the number of completed tasks recorded for one day.
+
+        ``progress.tasks_completed`` is what the dashboard, the weekly summary
+        and the coach read, so completing a plan task has to update it - but
+        never by double counting: re-tapping a task that is already done sends
+        ``delta=0`` from the caller, and un-completing it subtracts, clamped at
+        zero so a legacy row cannot go negative.
+        """
+        if delta == 0:
+            return True
+        try:
+            with self._manager._lock:
+                cursor = self._connection().cursor()
+                if delta > 0:
+                    cursor.execute(
+                        "INSERT INTO progress (user_id, date, tasks_completed) "
+                        "VALUES (?, ?, ?) "
+                        "ON CONFLICT (user_id, date) DO UPDATE SET "
+                        "tasks_completed = COALESCE(progress.tasks_completed, 0) + ?",
+                        (user_id, date, delta, delta),
+                    )
+                else:
+                    cursor.execute(
+                        "UPDATE progress SET tasks_completed = "
+                        "MAX(COALESCE(tasks_completed, 0) + ?, 0) "
+                        "WHERE user_id = ? AND date = ?",
+                        (delta, user_id, date),
+                    )
+                self._connection().commit()
+                return True
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in log_completed_task: {e}")
+            return False
+
     def dashboard(self, user_id: int) -> Dict[str, Any]:
         """Get comprehensive dashboard statistics."""
         try:
@@ -761,6 +1110,17 @@ class Database:
 
     def get_daily_plan(self, user_id: int, date: str) -> Optional[Dict[str, Any]]:
         return self.plans.get(user_id, date)
+
+    def set_daily_plan_completed(self, user_id: int, date: str,
+                                 completed: List[bool]) -> bool:
+        return self.plans.set_completed(user_id, date, completed)
+
+    def set_daily_plan_task_state(self, user_id: int, date: str, index: int,
+                                  done: bool) -> Optional[Dict[str, Any]]:
+        return self.plans.set_task_state(user_id, date, index, done)
+
+    def log_completed_task(self, user_id: int, date: str, delta: int = 1) -> bool:
+        return self.stats.log_completed_task(user_id, date, delta)
 
     def create_habit(self, user_id: int, name: str, description: str,
                      frequency: str = "daily", reminder_time: str = "08:00") -> Optional[int]:

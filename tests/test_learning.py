@@ -83,7 +83,7 @@ def test_container_wires_learning_engine(container):
 def test_curriculum_respects_prerequisites_and_orders(engine):
     _, _, curriculum_id = _seed_goal(engine)
     curriculum = engine.curriculum(OWNER, curriculum_id)
-    ordered = engine.curricula.ordered_objective_ids(curriculum)
+    ordered = engine.curricula_.ordered_objective_ids(curriculum)
     assert ordered == sorted(ordered), "topological order broken"
     assert len(ordered) == 3
 
@@ -302,13 +302,13 @@ def test_export_learning_includes_sessions_completed_and_not(engine):
     goal_id, objective_ids, curriculum_id = _seed_goal(engine)
 
     # Create a session directly
-    session = engine.sessions.start(
+    session = engine.sessions_.start(
         OWNER, objective_ids[0], goal_id, curriculum_id, "READ"
     )
     session_id = session.session_id
 
     # Complete the session
-    engine.sessions.complete(session, minutes=10)
+    engine.sessions_.complete(session, minutes=10)
 
     exported = engine.export_learning(OWNER)
     session_ids = {s["session_id"] for s in exported.get("sessions", [])}
@@ -945,8 +945,8 @@ def test_session_manager_get_rejects_other_owner(engine):
     outcome = _start_lesson(engine, curriculum_id)
     session_id = outcome["session"]["session_id"]
 
-    assert engine.sessions.get(OWNER, session_id) is not None
-    assert engine.sessions.get(OTHER, session_id) is None
+    assert engine.sessions_.get(OWNER, session_id) is not None
+    assert engine.sessions_.get(OTHER, session_id) is None
 
 
 def test_continue_session_does_not_leak_other_owner(engine):
@@ -970,19 +970,19 @@ def test_engine_paths_reject_cross_user_objective_ids(engine):
     assert not engine.quick_check(OTHER, session_id, objective_id)
 
     # Flashcards and lesson content for the wrong owner yield nothing.
-    assert engine.flashcards.from_objective(OTHER, objective_id) == []
-    assert engine.lessons.get(OWNER, outcome["lesson"]["lesson_id"]) is not None
+    assert engine.flashcards_.from_objective(OTHER, objective_id) == []
+    assert engine.lessons_.get(OWNER, outcome["lesson"]["lesson_id"]) is not None
 
 
 def test_session_completion_records_progress_for_the_owner(engine):
     """Regression: completion must pass owner_user_id through to the repo."""
     _, _, curriculum_id = _seed_goal(engine)
     outcome = _start_lesson(engine, curriculum_id)
-    session = engine.sessions.get(OWNER, outcome["session"]["session_id"])
+    session = engine.sessions_.get(OWNER, outcome["session"]["session_id"])
     assert session is not None
     session_id = session.session_id
 
-    engine.sessions.complete(session, minutes=17)
+    engine.sessions_.complete(session, minutes=17)
 
     store = engine._store
     row = store.sessions.get(OWNER, session_id)
