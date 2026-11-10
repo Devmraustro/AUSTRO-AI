@@ -507,9 +507,14 @@ async def test_edit_falls_back_to_a_new_message_when_editing_fails():
 
 
 def _registered_patterns() -> list:
+    from app.telegram import privacy_handlers as P
+
     patterns = []
     for handler in H.get_menu_handlers():
         patterns.append((handler.pattern, handler.callback.__name__))
+    for handler in P.get_privacy_handlers():
+        patterns.append((getattr(handler, "pattern", None),
+                         getattr(handler.callback, "__name__", "?")))
     for factory in (
         H.get_registration_handlers, H.get_learning_handlers, H.get_goal_handlers,
         H.get_plan_handlers, H.get_study_handlers, H.get_english_handlers,

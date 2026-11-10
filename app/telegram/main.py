@@ -49,6 +49,11 @@ from app.telegram.handlers import (
     knowledge_document,
     text_router,
 )
+from app.telegram.privacy_handlers import (
+    get_privacy_handlers,
+    offer_deletion,
+    send_export,
+)
 
 # Pin console + file logging once, with redaction.
 setup_logging(settings)
@@ -322,6 +327,23 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
+async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/export - send the user a JSON copy of all data stored about them."""
+    if not await guard_command_action(update, context):
+        return
+    services = get_services(context)
+    await send_export(update, context, services)
+
+
+async def delete_account_command(update: Update,
+                                 context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/delete - offer account erasure; destroys nothing until confirmed."""
+    if not await guard_command_action(update, context):
+        return
+    services = get_services(context)
+    await offer_deletion(update, context, services)
+
+
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Answer /cancel when NO conversation is active.
 
@@ -412,6 +434,8 @@ TELEGRAM_COMMANDS = [
     BotCommand("dashboard", "لوحة التحكم"),
     BotCommand("settings", "الإعدادات"),
     BotCommand("knowledge", "المعرفة"),
+    BotCommand("export", "نسخة من بياناتي"),
+    BotCommand("delete", "حذف حسابي وبياناتي"),
     BotCommand("cancel", "إلغاء"),
 ]
 
@@ -467,6 +491,8 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("dashboard", dashboard_command))
     application.add_handler(CommandHandler("settings", settings_command))
     application.add_handler(CommandHandler("knowledge", knowledge_command))
+    application.add_handler(CommandHandler("export", export_command))
+    application.add_handler(CommandHandler("delete", delete_account_command))
 
     # Add conversation handlers
     application.add_handler(get_registration_handlers())
@@ -479,6 +505,13 @@ def build_application() -> Application:
     application.add_handler(get_accountability_handlers())
     application.add_handler(get_habit_handlers())
     application.add_handler(get_reminder_handlers())
+
+    # Privacy: /export, /delete (with confirmation) and knowledge-source
+    # deletion. Registered BEFORE the generic text handler so `/delete` is a
+    # command, never a message routed into a waiting flow, and before the menu
+    # callbacks so `kdel:`/`privacy_*` patterns are matched by their owner.
+    for handler in get_privacy_handlers():
+        application.add_handler(handler)
 
     # Add callback query handlers (menu handlers)
     for handler in get_menu_handlers():

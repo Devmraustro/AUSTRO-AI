@@ -50,6 +50,20 @@ MAIN_COMMAND_RATELIMITS = {
     "coach_command": f"{COMMAND}+{AI}",
     # /cancel must always work so a throttled user can leave a conversation.
     "cancel_command": NONE,
+    # Privacy (app/telegram/privacy_handlers.py). `/export` builds a snapshot of
+    # the caller's own data and `/delete` only *offers* erasure, so both spend
+    # one command slot like the rest.
+    "export_command": COMMAND,
+    "delete_account_command": COMMAND,
+}
+
+# Inline-button callbacks that are not slash commands. They are reached only
+# from a message the user already paid a command slot to render, and each one is
+# bound to a one-time token (deletion) or a source id the caller owns.
+PRIVACY_CALLBACKS = {
+    "delete_confirm_callback",
+    "delete_cancel_callback",
+    "delete_source_callback",
 }
 
 # Internal lifecycle callbacks, not user-facing entry points.
@@ -200,6 +214,7 @@ def test_registered_commands_are_all_mapped():
     registered = _registered_callbacks(app)
     declared = (
         set(MAIN_COMMAND_RATELIMITS)
+        | set(PRIVACY_CALLBACKS)
         | set(H.ENTRY_POINT_RATELIMITS)
         | set(H.UNGUARDED_CONVERSATION_STATES)
         | {"fallback_cancel", "_ingest_book"}

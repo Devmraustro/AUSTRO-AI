@@ -27,6 +27,7 @@ from app.application.users import UserService
 from app.coaching.service import CoachingService
 from app.config.settings import Settings, settings as default_settings
 from app.core.errors import ConfigurationError
+from app.application.privacy import PrivacyService
 from app.database import db as default_db
 from app.database.repositories import Database
 from app.knowledge.collections import CollectionService
@@ -74,6 +75,7 @@ class ServiceContainer:
     coaching: CoachingService = field(default=None)  # type: ignore[assignment]
     knowledge: KnowledgeService = field(default=None)  # type: ignore[assignment]
     memory: MemoryService = field(default=None)  # type: ignore[assignment]
+    privacy: PrivacyService = field(default=None)  # type: ignore[assignment]
 
     def bot_data(self) -> Dict[str, Any]:
         """The dict that should be attached to `context.bot_data`."""
@@ -150,6 +152,14 @@ def build_container(
         memory_service=memory,
     )
 
+    privacy = PrivacyService(
+        db=database,
+        knowledge_storage=storage,
+        knowledge=knowledge,
+        learning_engine=learning_engine,
+        memory=memory,
+    )
+
     return ServiceContainer(
         db=database,
         settings=config,
@@ -168,6 +178,7 @@ def build_container(
         coaching=coaching,
         knowledge=knowledge,
         memory=memory,
+        privacy=privacy,
     )
 
 

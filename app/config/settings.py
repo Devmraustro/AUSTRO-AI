@@ -100,6 +100,11 @@ class Settings:
     db_name: str = "austro_ai"
     db_user: str = "austro"
     db_password: str = ""
+    # Retention (days) for append-only operational logs. These are enforced by
+    # the daily `purge_expired_logs` job; 0 disables the purge for that table.
+    # PRIVACY_RETENTION.md §2.2 previously listed these as "planned only".
+    activity_log_retention_days: int = 90
+    coach_log_retention_days: int = 90
     db_pool_size: int = 5
     db_max_overflow: int = 10
     db_pool_timeout: int = 30
@@ -345,6 +350,8 @@ def load_settings() -> Settings:
         db_name=os.getenv("DB_NAME", "austro_ai"),
         db_user=os.getenv("DB_USER", "austro"),
         db_password=os.getenv("DB_PASSWORD", ""),
+        activity_log_retention_days=int(os.getenv("ACTIVITY_LOG_RETENTION_DAYS", "90")),
+        coach_log_retention_days=int(os.getenv("COACH_LOG_RETENTION_DAYS", "90")),
         db_pool_size=int(os.getenv("DB_POOL_SIZE", "5")),
         db_max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "10")),
         db_pool_timeout=int(os.getenv("DB_POOL_TIMEOUT", "30")),

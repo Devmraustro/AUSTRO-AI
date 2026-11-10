@@ -932,6 +932,280 @@ class ActivityRepository(_BaseRepository):
             return False
 
 
+class PrivacyRepository(_BaseRepository):
+    """Account-wide data export and erasure.
+
+    WHY THIS EXISTS
+    ---------------
+    `PRIVACY_RETENTION.md` recorded an honest gap: goals, habits, plans,
+    reviews, sessions, reminders and knowledge sources were retained
+    indefinitely, and no `/export` or `/delete` command existed, so a user had
+    no way to obtain or erase their own data. Deleting a row by hand was also
+    unsafe: the learning, memory and knowledge stores live behind their own
+    facades and their derived tables are deleted by cascade or by explicit
+    cleanup.
+
+    The two operations here are the *account-level* ones:
+
+    * :meth:`export` returns a JSON-serialisable snapshot of everything this
+      user owns.
+    * :meth:`delete_all` erases every row belonging to the user.
+
+    DESIGN NOTES
+    ------------
+    * The table lists are module-level tuples of **literal** table names, so no
+      identifier ever comes from a caller (see the `nosec B608` markers).
+    * Erasure runs in ONE transaction: a failure leaves the account exactly as
+      it was instead of half-deleted. Every statement is scoped by
+      `user_id`/`owner_user_id`; there is no `DELETE FROM t` without a WHERE.
+    * Child tables are deleted before their parents. The core schema also
+      declares `ON DELETE CASCADE`, so the explicit order is belt-and-braces on
+      SQLite (where `PRAGMA foreign_keys` must be on) and a guarantee on
+      PostgreSQL.
+    * `users` is deleted LAST, so the foreign keys never dangle.
+    """
+
+    #: Tables keyed by the `user_id` column of the core schema.
+    _USER_TABLES = (
+        "habit_logs",
+        "habits",
+        "daily_plans",
+        "progress",
+        "daily_reviews",
+        "study_sessions",
+        "english_progress",
+        "programming_progress",
+        "cybersecurity_progress",
+        "reminders",
+        "coach_logs",
+        "activity_log",
+        "goals",
+    )
+
+    #: Tables keyed by `owner_user_id` (learning / memory / knowledge stores).
+    #: Ordered children-before-parents.
+    _OWNER_TABLES = (
+        # knowledge: derived rows first, sources last
+        # (knowledge_citations has no owner column - see _INDIRECT_TABLES)
+        "knowledge_chunks",
+        "knowledge_embeddings",
+        "knowledge_sections",
+        "knowledge_versions",
+        "knowledge_documents",
+        "knowledge_retrieval_events",
+        "knowledge_source_claims",
+        "knowledge_collection_sources",
+        "knowledge_storage_files",
+        "knowledge_sources",
+        "knowledge_collections",
+        # memory
+        "memory_access_log",
+        "memory_events",
+        "memory_versions",
+        "memory_prefs",
+        "memories",
+        # learning
+        "learning_events",
+        "learning_progress",
+        "learning_plans",
+        "learning_reviews",
+        "learning_assessments",
+        "learning_misconceptions",
+        "learning_mastery",
+        "learning_sessions",
+        "learning_lessons",
+        "learning_curricula",
+        "learning_objectives",
+        "learning_goals",
+    )
+
+    #: Tables with no owner column of their own, scoped through a parent row.
+    #: ``knowledge_citations`` hangs off ``knowledge_retrieval_events`` (both
+    #: foreign keys are ON DELETE CASCADE), so it is erased by deleting the
+    #: events that own it - but it is counted and validated here so coverage is
+    #: explicit rather than accidental.
+    _INDIRECT_TABLES = (
+        ("knowledge_citations", "event_id", "knowledge_retrieval_events",
+         "event_id"),
+    )
+
+    def _count(self, cursor, table: str, column: str, user_id: int) -> int:
+        # `table`/`column` are literals from the tuples above, never user input.
+        cursor.execute(  # nosec B608
+            f"SELECT COUNT(*) FROM {table} WHERE {column} = ?",  # nosec B608
+            (user_id,),
+        )
+        row = cursor.fetchone()
+        return int(row[0] if row is not None else 0)
+
+    def counts(self, user_id: int) -> Dict[str, int]:
+        """Row counts per table for one user (used by the export summary)."""
+        result: Dict[str, int] = {}
+        try:
+            with self._manager._lock:
+                cursor = self._connection().cursor()
+                for table in self._USER_TABLES:
+                    result[table] = self._count(cursor, table, "user_id", user_id)
+                for table in self._OWNER_TABLES:
+                    result[table] = self._count(
+                        cursor, table, "owner_user_id", user_id
+                    )
+                for table, child_col, parent, parent_col in self._INDIRECT_TABLES:
+                    cursor.execute(  # nosec B608 - literal identifiers
+                        f"SELECT COUNT(*) FROM {table} WHERE {child_col} IN "  # nosec B608
+                        f"(SELECT {parent_col} FROM {parent} "  # nosec B608
+                        "WHERE owner_user_id = ?)",  # nosec B608
+                        (user_id,),
+                    )
+                    row = cursor.fetchone()
+                    result[table] = int(row[0] if row is not None else 0)
+                return result
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in privacy_counts: {e}")
+            return {}
+
+    def purge_expired_logs(self, activity_days: int, coach_days: int,
+                           now: Optional[datetime] = None) -> Dict[str, int]:
+        """Delete operational log rows older than the retention window.
+
+        `PRIVACY_RETENTION.md` §2.2 promised 90-day retention for
+        `activity_log` and `coach_logs` while nothing enforced it. The cutoff is
+        computed in Python (UTC) and compared as an ISO string, which behaves
+        identically on SQLite and PostgreSQL - SQLite's `date('now', '-N days')`
+        has no PostgreSQL equivalent, and the dialect layer does not rewrite it.
+
+        ``activity_days``/``coach_days`` <= 0 disable the purge for that table,
+        so an operator can opt out per table without editing code.
+
+        Returns the number of deleted rows per table.
+        """
+        reference = now or datetime.utcnow()
+        deleted = {"activity_log": 0, "coach_logs": 0}
+        try:
+            with self._manager._lock:
+                connection = self._connection()
+                cursor = connection.cursor()
+                if activity_days > 0:
+                    cutoff = (reference - timedelta(days=activity_days)).isoformat()
+                    cursor.execute(
+                        "DELETE FROM activity_log WHERE timestamp IS NOT NULL "
+                        "AND timestamp < ?",
+                        (cutoff,),
+                    )
+                    deleted["activity_log"] = max(cursor.rowcount, 0)
+                if coach_days > 0:
+                    cutoff_date = (reference - timedelta(days=coach_days)).strftime(
+                        "%Y-%m-%d"
+                    )
+                    # coach_logs.date is a DATE column holding YYYY-MM-DD.
+                    cursor.execute(
+                        "DELETE FROM coach_logs WHERE date IS NOT NULL AND date < ?",
+                        (cutoff_date,),
+                    )
+                    deleted["coach_logs"] = max(cursor.rowcount, 0)
+                connection.commit()
+                return deleted
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in purge_expired_logs: {e}")
+            return {"activity_log": 0, "coach_logs": 0}
+
+    def storage_keys(self, user_id: int) -> List[str]:
+        """Storage keys of this user's uploaded knowledge files."""
+        try:
+            with self._manager._lock:
+                cursor = self._connection().cursor()
+                cursor.execute(
+                    "SELECT storage_key FROM knowledge_storage_files "
+                    "WHERE owner_user_id = ?",
+                    (user_id,),
+                )
+                return [row[0] for row in cursor.fetchall() if row[0]]
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in privacy_storage_keys: {e}")
+            return []
+
+    def delete_all(self, user_id: int) -> Optional[Dict[str, int]]:
+        """Erase every row this user owns, in one transaction.
+
+        Returns the per-table number of deleted rows, or ``None`` when the
+        transaction failed (in which case NOTHING was deleted - the caller must
+        not tell the user their data is gone).
+        """
+        deleted: Dict[str, int] = {}
+        try:
+            with self._manager._lock:
+                connection = self._connection()
+                cursor = connection.cursor()
+                for table, child_col, parent, parent_col in self._INDIRECT_TABLES:
+                    cursor.execute(  # nosec B608 - literal identifiers
+                        f"DELETE FROM {table} WHERE {child_col} IN "  # nosec B608
+                        f"(SELECT {parent_col} FROM {parent} "  # nosec B608
+                        "WHERE owner_user_id = ?)",  # nosec B608
+                        (user_id,),
+                    )
+                    deleted[table] = max(cursor.rowcount, 0)
+                for table in self._OWNER_TABLES:
+                    cursor.execute(  # nosec B608 - literal table name
+                        f"DELETE FROM {table} WHERE owner_user_id = ?",  # nosec B608
+                        (user_id,),
+                    )
+                    deleted[table] = max(cursor.rowcount, 0)
+                for table in self._USER_TABLES:
+                    cursor.execute(  # nosec B608 - literal table name
+                        f"DELETE FROM {table} WHERE user_id = ?",  # nosec B608
+                        (user_id,),
+                    )
+                    deleted[table] = max(cursor.rowcount, 0)
+                # The account row goes last: every child is already gone, so no
+                # foreign key can dangle, and the user loses the profile last.
+                cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+                deleted["users"] = max(cursor.rowcount, 0)
+                connection.commit()
+                return deleted
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in privacy_delete_all: {e}")
+            return None
+
+    def export_rows(self, user_id: int) -> Dict[str, Any]:
+        """Raw rows this user owns, keyed by table (JSON-serialisable)."""
+        export: Dict[str, Any] = {}
+        try:
+            with self._manager._lock:
+                cursor = self._connection().cursor()
+                for table in self._USER_TABLES:
+                    cursor.execute(  # nosec B608 - literal table name
+                        f"SELECT * FROM {table} WHERE user_id = ?",  # nosec B608
+                        (user_id,),
+                    )
+                    export[table] = [dict(row) for row in cursor.fetchall()]
+                for table in self._OWNER_TABLES:
+                    cursor.execute(  # nosec B608 - literal table name
+                        f"SELECT * FROM {table} WHERE owner_user_id = ?",  # nosec B608
+                        (user_id,),
+                    )
+                    export[table] = [dict(row) for row in cursor.fetchall()]
+                for table, child_col, parent, parent_col in self._INDIRECT_TABLES:
+                    cursor.execute(  # nosec B608 - literal identifiers
+                        f"SELECT * FROM {table} WHERE {child_col} IN "  # nosec B608
+                        f"(SELECT {parent_col} FROM {parent} "  # nosec B608
+                        "WHERE owner_user_id = ?)",  # nosec B608
+                        (user_id,),
+                    )
+                    export[table] = [dict(row) for row in cursor.fetchall()]
+                cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+                row = cursor.fetchone()
+                export["users"] = [dict(row)] if row is not None else []
+                return export
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in privacy_export_rows: {e}")
+            return {}
+
+
 class StatsRepository(_BaseRepository):
     _DEFAULTS = {
         "total_goals": 0,
@@ -1053,6 +1327,7 @@ class Database:
         self.reminders = ReminderRepository(manager)
         self.activity = ActivityRepository(manager)
         self.stats = StatsRepository(manager)
+        self.privacy = PrivacyRepository(manager)
 
     # ---- connection passthrough (kept for test/tooling compatibility) ----
     @property
@@ -1167,6 +1442,10 @@ class Database:
                                         max_attempts: int) -> Optional[int]:
         """Count one failed one-off delivery; retire it at the configured limit."""
         return self.reminders.record_failed_delivery(reminder_id, max_attempts)
+
+    def purge_expired_logs(self, activity_days: int, coach_days: int):
+        """Delegate to `PrivacyRepository.purge_expired_logs`."""
+        return self.privacy.purge_expired_logs(activity_days, coach_days)
 
     def log_activity(self, user_id: int, action: str, details: str = "") -> bool:
         return self.activity.log(user_id, action, details)
