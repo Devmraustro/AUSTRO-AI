@@ -130,7 +130,7 @@ The table lists are module-level literals and a test asserts that *every* table 
 - **No Public Benchmarks:** Individual user progress, mastery levels, or assessment results are never shared or published.
 
 ### 4.3 What Is Shared (Explicitly)
-- **Export:** Only memories can be exported today, as JSON from the coach menu. A complete user data export is planned and not implemented.
+- **Export:** `/export` sends a complete JSON snapshot of the caller's data. The coach menu still exports memories on their own.
 - **Coach Context:** Coach data is shared only within the user's own session (isolated per user).
 - **Knowledge Sources:** Uploaded documents are per-user owned; re-uploads are idempotent via `UNIQUE(owner_user_id, checksum)`.
 
@@ -159,33 +159,33 @@ The table lists are module-level literals and a test asserts that *every* table 
 
 | Category | Data | Retention | Deletion Method (current) |
 |----------|------|-----------|---------------------------|
-| User Goals | Goals | Until deleted | Not available through the bot (`/forget` and `/delete` are planned) |
-| User Habits | Habits | Until deleted | Not available through the bot (`/forget` and `/delete` are planned) |
-| User Memories | Memories | Until deleted | Coach menu: forget by ID or clear all |
-| Knowledge Sources | Documents, chunks, embeddings | Until deleted | Not available through the bot (service layer only) |
-| Learning Data | Sessions, assessments, misconceptions | Until deleted | Not available through the bot (`/forget` is planned) |
-| Coach Data | Logs, focus, blockers | Planned 90 days | Not implemented (no writer exists for coach logs) |
-| Activity Log | Audit events | Planned 90 days | Not implemented (no writer exists for the activity log) |
+| User Goals | Goals | Until deleted | `/delete` (confirmed, transactional, verified) |
+| User Habits | Habits | Until deleted | `/delete` (confirmed, transactional, verified) |
+| User Memories | Memories | Until deleted | Coach menu: forget by ID or clear all; `/delete` erases all |
+| Knowledge Sources | Documents, chunks, embeddings | Until deleted | Per-source button in "كتبي" (`kdel:<id>`) removes row + file; `/delete` erases all |
+| Learning Data | Sessions, assessments, misconceptions | Until deleted | `/delete` erases every learning table |
+| Coach Data | Logs, focus, blockers | 90 days | Daily `retention_purge`; `/export` includes them |
+| Activity Log | Audit events | 90 days | Written by `ActivityRepository.log`; daily `retention_purge`; `/export` includes it |
 | Telemetry | Run metadata | Ring buffer (200 max) | Automatic (oldest purged) |
-| User Identity | Telegram user ID | Until account deleted | Not available through the bot (`/delete` is planned) |
+| User Identity | Telegram user ID | Until account deleted | `/delete` removes the `users` row last |
 
 ## 7. Compliance
 
 ### 7.1 GDPR Rights
 These are the current capabilities. The GDPR rights are not fully met by the current application.
-- **Right to Access:** Not fully available. Only memories can be exported (JSON, coach menu). A complete export (`/export`) is not implemented.
+- **Right to Access:** Available. `/export` returns a complete JSON snapshot of every row the caller owns (core, learning, memory and knowledge tables), scoped to that user.
 - **Right to Rectification:** Partially available. Memories can be edited through the coach menu. Other data editing paths were not re-verified for this document.
-- **Right to Erasure:** Not available as a full account erasure. `/delete` is not implemented. Memories can be forgotten or cleared through the coach menu. Knowledge sources cannot be deleted by users.
+- **Right to Erasure:** Available. `/delete` erases the account and every derived row in one transaction, after an explicit confirmation; knowledge sources can also be deleted individually (🗑 in "كتبي"). See §3.1.
 - **Right to Data Portability:** Not available as a complete machine-readable snapshot. Memory-only JSON export exists.
 
 ### 7.2 Data Protection Principles
 - **Purpose Limitation:** Data is used only for the user's personal development coaching and learning.
 - **Data Minimization:** Only data necessary for coaching/learning is collected; no extraneous fields.
 - **Accuracy:** User can review and correct their data at any time.
-- **Storage Limitation:** Retention periods are documented as planned targets (90 days for logs). They are not enforced by current code (see §2.2).
+- **Storage Limitation:** Retention is enforced for `activity_log` and `coach_logs` (90 days, daily job, §2.2). User-owned content is retained until the user deletes it.
 - **Integrity:** Checksums verify data integrity; duplicates are prevented.
 - **Confidentiality:** Data is isolated per user; no cross-user leakage.
-- **Accountability:** Planned, not implemented. The `activity_log` table exists, but no code writes to it today.
+- **Accountability:** `activity_log` is written by `ActivityRepository.log`, retained 90 days, and purged by the daily job (§2.2).
 
 ---
 # File: PRIVACY_RETENTION.md
