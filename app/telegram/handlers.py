@@ -228,6 +228,30 @@ async def guard_expensive_action(update: Update, context: ContextTypes.DEFAULT_T
     return True
 
 
+async def guard_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Check if the user is an admin. Returns False and sends a message if not admin."""
+    from app.config.settings import settings
+
+    admin_ids = settings.admin_user_ids
+    if not admin_ids:
+        # Admin commands are disabled entirely
+        await notify_rate_limited(update, "❌ أوامر الأدمن غير مفعلة.")
+        return False
+
+    user_id = update.effective_user.id
+    if user_id not in admin_ids:
+        await notify_rate_limited(update, "❌ هذا الأمر مخصص للأدمن فقط.")
+        return False
+
+    # Still spend a command slot for admin actions
+    _rl = get_rate_limit_middleware()
+    allowed, msg = await _rl.check_command_limit(update.effective_user.id)
+    if not allowed:
+        await notify_rate_limited(update, msg)
+        return False
+    return True
+
+
 async def fallback_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Common async cancel handler for ConversationHandler fallbacks.
 

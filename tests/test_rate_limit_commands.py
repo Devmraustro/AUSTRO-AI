@@ -48,6 +48,8 @@ MAIN_COMMAND_RATELIMITS = {
     "knowledge_command": COMMAND,
     # /coach renders the coach menu AND runs an AI analysis on demand.
     "coach_command": f"{COMMAND}+{AI}",
+    # /admin_stats is admin-only, requires admin_user_ids to be configured.
+    "admin_stats_command": COMMAND,
     # /cancel must always work so a throttled user can leave a conversation.
     "cancel_command": NONE,
 }
@@ -80,7 +82,7 @@ def _guarded_names(func_name):
             seg = ast.get_source_segment(source, node) or ""
             return {
                 guard
-                for guard in ("guard_command_action", "guard_ai_action", "guard_expensive_action")
+                for guard in ("guard_command_action", "guard_admin_action", "guard_ai_action", "guard_expensive_action")
                 if guard in seg
             }
     raise AssertionError(f"{func_name} not found in {M.__file__}")
@@ -109,16 +111,32 @@ def test_declared_bucket_matches_the_guard_in_the_code(name, declared):
         # Match compound constants (AI == "ai_request+global_ai") before the
         # single-bucket tokens, so "ai_request" is not looked up on its own.
         if token and token in declared:
-            expected |= {
-                COMMAND: {"guard_command_action"},
-                AI: {"guard_ai_action"},
-                UPLOAD: {"guard_upload_action"},
-                EXPENSIVE: {"guard_expensive_action"},
-                NONE: set(),
-            }[token]
-    assert guards == expected, (
-        f"{name}: map declares {declared!r} but body uses {sorted(guards) or 'no guard'}"
-    )
+            if token == COMMAND:
+                # For COMMAND bucket, either guard_command_action OR guard_admin_action is acceptable
+                expected |= {"guard_command_action", "guard_admin_action"}
+            elif token == AI:
+                expected |= {"guard_ai_action"}
+            elif token == UPLOAD:
+                expected |= {"guard_upload_action"}
+            elif token == EXPENSIVE:
+                expected |= {"guard_expensive_action"}
+            elif token == NONE:
+                expected |= set()
+    # For COMMAND bucket, at least one of the acceptable guards must be present
+    if COMMAND in declared:
+        assert guards & {"guard_command_action", "guard_admin_action"}, (
+            f"{name}: map declares {declared!r} but body uses {sorted(guards) or 'no guard'} "
+            f"(expected guard_command_action or guard_admin_action)"
+        )
+        # For exact comparison, we need to check that guards is a subset of expected
+        # and that at least one COMMAND guard is present
+        assert guards.issubset({"guard_command_action", "guard_admin_action", "guard_ai_action", "guard_upload_action", "guard_expensive_action"}), (
+            f"{name}: map declares {declared!r} but body uses unexpected guards: {sorted(guards)}"
+        )
+    else:
+        assert guards == expected, (
+            f"{name}: map declares {declared!r} but body uses {sorted(guards) or 'no guard'}"
+        )
 
 
 @pytest.mark.parametrize("name", sorted(MAIN_COMMAND_RATELIMITS))

@@ -93,6 +93,9 @@ class Settings:
     telegram_transport: str = "polling"  # "polling" | "webhook"
     staging_id: str = ""
     support_username: str = "Mr_Austro"
+    # Admin users (comma-separated list of Telegram user IDs; empty = admin commands disabled)
+    admin_user_ids: tuple = ()
+
     # Database settings
     db_engine: str = "sqlite"  # "sqlite" | "postgresql"
     db_host: str = "localhost"
@@ -339,6 +342,9 @@ def load_settings() -> Settings:
         webhook_secret=os.getenv("WEBHOOK_SECRET", ""),
         telegram_transport=os.getenv("TELEGRAM_TRANSPORT", "polling").strip().lower(),
         staging_id=os.getenv("AUSTRO_STAGING_ID", "").strip(),
+        admin_user_ids=tuple(
+            int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()
+        ),
         db_engine=os.getenv("DB_ENGINE", "sqlite"),
         db_host=os.getenv("DB_HOST", "localhost"),
         db_port=int(os.getenv("DB_PORT", "5432")),

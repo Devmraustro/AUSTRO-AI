@@ -35,6 +35,7 @@ from app.telegram.handlers import (
     _knowledge_menu_content_for,
     get_accountability_handlers,
     guard_ai_action,
+    guard_admin_action,
     guard_command_action,
     get_english_handlers,
     get_goal_handlers,
@@ -322,6 +323,47 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
+async def admin_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only command to show bot statistics."""
+    if not await guard_admin_action(update, context):
+        return
+    user_id = update.effective_user.id
+    services = get_services(context)
+
+    # We'll use the store to get the stats
+    try:
+        # Get total users
+        all_users = services.users.list_all()
+        total_users = len(all_users) if all_users else 0
+
+        # Get total plans
+        total_plans = len(services.plans.recent(user_id, limit=1000)) if hasattr(services.plans, 'recent') else 0
+
+        # Get knowledge sources count
+        total_sources = len(services.knowledge.list_sources(user_id)) if hasattr(services.knowledge, 'list_sources') else 0
+
+        # Get database info
+        db_info = "SQLite"
+        if hasattr(services, '_store') and hasattr(services._store, '_manager'):
+            db_info = f"SQLite ({services._store._manager.db_path})"
+
+        stats_text = (
+            "📊 **إحصائيات الأدمن**\n\n"
+            f"👥 **المستخدمون:** {total_users}\n"
+            f"📋 **الخطط:** {total_plans}\n"
+            f"📚 **مصادر المعرفة:** {total_sources}\n"
+            f"💾 **قاعدة البيانات:** {db_info}\n"
+            f"🤖 **النقل:** {services.settings.telegram_transport if hasattr(services, 'settings') else 'polling'}"
+        )
+
+        await render.reply(update.message, stats_text, parse_mode="Markdown")
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"Error in admin_stats: {e}")
+        await render.reply(update.message, "❌ حدث خطأ أثناء جلب الإحصائيات.")
+
+
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Answer /cancel when NO conversation is active.
 
@@ -413,6 +455,7 @@ TELEGRAM_COMMANDS = [
     BotCommand("settings", "الإعدادات"),
     BotCommand("knowledge", "المعرفة"),
     BotCommand("cancel", "إلغاء"),
+    BotCommand("admin_stats", "إحصائيات الأدمن (للمشرفين فقط)"),
 ]
 
 
@@ -467,6 +510,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("dashboard", dashboard_command))
     application.add_handler(CommandHandler("settings", settings_command))
     application.add_handler(CommandHandler("knowledge", knowledge_command))
+    application.add_handler(CommandHandler("admin_stats", admin_stats_command))
 
     # Add conversation handlers
     application.add_handler(get_registration_handlers())
