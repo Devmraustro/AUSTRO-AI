@@ -3,8 +3,8 @@
 > **Correction (2026-10-10):** Items 17, 18 and 19 below previously claimed `/forget`, `/export` and
 > `/delete` commands, admin-only enforcement, GDPR compliance, and complete data export/deletion. Those
 > claims are not supported by the code. The current verified state is in `PRIVACY_RETENTION.md` §3.1 and
-> §7. Only memory forget/clear and memory-only JSON export are reachable from Telegram. Account
-> export and deletion, knowledge-source deletion by users, and admin commands are not implemented.
+> §7. Account export (`/export`), confirmed account deletion (`/delete`) and per-source deletion are
+> now reachable from Telegram; admin commands are still not implemented.
 
 ## Executive Summary
 
@@ -32,7 +32,7 @@ Phase F has been successfully executed, covering evaluation frameworks, security
 | 15 | Database Hardening | Complete |
 | 16 | File/Knowledge Security | Complete |
 | 17 | Telegram Security | Complete |
-| 18 | Data Export/Deletion Verification | Partial (memory export only; account export/deletion not implemented) |
+| 18 | Data Export/Deletion Verification | Verified (2026-11-09): `/export`, confirmed `/delete` and per-source deletion implemented; `tests/test_privacy_account.py`, `tests/test_privacy_telegram.py`, PostgreSQL cases |
 | 19 | Privacy/Retention | Partial (documentation corrected; erasure and export gaps remain) |
 | 20 | AI Output Validation Audit | Complete |
 | 20 | AI Output Validation Audit | Complete |
@@ -210,10 +210,10 @@ Phase F has been successfully executed, covering evaluation frameworks, security
   - What AUSTRO stores (user-provided + derived data)
   - What AUSTRO does NOT store (raw prompts, LLM responses, secrets, conversation text)
   - Retention rules (90-day default for logs, indefinite for user data until deletion)
-  - Deletion rules (planned: /forget, /delete with cascade order, admin-initiated; not implemented)
+  - Deletion rules (/delete with a verified cascade order; no /forget by design; admin-initiated deletion still not implemented)
   - Data derivation (embeddings, progress models, mastery states are derived, not raw)
   - What is never shared globally (no global learning, no cross-user aggregation, no public benchmarks)
-  - GDPR rights: NOT verified as compliant. Erasure and full portability are not implemented (see PRIVACY_RETENTION.md §7.1)
+  - GDPR rights: access and erasure are now implemented (`/export`, confirmed `/delete`; see PRIVACY_RETENTION.md §3.1/§7). Compliance still needs a legal review and a live run - code alone does not make a claim of compliance.
   - Data protection principles (purpose limitation, minimization, accuracy, storage limitation, integrity, confidentiality, accountability)
 
 ### Phase F Item 20: AI Output Validation Audit

@@ -75,9 +75,9 @@ Full configuration options are documented in `.env.example` including:
 
 ## Chat commands (in Telegram)
 
-`/start` · `/help` · `/plan` · `/goals` · `/habits` · `/progress` · `/review` · `/coach` · `/dashboard` · `/settings` · `/cancel` · `/knowledge`
+`/start` · `/help` · `/plan` · `/goals` · `/habits` · `/progress` · `/review` · `/coach` · `/dashboard` · `/settings` · `/cancel` · `/knowledge` · `/export` · `/delete`
 
-Not implemented: `/forget`, `/export` and `/delete` are not registered. See `PRIVACY_RETENTION.md` §3.1 for what is and is not available.
+`/export` sends a JSON copy of everything stored about the caller; `/delete` erases the account after an explicit confirmation, in one transaction, and reports only what it verified. Knowledge sources can be deleted individually from "كتبي". The 90-day retention on `activity_log`/`coach_logs` is enforced by a daily job. See `PRIVACY_RETENTION.md` §3.1.
 
 ## Tests
 

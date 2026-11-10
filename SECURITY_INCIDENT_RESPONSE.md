@@ -48,7 +48,7 @@ Incidents are classified by severity:
 
 ### Verify
 1. Test /start command functionality
-2. Test key registered commands (`/start`, `/goals`, `/habits`, `/knowledge`, etc.; see `app/telegram/main.py`). `/forget`, `/export` and `/delete` are not implemented and must not be tested as commands.
+2. Test key registered commands (`/start`, `/goals`, `/habits`, `/knowledge`, `/export`, `/delete`, etc.; see `app/telegram/main.py`). `/forget` does not exist as a command; `/export` and `/delete` do, and `/delete` requires a confirmation tap.
 3. Verify conversation state isolation still works
 4. Confirm no user data was leaked during the compromise period
 
