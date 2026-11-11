@@ -1,20 +1,24 @@
 """AUSTRO AI - AI run telemetry.
 
-Records one line per generation: run id, capability, provider, model,
-latency, success, retries and (when safe) the error type. No prompts or
+Records one entry per generation in an in-memory ring buffer and emits one
+JSON object per run through the ``app.ai.telemetry`` logger. No prompts or
 responses are ever stored here, and secrets are never included.
-Cost fields (tokens_prompt, tokens_completion, estimated_cost_usd) are
-populated by the gateway/provider adapter at record time; they default to
-0/0/0.0 so a missing value is distinguishable from a zero-value one.
+Token/cost fields are populated by the gateway/provider adapter when the
+provider reports usage. ``None`` means "not reported"; ``0`` means a measured
+zero. The distinction matters: a fabricated zero would look like a free run.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from typing import List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -29,9 +33,9 @@ class AIRunRecord:
     success: bool
     retry_count: int = 0
     error: Optional[str] = None
-    tokens_prompt: int = 0
-    tokens_completion: int = 0
-    estimated_cost_usd: float = 0.0
+    tokens_prompt: Optional[int] = None
+    tokens_completion: Optional[int] = None
+    estimated_cost_usd: Optional[float] = None
     request_id: str = ""
     nonce: Optional[str] = None
 
@@ -58,9 +62,9 @@ class AITelemetry:
         success: bool,
         retry_count: int = 0,
         error: Optional[str] = None,
-        tokens_prompt: int = 0,
-        tokens_completion: int = 0,
-        estimated_cost_usd: float = 0.0,
+        tokens_prompt: Optional[int] = None,
+        tokens_completion: Optional[int] = None,
+        estimated_cost_usd: Optional[float] = None,
         request_id: str = "",
         nonce: Optional[str] = None,
     ) -> AIRunRecord:
@@ -85,6 +89,28 @@ class AITelemetry:
             self._records.append(record)
             if len(self._records) > self._max:
                 self._records = self._records[-self._max:]
+
+        # Log-based metrics: one JSON object per completed run. The standard
+        # redacting formatter still processes this record, and no prompt or
+        # response text is included.
+        logger.info(json.dumps({
+            "event": "ai_run",
+            "run_id": record.run_id,
+            "timestamp": record.timestamp,
+            "capability": record.capability,
+            "category": record.category,
+            "provider": record.provider,
+            "model": record.model,
+            "latency_ms": record.latency_ms,
+            "success": record.success,
+            "retry_count": record.retry_count,
+            "tokens_prompt": record.tokens_prompt,
+            "tokens_completion": record.tokens_completion,
+            "estimated_cost_usd": record.estimated_cost_usd,
+            "error": record.error,
+            "request_id": record.request_id,
+            "nonce": record.nonce,
+        }, ensure_ascii=False, separators=(",", ":")))
         return record
 
     def recent(self, limit: Optional[int] = None) -> List[AIRunRecord]:

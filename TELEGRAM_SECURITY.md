@@ -32,7 +32,7 @@ The conversation state is strictly per-user. No global/shared conversation state
 
 ### 2.2 State Storage
 - **Onboarding:** `user_onboarding` table tracks steps per user
-- **Pending Actions:** `coach_logs` and `activity_log` store per-user events
+- **Coach / Activity Logs:** `coach_logs` stores the per-user performance analysis written by the coach menu. `activity_log` has a repository writer but no caller, so it holds no events today.
 - **Session State:** Learning session state stored in `learning_sessions` with `owner_user_id` filtering
 
 ## 3. Command Authorization

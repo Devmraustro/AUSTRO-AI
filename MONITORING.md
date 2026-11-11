@@ -9,25 +9,25 @@ This document classifies monitoring capabilities into **IMPLEMENTED** (built int
 ## IMPLEMENTED: Application-Level Observability
 
 ### 1. Structured Logging (`app/observability/logging_config.py`)
-- **Format**: JSON-structured logs with UTC timestamps
+- **Format**: Plain-text records (`%(asctime)s - %(name)s - %(levelname)s - %(message)s`) in local time, not JSON. AI run telemetry embeds one JSON object inside the message (see §2).
 - **Redaction**: Automatic redaction of secrets (BOT_TOKEN, API keys, passwords, secrets)
 - **Output**: Console + file (`logs/bot.log`) with UTF-8 encoding
 - **Levels**: DEBUG, INFO, WARNING, ERROR (configurable via `AUSTRO_LOG_LEVEL`)
 
-### 2. AI Telemetry (`app/ai/telemetry.py`)
-Records per-request metrics:
+### 2. AI Telemetry (`app/ai/telemetry.py`, emitted from `app/ai/gateway.py`)
+One in-memory record **and one JSON log line** per completed request (`"event":"ai_run"`):
 - `run_id`: Unique request identifier
 - `capability`: AI capability used (chat, coaching, tutoring, etc.)
 - `category`: High-level category (personal_development, learning, etc.)
-- `provider`: `openrouter` or `local` (deterministic fallback)
+- `provider`: `openrouter`, `local` (deterministic fallback), or `none` (no provider answered)
 - `model`: Model name (e.g., `google/gemma-4-31b-it:free`)
 - `latency_ms`: End-to-end latency
 - `success`: Boolean success flag
-- `retry_count`: Number of retries attempted
-- `error`: Error class if failed
-- `tokens_prompt` / `tokens_completion`: Token usage
-- `estimated_cost_usd`: Estimated cost
-- `request_id` / `nonce`: Request tracing
+- `retry_count`: Retries attempted before the final outcome
+- `error`: Error class and detail if failed
+- `tokens_prompt` / `tokens_completion`: Provider-reported token usage; `null` when the provider omits it (`0` means a measured zero)
+- `estimated_cost_usd`: Provider-reported cost when present, otherwise `null`
+- `request_id` / `nonce`: Reserved tracing fields; currently always empty/`null`
 
 ### 3. Error Taxonomy (`app/core/errors.py`)
 Structured error classes with safe user messages:

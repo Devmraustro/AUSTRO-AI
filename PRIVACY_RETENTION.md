@@ -44,13 +44,13 @@ Most data is retained until the user explicitly deletes it.
 | Memories | Until deleted | Coach menu: view, search, edit, forget by ID, clear all, export as JSON. `/delete` also erases them. |
 | Knowledge Sources | Until deleted | Each source has a 🗑 button in "كتبي" (`kdel:<id>`) that removes the row **and** the stored file; `/delete` erases everything. |
 | Learning Sessions | Until deleted | `/delete` erases all learning tables. |
-| Coach Logs | 90 days | Enforced by the daily `retention_purge` job (`COACH_LOG_RETENTION_DAYS`). Included in `/export`. |
+| Coach Logs | 90 days | Written by `coach_analysis` (`app/telegram/handlers.py`); enforced by the daily `retention_purge` job (`COACH_LOG_RETENTION_DAYS`). Included in `/export`. |
 | Activity Log | 90 days | Written by `ActivityRepository.log`; enforced by the daily `retention_purge` job (`ACTIVITY_LOG_RETENTION_DAYS`); included in `/export`. |
 | Embeddings/Chunks | Per knowledge source | Removed when the source is deleted (🗑 button or `/delete`). |
 
 ### 2.2 System-Generated Retention
 - **Activity Log:** 90-day retention, enforced daily by `retention_purge` (03:10 UTC) via `PrivacyRepository.purge_expired_logs`.
-- **Coach Logs:** 90-day retention, same job; `COACH_LOG_RETENTION_DAYS=0` disables it.
+- **Coach Logs:** Written by `coach_analysis` (`app/telegram/handlers.py`) for each performance analysis; 90-day retention, same job; `COACH_LOG_RETENTION_DAYS=0` disables it.
 - **Embedding Cache:** Cleared on knowledge source re-upload (dedup via checksum).
 
 ### 2.3 Default Retention Settings
@@ -146,7 +146,7 @@ The table lists are module-level literals and a test asserts that *every* table 
 - **No Secrets in Prompts:** System prompts never include user data, API keys, or authentication tokens.
 
 ### 5.3 Telemetry Privacy
-- **No Prompt/Response Storage:** `AITelemetry.record()` stores only metadata (run_id, capability, provider, model, latency, success, retry_count, error, tokens, cost). Prompts and responses are never included.
+- **No Prompt/Response Storage:** `AITelemetry.record()` stores only metadata (run_id, capability, provider, model, latency, success, retry_count, error, tokens, cost) and emits the same metadata as one JSON log line. Prompts and responses are never included. Token/cost values are `null` when the provider does not report them.
 - **No Secret Inclusion:** API keys, bot tokens, or user-identifying data are never included in telemetry records.
 - **Ring Buffer:** Telemetry uses a bounded ring buffer (max 200 records) to prevent unbounded growth.
 

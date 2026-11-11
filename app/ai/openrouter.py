@@ -469,6 +469,7 @@ class OpenRouterProvider(AIProvider):
                     actual = data.get("model") if isinstance(data, dict) else None
                     if isinstance(actual, str) and actual.strip():
                         request.data["_actual_model"] = actual.strip()
+                    request.data["_usage"] = self._extract_usage(data)
                     return text
 
                 if response.status_code in (401, 403):
@@ -517,6 +518,45 @@ class OpenRouterProvider(AIProvider):
             raise AIProviderError(
                 _redact(f"OpenRouter request failed: {type(exc).__name__}", key)
             ) from exc
+
+    @staticmethod
+    def _token_count(value):
+        """Return a non-negative token count, or None when unusable.
+
+        Booleans are rejected explicitly: ``isinstance(True, int)`` is true and
+        a token count of ``true`` must not become ``1``.
+        """
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        return value
+
+    def _extract_usage(self, data) -> dict:
+        """Extract provider-reported usage for telemetry; never raises.
+
+        OpenRouter omits ``usage`` on some responses and may report only part
+        of it. Missing/malformed values stay ``None`` instead of becoming 0,
+        so telemetry never invents a free run. ``cost`` is only present when
+        the caller requested usage accounting.
+        """
+        usage = data.get("usage") if isinstance(data, dict) else None
+        if not isinstance(usage, dict):
+            return {
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "cost_usd": None,
+            }
+
+        cost = usage.get("cost")
+        if isinstance(cost, bool) or not isinstance(cost, (int, float)) or cost < 0:
+            cost = None
+        else:
+            cost = float(cost)
+
+        return {
+            "prompt_tokens": self._token_count(usage.get("prompt_tokens")),
+            "completion_tokens": self._token_count(usage.get("completion_tokens")),
+            "cost_usd": cost,
+        }
 
     def _extract_text(self, data) -> str:
         """Pull non-empty assistant text out of a chat-completions response.
