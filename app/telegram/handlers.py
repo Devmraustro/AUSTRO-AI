@@ -1563,6 +1563,20 @@ async def coach_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     analysis = await services.coaching.analyze(stats)
 
+    # Persist the analysis for the 90-day coach-log policy. A failed write is
+    # logged and never blocks the answer the user asked for.
+    try:
+        stored = services.db.coach_logs.add(
+            user_id, None, advice_given=analysis
+        )
+        if not stored:
+            logger.error("Failed to persist coach analysis for user %s", user_id)
+    except Exception as exc:  # noqa: BLE001 - a log write must not break the reply
+        logger.error(
+            "Failed to persist coach analysis for user %s: %s",
+            user_id, type(exc).__name__,
+        )
+
     keyboard = [
         [InlineKeyboardButton("🔙 رجوع", callback_data="menu_coach")],
     ]
