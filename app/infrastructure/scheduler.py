@@ -8,6 +8,7 @@ unit-tested with fakes and does not import a global.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import random
 from datetime import datetime, time, timedelta
@@ -79,6 +80,31 @@ class ReminderScheduler:
             time=time(hour=15, minute=0),
             name="motivation_reminder",
         )
+        # Retention: 03:10 UTC, after the 02:00 backup window. Previously the
+        # 90-day policy was documented but nothing enforced it.
+        self.application.job_queue.run_daily(
+            self._purge_expired_logs,
+            time=time(hour=3, minute=10),
+            name="retention_purge",
+        )
+
+    async def _purge_expired_logs(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Delete operational log rows past their retention window.
+
+        Disabled per table when the configured window is <= 0. A failure is
+        logged and swallowed: retention must never take the scheduler down.
+        """
+        try:
+            from app.config.settings import settings as _settings
+
+            deleted = await asyncio.to_thread(
+                self._db.purge_expired_logs,
+                _settings.activity_log_retention_days,
+                _settings.coach_log_retention_days,
+            )
+            logger.info("Retention purge removed: %s", deleted)
+        except Exception as exc:  # noqa: BLE001 - keep the loop alive
+            logger.error("Retention purge failed: %s", type(exc).__name__)
 
     async def _check_reminders(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Reconcile database reminders with the job queue and send due ones."""

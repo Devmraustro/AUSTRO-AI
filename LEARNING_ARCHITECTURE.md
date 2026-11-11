@@ -191,9 +191,10 @@ evidence kind and current state.
 
 ## 11. Privacy & delete
 
-**Status:** engine-level only. `export_learning` and `delete_learning` are called only from tests
-(`tests/test_learning.py`). No Telegram command or handler exposes them, so users cannot export or
-delete learning data today. A `/forget` command is planned but not registered.
+**Status:** `export_learning` is called by `PrivacyService.export` (behind `/export`), and the same
+service erases the learning tables in the account-deletion transaction (behind `/delete`).
+`LearningEngine.delete_learning` remains engine-level (used by tests); the account-wide path is the
+supported one, and there is deliberately no partial `/forget`.
 
 - `export_learning(owner)` returns a JSON-safe snapshot containing:
   - All goals, objectives, curricula, and mastery state.

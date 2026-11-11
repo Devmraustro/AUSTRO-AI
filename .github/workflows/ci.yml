@@ -87,7 +87,7 @@ jobs:
           # zero errors, and - critically - zero skips (the modules skip
           # themselves when PostgreSQL is unreachable or credentials are
           # wrong, which must fail this gate rather than pass silently).
-          expected = {"/tmp/pg_repos.xml": 25, "/tmp/pg_claim.xml": 7}
+          expected = {"/tmp/pg_repos.xml": 30, "/tmp/pg_claim.xml": 7}
           problems = []
           for path, want in expected.items():
               root = ET.parse(path).getroot()
@@ -105,7 +105,7 @@ jobs:
           if problems:
               sys.exit("ERROR: " + "; ".join(problems))
           PY
-          echo "PostgreSQL integration tests: 32 passed (25 repository + 7 claim), 0 skipped"
+          echo "PostgreSQL integration tests: 37 passed (30 repository + 7 claim), 0 skipped"
 
       - name: Run evaluation regression harness
         env:

@@ -39,8 +39,10 @@ Each step lists the command or file to use and what "done" means.
 - [ ] **5. Run the live Telegram E2E** exactly per `TELEGRAM_E2E_PROCEDURE.md`
   (onboarding → goals → habits → plans → study → knowledge upload + RAG Q&A →
   memory → coaching → reminders → memory export/forget (coach menu) → error/rate-limit UX).
-  Do NOT test `/export`, `/forget` or `/delete` as commands: they are not registered, and
-  account export/deletion is not implemented (see `PRIVACY_RETENTION.md` §3.1).
+  **Privacy flow (now implemented, must be exercised live):** `/export` must return a JSON
+  document; `/delete` must show the summary and a confirmation button, refuse a stale tap,
+  and report the verified result; the 🗑 button in "كتبي" must remove a source and its file.
+  There is deliberately no `/forget` (see `PRIVACY_RETENTION.md` §3.1).
   Mark `PRODUCTION_E2E_CHECKLIST.md` §5 items VERIFIED.
 
 ## PROVISION (operator / DevOps)

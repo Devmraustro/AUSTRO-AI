@@ -880,6 +880,141 @@ def test_pg_exhausted_attempts_report_contended_not_already(pg_db, monkeypatch):
     assert _pg_weekly(pg_db) == 1
 
 
+# ============================ PRIVACY: EXPORT / ERASURE ============================
+
+
+def _pg_seed_two_users(pg_db):
+    """Two users with data, so cross-user isolation is testable on real PG."""
+    from datetime import datetime
+
+    date = datetime.utcnow().strftime("%Y-%m-%d")
+    for uid in (1, 2):
+        pg_db.create_user(uid, f"user{uid}", f"User {uid}", "")
+        pg_db.plans.create(
+            uid, date, [{"task": f"t{uid}"}], [], "20:00", "10",
+        )
+        pg_db.create_goal(uid, f"goal{uid}", "", "cat", [], None)
+        pg_db.log_activity(uid, "test", f"activity{uid}")
+    return date
+
+
+def test_pg_delete_all_erases_every_row_and_verifies(pg_db):
+    _pg_seed_two_users(pg_db)
+    service_db = pg_db
+
+    before = service_db.privacy.counts(1)
+    assert before["daily_plans"] == 1 and before["goals"] == 1
+
+    deleted = service_db.privacy.delete_all(1)
+    assert deleted is not None
+    assert deleted["users"] == 1
+
+    residual = {k: v for k, v in service_db.privacy.counts(1).items() if v}
+    assert residual == {}, f"rows survived on PostgreSQL: {residual}"
+    assert service_db.get_user(1) is None
+
+
+def test_pg_delete_all_never_touches_another_user(pg_db):
+    _pg_seed_two_users(pg_db)
+    assert pg_db.privacy.delete_all(1) is not None
+
+    assert pg_db.get_user(2) is not None
+    remaining = pg_db.privacy.counts(2)
+    assert remaining["daily_plans"] == 1
+    assert remaining["goals"] == 1
+    assert remaining["activity_log"] >= 1
+
+
+def test_pg_export_rows_are_scoped_and_serialisable(pg_db):
+    import json
+
+    _pg_seed_two_users(pg_db)
+    rows = pg_db.privacy.export_rows(1)
+    assert rows, "export returned nothing on PostgreSQL"
+    assert rows["users"][0]["user_id"] == 1
+    for plan in rows["daily_plans"]:
+        assert plan["user_id"] == 1
+    # Every value must survive JSON encoding (datetimes are normalised).
+    from app.application.privacy import PrivacyService, _json_safe
+
+    json.dumps(_json_safe(rows))
+    assert PrivacyService  # imported for the encoder contract above
+
+
+def test_pg_purge_expired_logs_deletes_only_old_rows(pg_db):
+    from datetime import datetime, timedelta
+
+    pg_db.create_user(1, "u1", "U1", "")
+    conn = pg_db._get_connection()
+    cursor = conn.cursor()
+    old = datetime.utcnow() - timedelta(days=200)
+    fresh = datetime.utcnow()
+    for stamp, action in ((old, "old"), (fresh, "fresh")):
+        cursor.execute(
+            "INSERT INTO activity_log (user_id, action, details, timestamp) "
+            "VALUES (%s, %s, %s, %s)",
+            (1, action, "", stamp.isoformat()),
+        )
+    conn.commit()
+
+    deleted = pg_db.privacy.purge_expired_logs(90, 90)
+    assert deleted["activity_log"] >= 1
+
+    cursor.execute("SELECT action FROM activity_log WHERE user_id = %s", (1,))
+    actions = {row[0] for row in cursor.fetchall()}
+    assert "fresh" in actions
+    assert "old" not in actions, "an expired row survived the purge on PostgreSQL"
+
+
+def test_pg_deletion_rolls_back_completely(pg_db, monkeypatch):
+    """A failure mid-erasure must leave every row on PostgreSQL too."""
+    import psycopg2
+    from app.database.repositories import _BaseRepository
+
+    _pg_seed_two_users(pg_db)
+    original = _BaseRepository._connection
+    state = {"armed": False}
+
+    class _Cursor:
+        def __init__(self, cursor):
+            self._cursor = cursor
+
+        def execute(self, sql, *args, **kwargs):
+            if "DELETE FROM GOALS" in str(sql).upper():
+                state["armed"] = True
+                raise psycopg2.OperationalError("injected failure mid-erasure")
+            return self._cursor.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._cursor, name)
+
+    class _Connection:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def cursor(self):
+            return _Cursor(self._connection.cursor())
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    monkeypatch.setattr(
+        _BaseRepository, "_connection", lambda self: _Connection(original(self)),
+    )
+    try:
+        result = pg_db.privacy.delete_all(1)
+    finally:
+        monkeypatch.undo()
+
+    assert state["armed"] is True
+    assert result is None, "a rolled-back erasure reported success"
+
+    assert pg_db.get_user(1) is not None
+    remaining = pg_db.privacy.counts(1)
+    assert remaining["daily_plans"] == 1
+    assert remaining["goals"] == 1
+
+
 # ============================ SCHEDULER ============================
 
 

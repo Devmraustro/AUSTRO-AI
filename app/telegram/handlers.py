@@ -2073,14 +2073,25 @@ async def knowledge_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     lines = ["📚 **كتبك:**\n"]
+    keyboard = []
     for source in sources[:12]:
         label = _STATUS_LABELS.get(source["status"], source["status"])
         title = source.get("title") or source.get("file_name") or "بدون عنوان"
         lines.append(f"• {label} {title}")
-    keyboard = [
-        [InlineKeyboardButton("📥 إضافة كتاب", callback_data="knowledge_upload")],
-        [InlineKeyboardButton("🔙 رجوع", callback_data="menu_knowledge")],
-    ]
+        # Deletion used to exist only in the service layer, so a user could not
+        # remove an uploaded book at all (PRIVACY_RETENTION.md §2.1). One button
+        # per source makes the existing, already-verified deletion path
+        # reachable; the handler reports the real outcome.
+        keyboard.append([InlineKeyboardButton(
+            f"🗑 حذف: {title[:40]}",
+            callback_data=f"kdel:{source['source_id']}",
+        )])
+    keyboard.append(
+        [InlineKeyboardButton("📥 إضافة كتاب", callback_data="knowledge_upload")]
+    )
+    keyboard.append(
+        [InlineKeyboardButton("🔙 رجوع", callback_data="menu_knowledge")]
+    )
     await render.edit(query,
         "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(keyboard),

@@ -46,25 +46,28 @@ The `/start` command is the entry point and initializes user onboarding.
 - **No Admin-Only Restrictions at /start:** All users can start the bot.
 
 ### 3.2 Admin-Only Commands (status: not implemented)
-The `/forget`, `/export`, `/delete` and `/admin*` commands are **not registered** in the bot
+The `/forget` and `/admin*` commands are **not registered** in the bot
 (`app/telegram/main.py`), and the application has **no** `ADMIN_USER_IDS` setting and **no** admin
 check in `app/`. The admin-only enforcement described in earlier revisions of this document does not
 exist. Any future admin command must add that check and be tested before the command is registered.
 
-### 3.3 /forget Command (status: not implemented as a command)
+### 3.3 /export and /delete Commands
+Both are registered (`app/telegram/main.py`) and rate-limited. `/export` sends the caller a JSON
+snapshot of their own rows only. `/delete` destroys nothing on its own: it offers a confirmation
+button bound to a one-time token, the user id and a 10-minute deadline, and a replayed, stale or
+foreign tap is refused. Erasure is one transaction, verified by a re-read. See
+`PRIVACY_RETENTION.md` §3.1.
+
+### 3.4 /forget Command (status: not implemented by design)
 There is no `/forget` command. The equivalent user-facing actions exist only in the coach menu:
 - **Memory forget (by ID) and clear (all):** available from the memory menu (`memory_forget`,
   `memory_clear`, `memory_clear_confirm`). They are scoped to the invoking user's memories.
 - **Learning state clearance:** not available to users. `LearningEngine.delete_learning` exists and is
   unit-tested, but no handler calls it.
 
-### 3.4 /export and /delete (status: not implemented)
-There is no `/export` or `/delete` command, and no account-deletion flow.
-- **Memory export:** available as a JSON export from the coach menu (`memory_export`). It covers memories only.
-- **Account export and account deletion:** not implemented. `LearningEngine.export_learning` exists and is
-  unit-tested, but no handler calls it. Knowledge-source deletion exists only in the service layer.
-- Deletion cascade order and GDPR-related claims are planned design, not verified behaviour. See
-  `PRIVACY_RETENTION.md` §3 and §7.
+### 3.5 Memory export (coach menu)
+- **Memory export:** a JSON export from the coach menu (`memory_export`). It covers memories only;
+  `/export` covers everything.
 
 ## 4. File Upload Handling
 

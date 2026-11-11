@@ -7,9 +7,8 @@
 - **Scope:** full local security / correctness / runtime-readiness review of the
   repository at the baseline commit. No hosting, deployment, provisioning, or
   live-service access was performed or attempted.
-- **Status:** 17 defects fixed (F-1 through F-17); residual risks R-2, R-4 and
-  R-5 resolved and locally verified with regression tests; R-1 and R-3 remain
-  open. The pre-existing `register_upload` async mismatch (4 failing upload
+- **Status:** 17 defects fixed (F-1 through F-17); residual risks R-1 through
+  R-5 are all **resolved** and covered by regression tests (R-1/R-3 in §4). The pre-existing `register_upload` async mismatch (4 failing upload
   tests) is fixed — local suite 479 passed / 19 skipped / 0 failed, and CI run
   `37934832595` is green on every job (Python 3.10–3.14, Bandit, PostgreSQL
   integration, dependency audit, Docker/staging, performance, secret scan).
@@ -488,9 +487,9 @@ now also asserts that it is invisible before approval and retrievable after.
 
 | # | Severity | Item | Status |
 |---|---|---|---|
-| R-1 | Medium | Knowledge ingestion runs blocking PDF/ZIP parsing on the event loop | Open — `TextExtractor` is CPU/IO-bound and is invoked from async handlers. Fixing it requires threading the ingestion pipeline; deferred to avoid changing concurrency semantics without load evidence. |
+| R-1 | Medium | Knowledge ingestion runs blocking PDF/ZIP parsing on the event loop | **Resolved** — every CPU/IO-bound step (`extract`, `split_paragraphs`, storage reads) runs through `asyncio.to_thread` in `app/knowledge/ingestion.py`; `test_extraction_does_not_block_the_event_loop` fails if the wrapper is removed. |
 | R-2 | Medium | `scripts/pg_backup.py` writes unencrypted whole-database dumps | **Resolved** — AES-256-GCM encryption (`cryptography>=42`, 32-byte key from `BACKUP_ENCRYPTION_KEY_FILE`, fail-closed, stable versioned container, streaming, manifest SHA-256 of the original SQL) is implemented and verified by 16 tests in `tests/test_backup.py`. CI re-runs the container backup path. |
-| R-3 | Medium | Ingestion failure state machine can wedge a source | Open — some parse/IO failure paths do not transition the source out of its in-progress state, so a retry may not be scheduled. |
+| R-3 | Medium | Ingestion failure state machine can wedge a source | **Resolved** — `cleanup_attempt` fences the claim, moves the source to `failed` with an error message and increments `retry_count`, so a retry is possible. Verified by `test_a_failed_ingestion_does_not_wedge_the_source` and `test_a_failed_ingestion_can_be_retried_and_succeeds`. |
 | R-4 | Medium | Inconsistent owner_user_id scoping across some learning repositories | **Resolved** — see R-5. |
 | R-5 | Low | Owner filters inconsistent across learning repositories | **Resolved** — `LearningObjectivesRepository.get()`, `list_for_goal()`, `set_status()`, `update_mastery()`, `set_prerequisites()` and `SessionsRepository.get()`, `set_step()`, `complete()` enforce `owner_user_id` at the SQL boundary; all callers pass the owner explicitly. Verified by 10 IDOR/cross-user tests in `tests/test_learning.py`. |
 
@@ -547,6 +546,12 @@ Updated in this change set (upload async contract):
 
 - The 4 previously-failing upload/ingestion tests now pass; full suite is
   479 passed / 19 skipped / 0 failed locally (§2).
+
+Resolved after the original report (this change set): R-1 and R-3 (see §4), and the
+privacy gap in `PRIVACY_RETENTION.md` §3.1 — `/export`, `/delete` (confirmed,
+transactional, verified), per-source deletion and the 90-day retention purge are
+implemented and covered by `tests/test_privacy_account.py`,
+`tests/test_privacy_telegram.py` and the PostgreSQL suite.
 
 Still outstanding (not changed here, listed so it is not lost):
 
