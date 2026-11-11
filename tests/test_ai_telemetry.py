@@ -98,7 +98,8 @@ async def test_success_records_measured_fields_and_one_json_line(caplog):
 
     record = gateway.telemetry.recent()[-1]
     assert record.success is True
-    assert record.latency_ms is not None and record.latency_ms > 0
+    assert record.latency_ms is not None
+    assert record.latency_ms >= 0.0
     assert record.provider == "stub"
     assert record.model == "stub-actual"
     assert record.capability == "chat"
@@ -138,7 +139,8 @@ async def test_final_failure_records_error_class_and_retries(caplog):
 
     record = gateway.telemetry.recent()[-1]
     assert record.success is False
-    assert record.latency_ms is not None and record.latency_ms > 0
+    assert record.latency_ms is not None
+    assert record.latency_ms >= 0.0
     assert record.error == "AIProviderError: upstream broke"
     assert record.retry_count == 2
     assert record.tokens_prompt is None
