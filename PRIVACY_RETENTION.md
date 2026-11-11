@@ -23,7 +23,7 @@ This document describes the privacy guarantees, data retention rules, and deleti
 
 ### 1.3 What AUSTRO Does NOT Store
 - **Raw LLM Prompts:** User messages and AI prompts are NOT persisted to the database.
-- **LLM Responses:** AI-generated responses are NOT stored in the database (see telemetry below).
+- **LLM Chat Responses:** AI chat responses are not stored. The coach menu's performance analysis is the exception: `coach_analysis` writes it to `coach_logs.advice_given` (`app/telegram/handlers.py`). The planned 90-day purge does not exist yet.
 - **API Keys/Secrets:** Bot token, OpenRouter key, or any secrets are never stored in database records.
 - **Conversation Text:** Full conversation history is not stored as a monolithic blob; only audited events are logged.
 - **Knowledge search queries:** the text a user types into a knowledge search is NOT stored. Each
@@ -44,13 +44,13 @@ Most data is retained until the user explicitly deletes it.
 | Memories | Indefinite | Coach menu: view, search, edit, forget by ID, clear all, export as JSON. Hard delete is not reachable from the bot. |
 | Knowledge Sources | Indefinite | View and re-upload are available. Deletion exists only in the service layer and has no user-facing command, so users cannot delete their sources. |
 | Learning Sessions | Until course completion | No `/forget` command exists, so there is no user-facing clear. |
-| Coach Logs | 90 days (planned) | No code writes this table, and no export exists. |
+| Coach Logs | Indefinite today; 90-day purge planned | `coach_analysis` writes one row per analysis (`app/telegram/handlers.py`). No purge job or export exists, so rows currently persist. |
 | Activity Log | 90 days (planned) | No code writes this table, and no export exists. |
 | Embeddings/Chunks | Indefinite (per knowledge source) | Removed only when a source is deleted, and no user-facing source deletion exists (see above). |
 
 ### 2.2 System-Generated Retention
 - **Activity Log:** Planned 90-day retention. Not implemented: no code writes this table, and no setting or purge job exists.
-- **Coach Logs:** Planned 90-day retention. Not implemented: no code writes this table, and no setting or purge job exists.
+- **Coach Logs:** Written by `coach_analysis` (`app/telegram/handlers.py`) for every performance analysis the user requests. Planned 90-day retention is **not enforced**: no `COACH_LOG_RETENTION_DAYS` setting or purge job exists, so rows persist until manually deleted.
 - **Embedding Cache:** Cleared on knowledge source re-upload (dedup via checksum).
 
 ### 2.3 Default Retention Settings
@@ -136,7 +136,7 @@ No current command runs this cascade for a user account.
 - **No Secrets in Prompts:** System prompts never include user data, API keys, or authentication tokens.
 
 ### 5.3 Telemetry Privacy
-- **No Prompt/Response Storage:** `AITelemetry.record()` stores only metadata (run_id, capability, provider, model, latency, success, retry_count, error, tokens, cost). Prompts and responses are never included.
+- **No Prompt/Response Storage:** `AITelemetry.record()` stores only metadata (run_id, capability, provider, model, latency, success, retry_count, error, tokens, cost) and emits the same metadata as one JSON log line. Prompts and responses are never included. Token/cost values are `null` when the provider does not report them.
 - **No Secret Inclusion:** API keys, bot tokens, or user-identifying data are never included in telemetry records.
 - **Ring Buffer:** Telemetry uses a bounded ring buffer (max 200 records) to prevent unbounded growth.
 
@@ -154,7 +154,7 @@ No current command runs this cascade for a user account.
 | User Memories | Memories | Until deleted | Coach menu: forget by ID or clear all |
 | Knowledge Sources | Documents, chunks, embeddings | Until deleted | Not available through the bot (service layer only) |
 | Learning Data | Sessions, assessments, misconceptions | Until deleted | Not available through the bot (`/forget` is planned) |
-| Coach Data | Logs, focus, blockers | Planned 90 days | Not implemented (no writer exists for coach logs) |
+| Coach Data | Logs, focus, blockers | Coach logs: indefinite today (90-day purge planned) | Coach logs written by `coach_analysis`; no purge job exists, so no automatic deletion |
 | Activity Log | Audit events | Planned 90 days | Not implemented (no writer exists for the activity log) |
 | Telemetry | Run metadata | Ring buffer (200 max) | Automatic (oldest purged) |
 | User Identity | Telegram user ID | Until account deleted | Not available through the bot (`/delete` is planned) |
@@ -172,7 +172,7 @@ These are the current capabilities. The GDPR rights are not fully met by the cur
 - **Purpose Limitation:** Data is used only for the user's personal development coaching and learning.
 - **Data Minimization:** Only data necessary for coaching/learning is collected; no extraneous fields.
 - **Accuracy:** User can review and correct their data at any time.
-- **Storage Limitation:** Retention periods are documented as planned targets (90 days for logs). They are not enforced by current code (see §2.2).
+- **Storage Limitation:** Retention periods are documented as planned targets (90 days for logs). They are not enforced by current code: `coach_analysis` now writes `coach_logs` (`app/telegram/handlers.py`), but no purge job exists (see §2.2), so those rows currently persist indefinitely.
 - **Integrity:** Checksums verify data integrity; duplicates are prevented.
 - **Confidentiality:** Data is isolated per user; no cross-user leakage.
 - **Accountability:** Planned, not implemented. The `activity_log` table exists, but no code writes to it today.
