@@ -46,8 +46,10 @@ _DSN_CRED_RE = re.compile(
     r"[^:@/\s]+:([^@/\s]+)@"
 )
 # key=value / key: value / "key": "value" for any credential-ish label.
+# `tokens_prompt` / `tokens_completion` are telemetry counters, not secrets:
+# without the exclusion a six-digit count was rewritten to [REDACTED].
 _SECRET_PAIR_RE = re.compile(
-    r"(?i)((?:token|key|api[_ -]?key|password|passwd|pwd|secret|authorization|"
+    r"(?i)((?:token(?!s_(?:prompt|completion)\b)|key|api[_ -]?key|password|passwd|pwd|secret|authorization|"
     r"credential|private[_ -]?key|access[_ -]?key|client[_ -]?secret|"
     r"session[_ -]?key|webhook)[\w\s-]*?[\"\']?\s*[:=]\s*[\"\']?)"
     r"([^\s\"',;)\]}]{6,})"
