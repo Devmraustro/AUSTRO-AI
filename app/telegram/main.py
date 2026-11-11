@@ -34,6 +34,7 @@ from app.telegram import rendering as render
 from app.telegram.handlers import (
     _knowledge_menu_content_for,
     get_accountability_handlers,
+    guard_admin_action,
     guard_ai_action,
     guard_command_action,
     get_english_handlers,
@@ -441,6 +442,54 @@ async def _post_init(application: Application) -> None:
     await _register_telegram_commands(application)
 
 
+# Admin commands exist only when an admin list is configured. With the default
+# empty tuple the coroutine is not defined at all, so a default deployment cannot
+# import, register or discover it.
+if settings.admin_user_ids:
+
+    async def admin_stats_command(
+        update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Show aggregate bot statistics to administrators only."""
+        if not await guard_admin_action(update, context):
+            return
+        services = get_services(context)
+        try:
+            total_users = len(services.db.get_all_user_ids())
+            db_backend = services.db._manager.engine
+            db_location = services.settings.db_path
+            cursor = services.db._manager._get_connection().cursor()
+            cursor.execute(
+                "SELECT status, COUNT(*) FROM knowledge_sources GROUP BY status"  # nosec B608
+            )
+            rows = cursor.fetchall()
+        except Exception as exc:  # noqa: BLE001 - report unavailability, never fake zeros
+            logger.exception("admin_stats failed: %s", type(exc).__name__)
+            if update.message is not None:
+                await render.reply(update.message, "❌ تعذر جلب الإحصائيات حالياً.")
+            return
+
+        counts = {"completed": 0, "processing": 0, "failed": 0}
+        for row in rows:
+            status = row["status"]
+            if status in counts:
+                counts[status] = int(row[1])
+        total_sources = sum(int(row[1]) for row in rows)
+
+        message = (
+            "📊 إحصائيات AUSTRO AI\n\n"
+            f"👥 المستخدمون: {total_users}\n"
+            f"🗄️ قاعدة البيانات: {db_backend}\n"
+            f"📍 موقع قاعدة البيانات: {db_location}\n"
+            f"📚 مصادر المعرفة: {total_sources}\n"
+            f"✅ مكتملة: {counts['completed']}\n"
+            f"⏳ قيد المعالجة: {counts['processing']}\n"
+            f"❌ فاشلة: {counts['failed']}"
+        )
+        if update.message is not None:
+            await render.reply(update.message, message)
+
+
 def build_application() -> Application:
     """Build the fully-wired bot application."""
     application = (
@@ -453,7 +502,8 @@ def build_application() -> Application:
     )
 
     # Attach the DI container so handlers resolve services from context.
-    application.bot_data.update(build_container().bot_data())
+    container = build_container()
+    application.bot_data.update(container.bot_data())
 
     # Add command handlers
     application.add_handler(CommandHandler("start", start))
@@ -467,6 +517,9 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("dashboard", dashboard_command))
     application.add_handler(CommandHandler("settings", settings_command))
     application.add_handler(CommandHandler("knowledge", knowledge_command))
+
+    if container.settings.admin_user_ids:
+        application.add_handler(CommandHandler("admin_stats", admin_stats_command))
 
     # Add conversation handlers
     application.add_handler(get_registration_handlers())

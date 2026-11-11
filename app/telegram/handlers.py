@@ -148,6 +148,7 @@ ENTRY_POINT_RATELIMITS: dict[str, str] = {
     "knowledge_document": UPLOAD,
     # --- expensive operation: makes a real, billable provider health call ---
     "settings_ai_reconnect": EXPENSIVE,
+    "guard_admin_action": COMMAND,
     # --- deliberately uncharged ---
     "fallback_cancel": NONE,   # recovery path, must always work
     "memory_text": NONE,       # flow charged at memory_search/edit/forget entry
@@ -224,6 +225,25 @@ async def guard_expensive_action(update: Update, context: ContextTypes.DEFAULT_T
     allowed, msg = await _rl.check_expensive_limit(update.effective_user.id)
     if not allowed:
         await notify_rate_limited(update, msg)
+        return False
+    return True
+
+
+async def guard_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Shared guard for admin-only commands.
+
+    The denial is byte-identical whether no admins are configured or the caller
+    is not an admin, so the guard does not leak admin existence. The command
+    rate limit is checked first; an admin that passes it then receives the
+    admin check.
+    """
+    if not await guard_command_action(update, context):
+        return False
+    services = get_services(context)
+    admins = services.settings.admin_user_ids
+    user_id = getattr(getattr(update, "effective_user", None), "id", None)
+    if not admins or user_id not in admins:
+        await notify_rate_limited(update, "❌ هذا الأمر غير متاح.")
         return False
     return True
 

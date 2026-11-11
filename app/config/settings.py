@@ -8,6 +8,7 @@ removes hardcoded keys, URLs, models, quotas and timeouts from the code.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -20,6 +21,8 @@ from app.config.deployment_validation import validate_deployment_safety
 from app.core.errors import ConfigurationError
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -113,6 +116,7 @@ class Settings:
     db_sslrootcert: str = ""
     db_sslcert: str = ""
     db_sslkey: str = ""
+    admin_user_ids: tuple[int, ...] = ()
 
     # Application-level rate limits (per-user, deterministic; see rate_limiter)
     rate_limit_command_max: int = 30
@@ -230,6 +234,23 @@ def _parse_free_fallback_models(raw: str, max_models: int) -> tuple:
     if len(seen) > cap:
         seen = seen[:cap]
     return tuple(seen)
+
+
+def _parse_admin_user_ids(raw: str) -> tuple[int, ...]:
+    """Parse comma-separated Telegram admin IDs, ignoring malformed entries."""
+    ids: list[int] = []
+    for part in (raw or "").split(","):
+        value = part.strip()
+        if not value:
+            continue
+        try:
+            user_id = int(value)
+        except ValueError:
+            logger.warning("Ignoring non-numeric ADMIN_USER_IDS entry: %r", value)
+            continue
+        if user_id not in ids:
+            ids.append(user_id)
+    return tuple(ids)
 
 
 def load_settings() -> Settings:
@@ -353,6 +374,7 @@ def load_settings() -> Settings:
         db_sslrootcert=os.getenv("DB_SSL_ROOT_CERT", ""),
         db_sslcert=os.getenv("DB_SSL_CERT", ""),
         db_sslkey=os.getenv("DB_SSL_KEY", ""),
+        admin_user_ids=_parse_admin_user_ids(os.getenv("ADMIN_USER_IDS", "")),
         rate_limit_command_max=int(os.getenv("RATE_LIMIT_COMMAND_MAX", "30")),
         rate_limit_command_window=float(os.getenv("RATE_LIMIT_COMMAND_WINDOW", "60")),
         rate_limit_ai_max=int(os.getenv("RATE_LIMIT_AI_MAX", "20")),
