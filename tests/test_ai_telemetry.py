@@ -133,7 +133,7 @@ async def test_success_records_measured_fields_and_one_json_line(caplog):
 @pytest.mark.asyncio
 async def test_final_failure_records_error_class_and_retries(caplog):
     caplog.set_level(logging.INFO, logger="app.ai.telemetry")
-    provider = _StubProvider(policy=True, error=AIProviderError("upstream broke"))
+    provider = _StubProvider(policy=True, error=AIProviderError("upstream broke; prompt=private-user-content api_key=SUPER_SECRET_VALUE"))
     gateway = _gateway(provider)
     response = await gateway.generate(AIRequest(capability="chat", prompt="hello"))
 
@@ -141,7 +141,7 @@ async def test_final_failure_records_error_class_and_retries(caplog):
     assert record.success is False
     assert record.latency_ms is not None
     assert record.latency_ms >= 0.0
-    assert record.error == "AIProviderError: upstream broke"
+    assert record.error == "AIProviderError"
     assert record.retry_count == 2
     assert record.tokens_prompt is None
     assert record.tokens_completion is None
@@ -150,8 +150,19 @@ async def test_final_failure_records_error_class_and_retries(caplog):
 
     payload = _json_records(caplog)[-1]
     assert payload["success"] is False
-    assert payload["error"] == "AIProviderError: upstream broke"
+    assert payload["error"] == "AIProviderError"
+    serialized = json.dumps(payload)
+    assert "private-user-content" not in serialized
+    assert "SUPER_SECRET_VALUE" not in serialized
     assert payload["retry_count"] == 2
+
+
+@pytest.mark.parametrize("cost", [float("nan"), float("inf"), float("-inf"), 10 ** 10000])
+def test_openrouter_rejects_non_finite_and_overflow_costs(monkeypatch, cost):
+    provider = _adapter(monkeypatch, {"choices": [{"message": {"content": "ok"}}]})
+    usage = provider._extract_usage({"usage": {"cost": cost}})
+    assert usage["cost_usd"] is None
+
 
 
 @pytest.mark.asyncio
