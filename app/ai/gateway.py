@@ -191,7 +191,9 @@ class AIGateway:
                 last_error = exc
                 logger.error(f"Local fallback failed for {request.capability}: {exc}")
 
-        error_text = f"{type(last_error).__name__}: {last_error}" if last_error else "unknown"
+        # Exception messages may contain provider-echoed prompts or user data.
+        # Telemetry stores only the stable exception class, never str(exc).
+        error_text = type(last_error).__name__ if last_error else "unknown"
         return self._record(
             run_id, request, category, "none", "none", started, retries_used,
             self._fallback_advice(request), False, error_text,
