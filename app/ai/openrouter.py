@@ -547,10 +547,16 @@ class OpenRouterProvider(AIProvider):
             }
 
         cost = usage.get("cost")
-        if isinstance(cost, bool) or not isinstance(cost, (int, float)) or cost < 0:
+        if isinstance(cost, bool) or not isinstance(cost, (int, float)):
             cost = None
         else:
-            cost = float(cost)
+            try:
+                cost = float(cost)
+            except (OverflowError, TypeError, ValueError):
+                cost = None
+            else:
+                if not math.isfinite(cost) or cost < 0:
+                    cost = None
 
         return {
             "prompt_tokens": self._token_count(usage.get("prompt_tokens")),
