@@ -136,6 +136,12 @@ class AIGateway:
         started = time.perf_counter()
         category = request.category()
 
+        # Per-request attribution/usage is written into request.data by the
+        # provider. Clear leftovers so a reused request object cannot report
+        # a previous run's model or token counts.
+        request.data.pop("_actual_model", None)
+        request.data.pop("_usage", None)
+
         if category in UNSUPPORTED_CAPABILITIES:
             return self._record(
                 run_id, request, category, "none", "none", started, 0,
@@ -145,9 +151,11 @@ class AIGateway:
         # OpenRouter is the only cloud provider; local fallback is handled below.
         chain: List = [self.provider]
         last_error: Optional[BaseException] = None
+        retries_used = 0
 
         for provider in chain:
             text, error, attempts = await self._try_provider(provider, request)
+            retries_used += attempts
             if text is not None:
                 # Attribute the run to the model that actually answered when
                 # the provider reported one (native `models` fallback makes
@@ -158,11 +166,16 @@ class AIGateway:
                     if isinstance(actual_model, str) and actual_model.strip()
                     else getattr(provider, "model", "unknown")
                 )
+                usage = request.data.get("_usage")
+                usage = usage if isinstance(usage, dict) else {}
                 return self._record(
                     run_id, request, category,
                     getattr(provider, "name", "provider"),
                     model,
-                    started, attempts, text, True, None,
+                    started, retries_used, text, True, None,
+                    tokens_prompt=usage.get("prompt_tokens"),
+                    tokens_completion=usage.get("completion_tokens"),
+                    estimated_cost_usd=usage.get("cost_usd"),
                 )
             if error is not None:
                 last_error = error
@@ -172,15 +185,17 @@ class AIGateway:
                 text = self.local.generate(request)
                 return self._record(
                     run_id, request, category, self.local.name, "deterministic-local",
-                    started, 0, text, True, None,
+                    started, retries_used, text, True, None,
                 )
             except Exception as exc:  # noqa: BLE001 - fallback must never crash the loop
                 last_error = exc
                 logger.error(f"Local fallback failed for {request.capability}: {exc}")
 
-        error_text = f"{type(last_error).__name__}: {last_error}" if last_error else "unknown"
+        # Exception messages may contain provider-echoed prompts or user data.
+        # Telemetry stores only the stable exception class, never str(exc).
+        error_text = type(last_error).__name__ if last_error else "unknown"
         return self._record(
-            run_id, request, category, "none", "none", started, 0,
+            run_id, request, category, "none", "none", started, retries_used,
             self._fallback_advice(request), False, error_text,
         )
 
@@ -196,6 +211,9 @@ class AIGateway:
         text: str,
         success: bool,
         error: Optional[str],
+        tokens_prompt: Optional[int] = None,
+        tokens_completion: Optional[int] = None,
+        estimated_cost_usd: Optional[float] = None,
     ) -> AIResponse:
         latency_ms = (time.perf_counter() - started) * 1000
         metadata = self.telemetry.record(
@@ -208,6 +226,9 @@ class AIGateway:
             success=success,
             retry_count=retry_count,
             error=error,
+            tokens_prompt=tokens_prompt,
+            tokens_completion=tokens_completion,
+            estimated_cost_usd=estimated_cost_usd,
         )
         return AIResponse(text=text, metadata=metadata)
 

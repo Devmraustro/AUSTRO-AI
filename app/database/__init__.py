@@ -8,6 +8,7 @@ from __future__ import annotations
 from app.database.connection import DatabaseManager
 from app.database.repositories import (
     ActivityRepository,
+    CoachLogRepository,
     Database,
     GoalRepository,
     HabitRepository,
@@ -26,6 +27,7 @@ __all__ = [
     "DatabaseManager",
     "Database",
     "ActivityRepository",
+    "CoachLogRepository",
     "GoalRepository",
     "HabitRepository",
     "PlanRepository",

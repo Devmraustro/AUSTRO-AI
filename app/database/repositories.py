@@ -1206,6 +1206,38 @@ class PrivacyRepository(_BaseRepository):
             return {}
 
 
+class CoachLogRepository(_BaseRepository):
+    def add(self, user_id: int, date: Optional[str],
+            performance_analysis: str = "",
+            mistakes_identified: str = "",
+            improvements_suggested: str = "",
+            advice_given: str = "") -> bool:
+        """Persist one coach analysis for ``user_id``.
+
+        ``date`` is a DATE column holding ``YYYY-MM-DD``. ``None`` means today
+        in UTC; the value is computed in Python because SQLite's ``date('now')``
+        has no PostgreSQL equivalent.
+        """
+        log_date = date or datetime.utcnow().strftime("%Y-%m-%d")
+        try:
+            with self._manager._lock:
+                cursor = self._connection().cursor()
+                cursor.execute(
+                    "INSERT INTO coach_logs "
+                    "(user_id, date, performance_analysis, mistakes_identified, "
+                    "improvements_suggested, advice_given) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (user_id, log_date, performance_analysis,
+                     mistakes_identified, improvements_suggested, advice_given),
+                )
+                self._connection().commit()
+                return True
+        except DB_ERROR as e:
+            self._rollback()
+            logger.error(f"Database error in add_coach_log: {e}")
+            return False
+
+
 class StatsRepository(_BaseRepository):
     _DEFAULTS = {
         "total_goals": 0,
@@ -1326,6 +1358,7 @@ class Database:
         self.reviews = ReviewRepository(manager)
         self.reminders = ReminderRepository(manager)
         self.activity = ActivityRepository(manager)
+        self.coach_logs = CoachLogRepository(manager)
         self.stats = StatsRepository(manager)
         self.privacy = PrivacyRepository(manager)
 
