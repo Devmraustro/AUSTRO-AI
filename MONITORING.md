@@ -24,7 +24,7 @@ One in-memory record **and one JSON log line** per completed request (`"event":"
 - `latency_ms`: End-to-end latency
 - `success`: Boolean success flag
 - `retry_count`: Retries attempted before the final outcome
-- `error`: Error class and detail if failed
+- `error`: Exception class only if failed; exception messages are excluded because they may contain prompts or user data.
 - `tokens_prompt` / `tokens_completion`: Provider-reported token usage; `null` when the provider omits it (`0` means a measured zero)
 - `estimated_cost_usd`: Provider-reported cost when present, otherwise `null`
 - `request_id` / `nonce`: Reserved tracing fields; currently always empty/`null`
