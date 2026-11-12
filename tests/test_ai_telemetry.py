@@ -157,7 +157,12 @@ async def test_final_failure_records_error_class_and_retries(caplog):
     assert payload["retry_count"] == 2
 
 
-@pytest.mark.parametrize("cost", [float("nan"), float("inf"), float("-inf"), 10 ** 10000])
+@pytest.mark.parametrize("cost", [
+    pytest.param(float("nan"), id="nan"),
+    pytest.param(float("inf"), id="positive-infinity"),
+    pytest.param(float("-inf"), id="negative-infinity"),
+    pytest.param(10 ** 10000, id="integer-overflow"),
+])
 def test_openrouter_rejects_non_finite_and_overflow_costs(monkeypatch, cost):
     provider = _adapter(monkeypatch, {"choices": [{"message": {"content": "ok"}}]})
     usage = provider._extract_usage({"usage": {"cost": cost}})
