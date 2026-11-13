@@ -231,6 +231,13 @@ _CORE_INDEXES_DDL: list = [
     "CREATE INDEX IF NOT EXISTS idx_progress_user_date ON progress(user_id, date)",
     "CREATE INDEX IF NOT EXISTS idx_reviews_user ON daily_reviews(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_reminders_user ON reminders(user_id)",
+    # Retention purge filters on timestamp/date alone; per-user export and
+    # counts filter on the owner column. Without these, a table that is
+    # specifically designed to grow every day is scanned on every request.
+    "CREATE INDEX IF NOT EXISTS idx_activity_log_timestamp ON activity_log(timestamp)",
+    "CREATE INDEX IF NOT EXISTS idx_activity_log_user ON activity_log(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_coach_logs_date ON coach_logs(date)",
+    "CREATE INDEX IF NOT EXISTS idx_coach_logs_user_date ON coach_logs(user_id, date)",
 ]
 
 
@@ -331,9 +338,18 @@ class DatabaseManager:
     def _get_connection(self):
         """Get thread-local database connection for the configured engine."""
         if self.engine == "postgresql":
-            if not hasattr(self._local, "connection") or self._local.connection is None:
-                self._local.connection = _postgres_connect(self.db_path)
-            return self._local.connection
+            connection = getattr(self._local, "connection", None)
+            # psycopg2 marks a broken/closed connection with ``closed`` 1 or 2.
+            # Without this check one dropped socket (server restart, network
+            # blip, idle timeout) poisoned the thread-local slot for the whole
+            # process life: every later statement failed and nothing retried.
+            if connection is not None and getattr(connection, "closed", 0):
+                self._discard_connection()
+                connection = None
+            if connection is None:
+                connection = _postgres_connect(self.db_path)
+                self._local.connection = connection
+            return connection
 
         if not hasattr(self._local, "connection") or self._local.connection is None:
             db_dir = os.path.dirname(self.db_path)
@@ -346,6 +362,22 @@ class DatabaseManager:
             self._local.connection.execute("PRAGMA foreign_keys = ON")
             self._local.connection.execute("PRAGMA journal_mode = WAL")
         return self._local.connection
+
+    def _discard_connection(self) -> None:
+        """Forget this thread's connection after it became unusable.
+
+        Closing is best-effort: the caller has already seen a database error,
+        and a failing ``close()`` on a broken socket must not mask it. Clearing
+        the slot is the part that matters - the next call reconnects instead of
+        reusing a dead session forever.
+        """
+        connection = getattr(self._local, "connection", None)
+        self._local.connection = None
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:  # noqa: BLE001 - already unusable
+                pass
 
     def _close_connection(self) -> None:
         """Close thread-local connection."""
