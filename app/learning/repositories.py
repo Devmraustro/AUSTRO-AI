@@ -50,7 +50,9 @@ class _LearningBase:
         try:
             self._manager._get_connection().rollback()
         except Exception:  # noqa: BLE001 - never mask the original error
-            pass
+            # The connection itself is unusable; clearing it lets the next
+            # call reconnect rather than reuse a dead session forever.
+            self._manager._discard_connection()
 
     def _remove_workdir(self, work_dir: Path) -> None:
         """Delete the private workdir and any plaintext dump still inside it."""
@@ -1250,26 +1252,52 @@ class PlansRepository(_LearningBase):
 
 class LearningProgressRepository(_LearningBase):
     def record(self, owner_user_id: int, record_date: str, **delta: Any) -> bool:
-        current = self.get(owner_user_id, record_date)
-        base = dict(current) if current else {}
-        update = {
-            "study_minutes": int(base.get("study_minutes") or 0) + int(delta.get("study_minutes", 0)),
-            "practice_count": int(base.get("practice_count") or 0) + int(delta.get("practice_count", 0)),
-            "review_count": int(base.get("review_count") or 0) + int(delta.get("review_count", 0)),
-            "assessment_count": int(base.get("assessment_count") or 0) + int(delta.get("assessment_count", 0)),
-            "assessment_score_avg": delta.get("assessment_score_avg"),
-        }
+        """Atomically add one day's learning counters.
+
+        Two separate defects are avoided by a single upsert:
+
+        * The previous implementation read the row (under the lock), released
+          it, computed the new totals, and wrote again. Two threads recording
+          different evidence kinds for the same user/day could both observe the
+          old row, so one increment was silently lost.
+        * Every event overwrote ``assessment_score_avg`` with its own value,
+          which defaults to ``None``. Recording a review after an assessment
+          therefore erased the day's assessment average. ``COALESCE`` keeps the
+          stored average unless this call actually measured a new one
+          (``0.0`` is a measured score, not "no data").
+        """
+        study_minutes = int(delta.get("study_minutes", 0) or 0)
+        practice_count = int(delta.get("practice_count", 0) or 0)
+        review_count = int(delta.get("review_count", 0) or 0)
+        assessment_count = int(delta.get("assessment_count", 0) or 0)
+        average = delta.get("assessment_score_avg")
+        assessment_score_avg = None if average is None else float(average)
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
                 cursor.execute(
-                    "INSERT OR REPLACE INTO learning_progress "
+                    "INSERT INTO learning_progress "
                     "(owner_user_id, record_date, study_minutes, practice_count, "
                     "review_count, assessment_count, assessment_score_avg) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (owner_user_id, record_date, update["study_minutes"],
-                     update["practice_count"], update["review_count"],
-                     update["assessment_count"], update["assessment_score_avg"]),
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT (owner_user_id, record_date) DO UPDATE SET "
+                    # Qualify the target column: PostgreSQL reports
+                    # "column reference is ambiguous" when both the target
+                    # column and EXCLUDED share a name (SQLite is lenient).
+                    "study_minutes = learning_progress.study_minutes "
+                    "+ excluded.study_minutes, "
+                    "practice_count = learning_progress.practice_count "
+                    "+ excluded.practice_count, "
+                    "review_count = learning_progress.review_count "
+                    "+ excluded.review_count, "
+                    "assessment_count = learning_progress.assessment_count "
+                    "+ excluded.assessment_count, "
+                    "assessment_score_avg = COALESCE("
+                    "excluded.assessment_score_avg, "
+                    "learning_progress.assessment_score_avg)",
+                    (owner_user_id, record_date, study_minutes,
+                     practice_count, review_count, assessment_count,
+                     assessment_score_avg),
                 )
                 self._connection().commit()
                 return True
