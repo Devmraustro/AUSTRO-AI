@@ -108,6 +108,14 @@ async def offer_deletion(update: Update, context: ContextTypes.DEFAULT_TYPE,
     user_id = update.effective_user.id
 
     counts = services.privacy.summary(user_id)
+    if counts is None:
+        # Do not show "you have no data" when the read failed, and do not hand
+        # out a token for an operation whose scope we cannot state.
+        await render.reply(
+            update.message,
+            "❌ تعذر قراءة بيانات الحساب الآن. حاول لاحقًا.",
+        )
+        return
     token = secrets.token_hex(8)
     _clear_pending(context)
     context.user_data[_PENDING_KEY] = {
@@ -168,11 +176,29 @@ async def delete_confirm_callback(update: Update,
         return
 
     if not result.verified:
+        if result.residual is None:
+            logger.error("Deletion for %s could not be verified: read failed", user_id)
+            await render.edit(query,
+                "⚠️ حُذفت سجلات حسابك من قاعدة البيانات، لكن تعذّر التحقق من "
+                "اكتمال الحذف. تواصل مع الدعم للتأكيد.")
+            return
         logger.error("Deletion for %s was not verified clean: %s",
                      user_id, result.residual)
         await render.edit(query,
             "⚠️ حُذف معظم البيانات لكن بقي أثر لم نستطع التأكد من إزالته. "
             "تواصل مع الدعم لإكمال الحذف.")
+        return
+
+    if result.files_failed:
+        # The rows are gone, but stored files are not. Saying "all your data
+        # was deleted" here would be false, and the files are now unreachable
+        # from the database, so the operator must finish the job by hand.
+        logger.error("Deletion for %s left %s stored file(s)",
+                     user_id, result.files_failed)
+        await render.edit(query,
+            "⚠️ حُذفت سجلات حسابك، لكن تعذّر حذف "
+            f"{result.files_failed} من الملفات المخزنة. "
+            "تواصل مع الدعم لإكمال حذف الملفات.")
         return
 
     await render.edit(query,

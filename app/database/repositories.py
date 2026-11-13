@@ -144,7 +144,10 @@ class _BaseRepository:
         try:
             self._manager._get_connection().rollback()
         except Exception:  # noqa: BLE001 - rollback must never mask the original error
-            pass
+            # A rollback that itself fails means the connection is unusable
+            # (closed socket, server gone). Drop it so the next call reconnects
+            # instead of failing forever on the poisoned thread-local slot.
+            self._manager._discard_connection()
 
     @staticmethod
     def _serialise(value: Any) -> Any:
@@ -1038,8 +1041,13 @@ class PrivacyRepository(_BaseRepository):
         row = cursor.fetchone()
         return int(row[0] if row is not None else 0)
 
-    def counts(self, user_id: int) -> Dict[str, int]:
-        """Row counts per table for one user (used by the export summary)."""
+    def counts(self, user_id: int) -> Optional[Dict[str, int]]:
+        """Row counts per table for one user (used by the export summary).
+
+        Returns ``None`` when the read failed. An empty dict is a valid answer
+        (no rows), so the two must not be conflated: account-deletion
+        verification treats ``None`` as "could not verify", never as success.
+        """
         result: Dict[str, int] = {}
         try:
             with self._manager._lock:
@@ -1063,7 +1071,7 @@ class PrivacyRepository(_BaseRepository):
         except DB_ERROR as e:
             self._rollback()
             logger.error(f"Database error in privacy_counts: {e}")
-            return {}
+            return None
 
     def purge_expired_logs(self, activity_days: int, coach_days: int,
                            now: Optional[datetime] = None) -> Dict[str, int]:
@@ -1071,9 +1079,15 @@ class PrivacyRepository(_BaseRepository):
 
         `PRIVACY_RETENTION.md` §2.2 promised 90-day retention for
         `activity_log` and `coach_logs` while nothing enforced it. The cutoff is
-        computed in Python (UTC) and compared as an ISO string, which behaves
+        computed in Python (UTC) and bound as a parameter, so it behaves
         identically on SQLite and PostgreSQL - SQLite's `date('now', '-N days')`
         has no PostgreSQL equivalent, and the dialect layer does not rewrite it.
+
+        `activity_log.timestamp` defaults to SQLite `CURRENT_TIMESTAMP`, which
+        writes ``YYYY-MM-DD HH:MM:SS`` (space separator, no offset). The cutoff
+        must use the same shape: an ``isoformat()`` cutoff puts a ``T`` where the
+        stored rows have a space, and because ``" " < "T"`` every row *on the
+        cutoff day* compared smaller and was deleted up to 24 hours early.
 
         ``activity_days``/``coach_days`` <= 0 disable the purge for that table,
         so an operator can opt out per table without editing code.
@@ -1087,7 +1101,12 @@ class PrivacyRepository(_BaseRepository):
                 connection = self._connection()
                 cursor = connection.cursor()
                 if activity_days > 0:
-                    cutoff = (reference - timedelta(days=activity_days)).isoformat()
+                    # Match SQLite CURRENT_TIMESTAMP exactly (space separator,
+                    # second precision); an ISO "T" cutoff sorted every row on
+                    # the boundary day as older than the cutoff.
+                    cutoff = (reference - timedelta(days=activity_days)).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
                     cursor.execute(
                         "DELETE FROM activity_log WHERE timestamp IS NOT NULL "
                         "AND timestamp < ?",
@@ -1111,8 +1130,13 @@ class PrivacyRepository(_BaseRepository):
             logger.error(f"Database error in purge_expired_logs: {e}")
             return {"activity_log": 0, "coach_logs": 0}
 
-    def storage_keys(self, user_id: int) -> List[str]:
-        """Storage keys of this user's uploaded knowledge files."""
+    def storage_keys(self, user_id: int) -> Optional[List[str]]:
+        """Storage keys of this user's uploaded knowledge files.
+
+        Returns ``None`` when the read failed. Callers must not erase the rows
+        that hold those keys before the keys are known: otherwise the files
+        become unreachable orphans that account deletion can never clean up.
+        """
         try:
             with self._manager._lock:
                 cursor = self._connection().cursor()
@@ -1125,7 +1149,7 @@ class PrivacyRepository(_BaseRepository):
         except DB_ERROR as e:
             self._rollback()
             logger.error(f"Database error in privacy_storage_keys: {e}")
-            return []
+            return None
 
     def delete_all(self, user_id: int) -> Optional[Dict[str, int]]:
         """Erase every row this user owns, in one transaction.
@@ -1168,6 +1192,16 @@ class PrivacyRepository(_BaseRepository):
         except DB_ERROR as e:
             self._rollback()
             logger.error(f"Database error in privacy_delete_all: {e}")
+            return None
+        except Exception:  # noqa: BLE001 - rollback, never leave a partial commit
+            # A non-database exception (a driver/proxy bug, a wrapped cursor)
+            # must roll back too. Letting it escape would leave the deletes
+            # uncommitted on SQLite, where an unrelated later commit could
+            # silently make the half-deletion permanent.
+            self._rollback()
+            logger.exception(
+                "Unexpected error in privacy_delete_all for user %s", user_id
+            )
             return None
 
     def export_rows(self, user_id: int) -> Dict[str, Any]:
