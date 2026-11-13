@@ -232,7 +232,10 @@ class AssessmentEngine:
         self._store.progress.record(
             owner_user_id, on_date,
             assessment_count=total,
-            assessment_score_avg=round(score, 2) if score else None,
+            # 0.0 is a real measured average (every answer wrong), not "no
+            # assessment today". Passing None used to be indistinguishable
+            # from a non-assessment event and left the column empty.
+            assessment_score_avg=round(score, 2),
         )
         self._store.events.log(
             owner_user_id, "assessment_submitted", objective_id, session_id,
