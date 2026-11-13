@@ -176,7 +176,7 @@ These are the current capabilities. The GDPR rights are not fully met by the cur
 - **Right to Access:** Available. `/export` returns a complete JSON snapshot of every row the caller owns (core, learning, memory and knowledge tables), scoped to that user.
 - **Right to Rectification:** Partially available. Memories can be edited through the coach menu. Other data editing paths were not re-verified for this document.
 - **Right to Erasure:** Available. `/delete` erases the account and every derived row in one transaction, after an explicit confirmation; knowledge sources can also be deleted individually (🗑 in "كتبي"). See §3.1.
-- **Right to Data Portability:** Not available as a complete machine-readable snapshot. Memory-only JSON export exists.
+- **Right to Data Portability:** Available. `/export` returns a complete machine-readable JSON snapshot of every row the caller owns (`PrivacyService.export`), and the coach menu still offers a memory-only JSON export.
 
 ### 7.2 Data Protection Principles
 - **Purpose Limitation:** Data is used only for the user's personal development coaching and learning.
