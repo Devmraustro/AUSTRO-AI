@@ -20,7 +20,7 @@ This document separates what was **locally verified** from what is **awaiting cr
 | Docker Engine | Image build and staging checks | **Locally verified (build)** | Docker 29.9.2; staging app image built; compose resolves |
 | Hosted staging environment | Runtime cold start/health/restart | **Blocked by infrastructure** | No staging host; only local static + build checks |
 | `pip-audit` advisory database | Dependency vulnerabilities | **Locally verified** | 33 packages, no known vulnerabilities, exit 0 |
-| TruffleHog | Secret scanning | **Passed in main push CI / missing locally** | Binary not installed locally; passed in post-merge GitHub Actions run `43599696751` on `main` (`85e9a53a...`) |
+| TruffleHog | Secret scanning | **Passed in PR candidate CI / missing locally** | Binary not installed locally; passed in GitHub Actions run `43531570063` on the earlier audit candidate branch (`bc872441...`); the post-merge push run did not include this job |
 | Encrypted backup + restore | Disaster recovery | **Passed in main push CI / not locally run** | Passed in post-merge GitHub Actions run `43599696751` using the PostgreSQL 16 service |
 | GitHub Actions CI | Full matrix and post-merge gates | **PASS on main** | Push run `43599696751` on SHA `85e9a53a04c7205b29c64722d3796ac322d9d6cb`; all 9 jobs completed successfully, including Python 3.10–3.14, dependency audit, performance, staging compose/images, and encrypted PostgreSQL 16 backup/restore |
 | GitHub PR state | PR #18 | **Merged** | PR #18 is closed/merged; `main` points to its merge commit. A separate follow-up PR is planned for documentation and test-quality improvements |
