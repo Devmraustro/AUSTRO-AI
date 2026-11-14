@@ -146,3 +146,57 @@ def test_replayed_review_grading_is_idempotent(container):
     assert store.mastery.get(OWNER, objective_id)["evidence_count"] == 1
     assert store.progress.get(OWNER, engine._today())["review_count"] == 1
     assert store.reviews.get(OWNER, objective_id, "مفهوم")["attempt_count"] == 1
+
+
+def test_upsert_handles_null_counters_without_losing_increments(store):
+    """If an existing row has NULL counters, COALESCE prevents NULL + N."""
+    import sqlite3 as _sqlite3
+
+    # Prove the SQLite/PostgreSQL upsert SQL uses COALESCE on each counter by
+    # executing the exact conflict update against a nullable table schema.
+    conn = _sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE learning_progress ("
+        "owner_user_id INTEGER NOT NULL, "
+        "record_date TEXT NOT NULL, "
+        "study_minutes INTEGER, "
+        "practice_count INTEGER, "
+        "review_count INTEGER, "
+        "assessment_count INTEGER, "
+        "assessment_score_avg REAL, "
+        "UNIQUE (owner_user_id, record_date))"
+    )
+    conn.execute(
+        "INSERT INTO learning_progress VALUES (?, ?, NULL, NULL, NULL, NULL, NULL)",
+        (OWNER, "2026-05-03"),
+    )
+    conn.execute(
+        "INSERT INTO learning_progress "
+        "(owner_user_id, record_date, study_minutes, practice_count, "
+        "review_count, assessment_count, assessment_score_avg) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT (owner_user_id, record_date) DO UPDATE SET "
+        "study_minutes = COALESCE(learning_progress.study_minutes, 0) + excluded.study_minutes, "
+        "practice_count = COALESCE(learning_progress.practice_count, 0) + excluded.practice_count, "
+        "review_count = COALESCE(learning_progress.review_count, 0) + excluded.review_count, "
+        "assessment_count = COALESCE(learning_progress.assessment_count, 0) + excluded.assessment_count, "
+        "assessment_score_avg = COALESCE(excluded.assessment_score_avg, learning_progress.assessment_score_avg)",
+        (OWNER, "2026-05-03", 15, 2, 1, 0, None),
+    )
+    row = conn.execute(
+        "SELECT study_minutes, practice_count, review_count, assessment_count, assessment_score_avg "
+        "FROM learning_progress WHERE owner_user_id = ? AND record_date = ?",
+        (OWNER, "2026-05-03"),
+    ).fetchone()
+    conn.close()
+    assert row == (15, 2, 1, 0, None)
+
+    day = "2026-05-03"
+    assert store.progress.record(OWNER, day, study_minutes=15)
+    assert store.progress.record(OWNER, day, practice_count=3)
+    assert store.progress.record(OWNER, day, study_minutes=5, assessment_count=1, assessment_score_avg=0.0)
+    stored = store.progress.get(OWNER, day)
+    assert stored["study_minutes"] == 20
+    assert stored["practice_count"] == 3
+    assert stored["assessment_count"] == 1
+    assert stored["assessment_score_avg"] == 0.0

@@ -100,3 +100,30 @@ def test_successful_rollback_keeps_the_connection(tmp_path):
 
     assert manager._local.connection is healthy
     assert healthy.close_calls == 0
+
+
+def test_rollback_on_closed_postgres_connection_discards_without_reconnecting(
+    tmp_path, monkeypatch
+):
+    manager = _manager(tmp_path)
+    manager.engine = "postgresql"
+    dead = _FakeConnection(closed=2)
+    manager._local.connection = dead
+    connect_calls = []
+
+    import app.database.connection as connection_module
+
+    monkeypatch.setattr(
+        connection_module,
+        "_postgres_connect",
+        lambda path=None: connect_calls.append(path),
+    )
+
+    database = Database(manager)
+    database.privacy._rollback()
+
+    assert connect_calls == [], (
+        "_rollback() must not open a new PostgreSQL connection just to roll back"
+    )
+    assert manager._local.connection is None
+    assert dead.close_calls == 1

@@ -70,12 +70,7 @@ class _KnowledgeBase:
         PostgreSQL one failed statement poisons the session (``25P02``).
         Called while ``self._manager._lock`` is held.
         """
-        try:
-            self._manager._get_connection().rollback()
-        except Exception:  # noqa: BLE001 - never mask the original error
-            # The connection itself is unusable; clearing it lets the next
-            # call reconnect rather than reuse a dead session forever.
-            self._manager._discard_connection()
+        self._manager._rollback_connection()
 
     @staticmethod
     def _j(value: Any) -> str:

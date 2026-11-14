@@ -47,12 +47,7 @@ class _LearningBase:
         PostgreSQL one failed statement poisons the session (``25P02``).
         Called while ``self._manager._lock`` is held.
         """
-        try:
-            self._manager._get_connection().rollback()
-        except Exception:  # noqa: BLE001 - never mask the original error
-            # The connection itself is unusable; clearing it lets the next
-            # call reconnect rather than reuse a dead session forever.
-            self._manager._discard_connection()
+        self._manager._rollback_connection()
 
     def _remove_workdir(self, work_dir: Path) -> None:
         """Delete the private workdir and any plaintext dump still inside it."""
@@ -1284,13 +1279,13 @@ class LearningProgressRepository(_LearningBase):
                     # Qualify the target column: PostgreSQL reports
                     # "column reference is ambiguous" when both the target
                     # column and EXCLUDED share a name (SQLite is lenient).
-                    "study_minutes = learning_progress.study_minutes "
+                    "study_minutes = COALESCE(learning_progress.study_minutes, 0) "
                     "+ excluded.study_minutes, "
-                    "practice_count = learning_progress.practice_count "
+                    "practice_count = COALESCE(learning_progress.practice_count, 0) "
                     "+ excluded.practice_count, "
-                    "review_count = learning_progress.review_count "
+                    "review_count = COALESCE(learning_progress.review_count, 0) "
                     "+ excluded.review_count, "
-                    "assessment_count = learning_progress.assessment_count "
+                    "assessment_count = COALESCE(learning_progress.assessment_count, 0) "
                     "+ excluded.assessment_count, "
                     "assessment_score_avg = COALESCE("
                     "excluded.assessment_score_avg, "

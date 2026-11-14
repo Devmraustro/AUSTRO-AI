@@ -141,13 +141,7 @@ class _BaseRepository:
         Must be called while holding ``self._manager._lock`` (every call site is
         inside the same ``with`` block as the statement that failed).
         """
-        try:
-            self._manager._get_connection().rollback()
-        except Exception:  # noqa: BLE001 - rollback must never mask the original error
-            # A rollback that itself fails means the connection is unusable
-            # (closed socket, server gone). Drop it so the next call reconnects
-            # instead of failing forever on the poisoned thread-local slot.
-            self._manager._discard_connection()
+        self._manager._rollback_connection()
 
     @staticmethod
     def _serialise(value: Any) -> Any:

@@ -379,6 +379,28 @@ class DatabaseManager:
             except Exception:  # noqa: BLE001 - already unusable
                 pass
 
+    def _rollback_connection(self) -> None:
+        """Roll back the current thread's connection, or discard it if dead.
+
+        Inspects the existing thread-local slot without opening a new
+        connection: if a PostgreSQL socket already dropped (``closed`` != 0),
+        reconnecting just to call ``rollback()`` would waste a round-trip or
+        fail while the database is transiently unavailable.
+        """
+        connection = getattr(self._local, "connection", None)
+        if connection is None:
+            return
+        if getattr(connection, "closed", 0):
+            self._discard_connection()
+            return
+        try:
+            connection.rollback()
+        except Exception:  # noqa: BLE001 - rollback must never mask the original error
+            # A rollback that itself fails means the connection is unusable
+            # (closed socket, server gone). Drop it so the next call reconnects
+            # instead of failing forever on the poisoned thread-local slot.
+            self._discard_connection()
+
     def _close_connection(self) -> None:
         """Close thread-local connection."""
         if hasattr(self._local, "connection") and self._local.connection:

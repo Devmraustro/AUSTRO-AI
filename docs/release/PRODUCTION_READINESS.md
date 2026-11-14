@@ -9,41 +9,40 @@
 
 ## 1. Verdict summary
 
-The merged code is materially healthier after this audit: four High and four Medium defects were found and fixed, with 18 new regression tests. The PostgreSQL suite, privacy/erasure tests, learning tests, security tests, performance benchmarks, lint, compile, SAST, and dependency audit pass locally.
+The merged code is materially healthier after this audit: four High and four Medium defects were found and fixed, plus follow-up `_rollback_connection()` and `COALESCE` hardening on `arena/8aa8f7e9-austro-ai`, with 20 new regression tests (1100 passed, 143 skipped, 0 failed on Linux). The PostgreSQL suite, privacy/erasure tests, learning tests, security tests, performance benchmarks, lint, compile, SAST, and dependency audit pass.
 
 It is still **not production-ready** for these reasons:
 
-1. The fixes are on an unmerged branch and have not completed GitHub CI.
+1. The fixes have not yet been merged into `main` (PR #17 remains open; `arena/8aa8f7e9-austro-ai` carries its fixes forward plus follow-up hardening).
 2. Live Telegram end-to-end behavior was not exercised (no valid bot token or safe chat).
 3. Live OpenRouter behavior was not exercised (no real API key).
 4. The staging runtime drill (`staging_validate.py --execute`) was not run; only compose resolution, static isolation, image builds, and guard checks were performed.
-5. The encrypted backup/restore integration and TruffleHog secret scan were not run locally; they are CI jobs.
-6. Production validation does not force PostgreSQL; a deploy must explicitly set `DB_ENGINE=postgresql` or the app will use SQLite.
+5. Production validation does not force PostgreSQL; a deploy must explicitly set `DB_ENGINE=postgresql` or the app will use SQLite.
 
 ## 2. Readiness gates
 
 | Gate | Status | Evidence |
 |---|---|---|
-| Audit findings fixed | **PASS (local)** | Four High, four Medium, two Low fixed; 18 regression tests |
-| Full SQLite suite | **PARTIAL** | `2 failed, 1097 passed, 142 skipped`; both failures are Windows-only environment issues |
-| PostgreSQL repository suite | **PASS** | 30 passed, 0 skipped, exit 0 |
-| PostgreSQL claim suite | **PASS** | 7 passed, 0 skipped, exit 0 |
+| Audit findings fixed | **PASS (local)** | Four High, four Medium, two Low fixed + rollback/COALESCE hardening; 20 regression tests |
+| Full SQLite suite | **PASS (Linux)** | `1100 passed, 143 skipped, 0 failed` on Linux (`arena/8aa8f7e9-austro-ai`) |
+| PostgreSQL repository suite | **PASS** | 30 passed, 0 skipped, exit 0 (PR #17 CI run `43493434771`) |
+| PostgreSQL claim suite | **PASS** | 7 passed, 0 skipped, exit 0 (PR #17 CI run `43493434771`) |
 | Privacy/erasure regressions | **PASS** | 10 new tests passed; the 30 PostgreSQL repository tests passed separately |
-| Learning/DB regressions | **PASS** | 8 passed |
-| Security test selection | **PASS** | 45 passed |
+| Learning/DB regressions | **PASS** | 10 passed (5 learning + 5 DB recovery) |
+| Security test selection | **PASS** | 44 passed, 1 skipped (Docker image test skipped without Docker) |
 | Lint / compile / SAST | **PASS** | pyflakes 0, compileall 0, Bandit 0 medium/high |
-| Dependency audit | **PASS (local)** | 33 dependencies, no known vulnerabilities |
+| Dependency audit | **PASS** | 33 dependencies, no known vulnerabilities (PR #17 CI run `43493434771`) |
 | Evaluation harness | **PASS** | 100% / 100% threshold |
 | Performance benchmarks | **PASS** | 7/7 |
 | Staging compose + static isolation | **PASS** | compose resolves; 4 credentials differ from production |
-| Staging images | **PASS (build)** | app and backup images built successfully |
+| Staging images | **PASS (build)** | app and backup images built successfully (PR #17 CI run `43493434771`) |
 | Staging runtime drill | **NOT RUN** | requires a running staging stack and credentials |
 | Telegram live E2E | **BLOCKED** | no credentials/safe chat |
 | OpenRouter live eval | **BLOCKED** | no API key; local fallback only |
-| Secret scan (TruffleHog) | **PENDING CI** | not installed locally |
-| Backup/restore integration | **PENDING CI** | Linux/bash + disposable PostgreSQL job |
-| CI matrix (3.10–3.14) | **PENDING** | branch not yet pushed/run |
-| PR review/merge | **NOT DONE** | explicitly out of scope for this audit |
+| Secret scan (TruffleHog) | **PASS (PR #17 CI)** | passed in CI run `43493434771`; re-runs on branch push |
+| Backup/restore integration | **PASS (PR #17 CI)** | passed in CI run `43493434771`; re-runs on branch push |
+| CI matrix (3.10–3.14) | **PASS (PR #17 CI) / PENDING BRANCH** | passed on PR #17 (`43493434771`); re-running for `arena/8aa8f7e9-austro-ai` |
+| PR review/merge | **NOT DONE** | PR not yet merged into `main` |
 
 ## 3. Configuration requirements for production
 

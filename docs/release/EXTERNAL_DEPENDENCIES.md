@@ -18,9 +18,9 @@ This document separates what was **locally verified** from what is **awaiting cr
 | Docker Engine | Image build and staging checks | **Locally verified (build)** | Docker 29.9.2; staging app image built; compose resolves |
 | Hosted staging environment | Runtime cold start/health/restart | **Blocked by infrastructure** | No staging host; only local static + build checks |
 | `pip-audit` advisory database | Dependency vulnerabilities | **Locally verified** | 33 packages, no known vulnerabilities, exit 0 |
-| TruffleHog | Secret scanning | **Missing locally / CI job** | Binary not installed; CI job configured |
-| Encrypted backup + restore | Disaster recovery | **Not locally run / CI job** | Linux/bash + PG service job exists; not executed on this host |
-| GitHub Actions CI | Full matrix and gates | **Pending push** | Branch not yet pushed; CI not yet run |
+| TruffleHog | Secret scanning | **Passed in PR #17 CI / missing locally** | Binary not installed locally; passed in CI run `43493434771` (`release/post-merge-audit`) and re-runs on push |
+| Encrypted backup + restore | Disaster recovery | **Passed in PR #17 CI / not locally run** | Passed in CI run `43493434771` (PG 16 service); re-runs on push |
+| GitHub Actions CI | Full matrix and gates | **Passed on PR #17 / pending push on this branch** | PR #17 run `43493434771` green across all 9 jobs; re-running on `arena/8aa8f7e9-austro-ai` push |
 | GitHub CLI authentication | PR creation/monitoring | **Blocked (invalid gh token)** | `gh auth status` reports invalid keyring token; git remote access still works |
 
 ## 2. OpenRouter
@@ -77,9 +77,9 @@ This document separates what was **locally verified** from what is **awaiting cr
 ## 8. GitHub / CI
 
 - **Configured:** `.github/workflows/ci.yml` has jobs for the 3.10–3.14 test matrix, PostgreSQL integration, encrypted backup/restore, dependency audit, performance, security tests, secret scan, and staging compose/image validation.
-- **Local status:** the branch has not been pushed, so no CI run exists yet. `gh auth status` reports an invalid keyring token on this host, although `git ls-remote origin` succeeds; PR creation may require re-authentication.
-- **Blocking level:** merge blocker until CI is green; production blocker until the release record includes the CI URL.
-- **Required to close:** push `release/post-merge-audit`, open a PR, and record the CI run URL and SHA.
+- **Status:** PR #17 (`release/post-merge-audit`) completed CI run `43493434771` with all 9 jobs passing (`test (3.10..3.14)`, `Staging stack (compose + images)`, `Encrypted backup and disposable restore (PostgreSQL 16)`, `dependency-audit`, `performance-tests`). Branch `arena/8aa8f7e9-austro-ai` carries those fixes forward with follow-up `_rollback_connection()` and `COALESCE` hardening and awaits its own CI run on push.
+- **Blocking level:** merge blocker until CI is green on the target branch; production blocker until the release record includes the final merged CI URL.
+- **Required to close:** push `arena/8aa8f7e9-austro-ai`, verify the CI run is green, and record the CI run URL and SHA.
 
 ## 9. Things intentionally not attempted
 
