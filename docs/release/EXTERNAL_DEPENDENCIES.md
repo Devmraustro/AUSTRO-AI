@@ -1,10 +1,10 @@
 # AUSTRO AI — External Dependencies and Verification Status
 
 - **Date:** 2026-11-14
-- **Audited base:** `63ae400b2a4f4310f944bb8f6b9f32f89fe53753`
-- **Verified branch:** `arena/8aa8f7e9-austro-ai`
-- **Verified head:** `bc8724419b865d92589377f2e5e70987acdb682b`
-- **GitHub Actions:** [Run 43531570063](https://github.com/Devmraustro/AUSTRO-AI/actions/runs/43531570063) — 9/9 jobs passed
+- **Current verified branch:** `main`
+- **Current main SHA:** `85e9a53a04c7205b29c64722d3796ac322d9d6cb` (PR #18 merge commit)
+- **Post-merge GitHub Actions:** [Run 43599696751](https://github.com/Devmraustro/AUSTRO-AI/actions/runs/43599696751) — 9/9 jobs passed (`push` event)
+- **Earlier audit candidate:** `arena/8aa8f7e9-austro-ai` (historical source branch; PR #18 merged)
 - **Production deployment:** **NO**
 
 This document separates what was **locally verified** from what is **awaiting credentials**, **partial**, **missing**, or **blocked by infrastructure**. No external result is presented as passing when it did not run.
@@ -20,10 +20,10 @@ This document separates what was **locally verified** from what is **awaiting cr
 | Docker Engine | Image build and staging checks | **Locally verified (build)** | Docker 29.9.2; staging app image built; compose resolves |
 | Hosted staging environment | Runtime cold start/health/restart | **Blocked by infrastructure** | No staging host; only local static + build checks |
 | `pip-audit` advisory database | Dependency vulnerabilities | **Locally verified** | 33 packages, no known vulnerabilities, exit 0 |
-| TruffleHog | Secret scanning | **Passed in arena branch CI / missing locally** | Binary not installed locally; passed in GitHub Actions run `43531570063` on `arena/8aa8f7e9-austro-ai` (`bc872441...`) |
-| Encrypted backup + restore | Disaster recovery | **Passed in arena branch CI / not locally run** | Passed in GitHub Actions run `43531570063` using the PostgreSQL 16 service |
-| GitHub Actions CI | Full matrix and gates | **PASS on arena branch** | Run `43531570063` on SHA `bc8724419b865d92589377f2e5e70987acdb682b`; all 9 jobs completed successfully, including Python 3.10–3.14, PostgreSQL 16, encrypted backup/restore, dependency audit, performance, security, secret scan and staging stack |
-| GitHub PR API | PR creation/monitoring | **Verified through GitHub integration** | Replacement PR creation and review are performed through the authenticated GitHub integration; local GitHub CLI status is not a release gate |
+| TruffleHog | Secret scanning | **Passed in arena branch CI / missing locally** | Binary not installed locally; passed in post-merge GitHub Actions run `43599696751` on `main` (`85e9a53a...`) |
+| Encrypted backup + restore | Disaster recovery | **Passed in arena branch CI / not locally run** | Passed in post-merge GitHub Actions run `43599696751` using the PostgreSQL 16 service |
+| GitHub Actions CI | Full matrix and post-merge gates | **PASS on main** | Push run `43599696751` on SHA `85e9a53a04c7205b29c64722d3796ac322d9d6cb`; all 9 jobs completed successfully, including Python 3.10–3.14, dependency audit, performance, staging compose/images, and encrypted PostgreSQL 16 backup/restore |
+| GitHub PR state | PR #18 | **Merged** | PR #18 is closed/merged; `main` points to its merge commit. A separate follow-up PR is planned for documentation and test-quality improvements |
 
 ## 2. OpenRouter
 
@@ -79,9 +79,9 @@ This document separates what was **locally verified** from what is **awaiting cr
 ## 8. GitHub / CI
 
 - **Configured:** `.github/workflows/ci.yml` has jobs for the 3.10–3.14 test matrix, PostgreSQL integration, encrypted backup/restore, dependency audit, performance, security tests, secret scan, and staging compose/image validation.
-- **Status:** Branch `arena/8aa8f7e9-austro-ai` completed GitHub Actions run `43531570063` on SHA `bc8724419b865d92589377f2e5e70987acdb682b`; all 9 jobs passed. This run includes the follow-up `_rollback_connection()` and `COALESCE` hardening. The earlier PR #17 run `43493434771` is historical evidence for the older `release/post-merge-audit` head, not the current candidate.
-- **Blocking level:** CI is green on the candidate branch; PR-specific required checks must still be confirmed against the exact head after replacement PR creation. Production remains blocked by live credentials and staging runtime verification.
-- **Required to close:** create/review the replacement PR from this branch and confirm its checks on the exact PR head.
+- **Status:** `main` completed push-triggered run `43599696751` on SHA `85e9a53a04c7205b29c64722d3796ac322d9d6cb`; all 9 jobs passed. This is post-merge evidence for the current main commit. The earlier candidate-branch run `43531570063` is historical evidence.
+- **Blocking level:** CI is green on `main`. Production remains blocked by live credentials and staging runtime verification.
+- **Required to close:** run the hosted staging drill and live OpenRouter/Telegram E2E gates; a separate follow-up PR will improve the nullable-counter regression test and reconcile documentation.
 
 ## 9. Things intentionally not attempted
 
@@ -97,7 +97,6 @@ This document separates what was **locally verified** from what is **awaiting cr
 2. A dedicated staging `BOT_TOKEN` and a safe test chat ID.
 3. A staging PostgreSQL 16 endpoint with TLS and disposable restore target.
 4. A staging host (or permission to run the compose stack locally with real staging credentials).
-5. A replacement PR review and explicit merge approval.
-6. Staging credentials and host for the runtime drill; CI backup/restore evidence is already available from run `43531570063`.
+5. Staging credentials and host for the runtime drill; CI backup/restore evidence is available from post-merge run `43599696751`.
 
 Until these are provided, the corresponding rows above remain **awaiting credentials**, **partial**, **missing**, or **blocked by infrastructure** — never “passed”.
