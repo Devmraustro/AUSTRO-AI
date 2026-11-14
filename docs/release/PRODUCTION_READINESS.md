@@ -1,8 +1,10 @@
 # AUSTRO AI — Production Readiness
 
-- **Date:** 2026-11-13
+- **Date:** 2026-11-14
 - **Audited base:** `63ae400b2a4f4310f944bb8f6b9f32f89fe53753` (PR #16)
-- **Audit branch:** `release/post-merge-audit`
+- **Audit branch:** `arena/8aa8f7e9-austro-ai`
+- **Verified branch head:** `bc8724419b865d92589377f2e5e70987acdb682b`
+- **GitHub Actions:** [Run 43531570063](https://github.com/Devmraustro/AUSTRO-AI/actions/runs/43531570063) — 9/9 jobs passed
 - **Verdict:** **NOT READY — NO-GO**
 - **Production deployment performed:** **NO**
 - **Production data/infrastructure/secrets changed:** **NO**
@@ -13,7 +15,7 @@ The merged code is materially healthier after this audit: four High and four Med
 
 It is still **not production-ready** for these reasons:
 
-1. The fixes have not yet been merged into `main` (PR #17 remains open; `arena/8aa8f7e9-austro-ai` carries its fixes forward plus follow-up hardening).
+1. The fixes remain unmerged. PR #17 is the earlier, incomplete review branch; the proposed replacement PR will use `arena/8aa8f7e9-austro-ai`, which includes the follow-up rollback and COALESCE hardening.
 2. Live Telegram end-to-end behavior was not exercised (no valid bot token or safe chat).
 3. Live OpenRouter behavior was not exercised (no real API key).
 4. The staging runtime drill (`staging_validate.py --execute`) was not run; only compose resolution, static isolation, image builds, and guard checks were performed.
@@ -39,9 +41,9 @@ It is still **not production-ready** for these reasons:
 | Staging runtime drill | **NOT RUN** | requires a running staging stack and credentials |
 | Telegram live E2E | **BLOCKED** | no credentials/safe chat |
 | OpenRouter live eval | **BLOCKED** | no API key; local fallback only |
-| Secret scan (TruffleHog) | **PASS (PR #17 CI)** | passed in CI run `43493434771`; re-runs on branch push |
-| Backup/restore integration | **PASS (PR #17 CI)** | passed in CI run `43493434771`; re-runs on branch push |
-| CI matrix (3.10–3.14) | **PASS (PR #17 CI) / PENDING BRANCH** | passed on PR #17 (`43493434771`); re-running for `arena/8aa8f7e9-austro-ai` |
+| Secret scan (TruffleHog) | **PASS (arena branch CI)** | passed in run `43531570063` |
+| Backup/restore integration | **PASS (arena branch CI)** | encrypted backup and disposable PostgreSQL 16 restore passed in run `43531570063` |
+| CI matrix (3.10–3.14) | **PASS (arena branch)** | GitHub Actions run `43531570063`, head `bc8724419b865d92589377f2e5e70987acdb682b`; all 9 jobs passed, including matrix, PostgreSQL, backup/restore, dependency, security, secret scan, staging and performance gates |
 | PR review/merge | **NOT DONE** | PR not yet merged into `main` |
 
 ## 3. Configuration requirements for production
@@ -96,8 +98,8 @@ Additional operational requirements:
 
 ## 5. Required actions before production
 
-1. Push `release/post-merge-audit`, open a PR, and get all GitHub CI jobs green (test matrix, PostgreSQL, backup/restore, dependency audit, performance, security, secret scan, staging compose/images).
-2. Review and merge the PR through the repository's normal review process. **This audit does not merge it.**
+1. Review the replacement PR from `arena/8aa8f7e9-austro-ai` to `main`; its current head has a green 9/9 CI run (`43531570063`). Re-run/confirm required checks on the exact PR head after creation.
+2. Obtain explicit approval and merge through the repository's normal review process. **This audit does not merge it.**
 3. Run the staging runtime drill with real staging credentials:
    `python scripts/staging_validate.py --env-file .env.staging --execute`
    and confirm cold start, migrations, healthcheck, DB identity, storage marker, restart.
@@ -133,4 +135,4 @@ Do not deploy if any of the following is true:
 
 No production database, data, infrastructure, secret, or deployment was touched. No PR was merged, and nothing was pushed to `main`. The staging stack was not started; only compose validation and image builds were performed.
 
-**Next action:** push the audit branch, open the PR, wait for CI, then execute the staging runtime and live E2E gates above before any production decision.
+**Next action:** review the replacement PR on `arena/8aa8f7e9-austro-ai`, confirm CI on its exact head, then execute the staging runtime and live E2E gates above before any production decision.
