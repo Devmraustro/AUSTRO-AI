@@ -485,6 +485,18 @@ class AdaptiveLearningEngine:
              if r.get("review_id") == review_id), None)
         if item is None:
             return None
+        if str(item.get("last_reviewed") or "") == self._today():
+            # The same Telegram callback can be delivered twice (a double tap,
+            # or a poll offset that was not confirmed before a restart). The
+            # first delivery stamped `last_reviewed` with today's date, so
+            # applying this result again would add a second mastery evidence
+            # point and a second review count for one answer. Return the
+            # stored item unchanged instead: grading is idempotent per day.
+            logger.info(
+                "Ignoring replayed review grading for review %s (already done today)",
+                review_id,
+            )
+            return dict(item)
         objective_id = int(item["objective_id"])
         updated = self.scheduler_.schedule(
             item, correct, on=self._date(),

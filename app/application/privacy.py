@@ -18,7 +18,9 @@ The rules this service enforces:
    is untouched and the user is told so.
 2. **Deletion is verified, not assumed.** ``delete_account`` re-reads the counts
    afterwards and reports ``verified`` only when no owned row remains. A caller
-   must never claim "your data is gone" without that read.
+   must never claim "your data is gone" without that read; if the verification
+   read itself fails, the result says so instead of treating the error as an
+   empty account.
 3. **Export is JSON-safe.** Rows can contain ``datetime``, ``Decimal`` and
    ``bytes``; the snapshot is normalised so it can be written to a file and sent
    to the user without a serializer crash.
@@ -92,7 +94,9 @@ class DeletionResult:
     files_removed: int
     files_failed: int
     verified: bool
-    residual: Dict[str, int]
+    #: ``None`` means the post-delete verification read failed, so the
+    #: outcome is unknown; ``{}`` means it succeeded and found nothing.
+    residual: Optional[Dict[str, int]]
 
     @property
     def total_rows(self) -> int:
@@ -168,9 +172,17 @@ class PrivacyService:
         commit, and every file failure is counted instead of raised so a stale
         file never hides a successful database erasure.
         """
-        storage_keys: List[str] = []
+        storage_keys: Optional[List[str]] = []
         if self._storage is not None:
             storage_keys = self._db.privacy.storage_keys(user_id)
+            if storage_keys is None:
+                # The file keys live in rows that the transaction is about to
+                # delete. Without them the files can never be located again, so
+                # abort before deleting anything rather than leak orphan files.
+                logger.error(
+                    "Could not read storage keys for %s; erasure aborted", user_id
+                )
+                return None
 
         deleted = self._db.privacy.delete_all(user_id)
         if deleted is None:
@@ -191,16 +203,30 @@ class PrivacyService:
 
         # Verify from the database, never from the delete return codes.
         residual_counts = self._db.privacy.counts(user_id)
-        residual = {name: count for name, count in residual_counts.items() if count}
-        verified = not residual
-
-        if not verified:
-            # A row survived: either a table is missing from the erasure lists
-            # (a bug worth logging loudly) or a concurrent writer re-created
-            # data. Never report a clean deletion in that case.
+        if residual_counts is None:
+            # The erasure committed, but the check that proves it did not run.
+            # Report "unverified", never "empty": an unreadable database and a
+            # clean deletion are different facts.
+            residual = None
+            verified = False
             logger.error(
-                "Account deletion for %s left residual rows: %s", user_id, residual
+                "Account deletion for %s could not be verified: counts read failed",
+                user_id,
             )
+        else:
+            residual = {
+                name: count for name, count in residual_counts.items() if count
+            }
+            verified = not residual
+            if not verified:
+                # A row survived: either a table is missing from the erasure
+                # lists (a bug worth logging loudly) or a concurrent writer
+                # re-created data. Never report a clean deletion in that case.
+                logger.error(
+                    "Account deletion for %s left residual rows: %s",
+                    user_id,
+                    residual,
+                )
 
         return DeletionResult(
             deleted=deleted,
@@ -210,9 +236,10 @@ class PrivacyService:
             residual=residual,
         )
 
-    def summary(self, user_id: int) -> Dict[str, int]:
-        """Current per-table row counts (used to explain what will be erased)."""
+    def summary(self, user_id: int) -> Optional[Dict[str, int]]:
+        """Current per-table row counts, or ``None`` when they cannot be read."""
         return self._db.privacy.counts(user_id)
 
     def has_any_data(self, user_id: int) -> bool:
-        return any(self.summary(user_id).values())
+        summary = self.summary(user_id)
+        return bool(summary) and any(summary.values())

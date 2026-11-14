@@ -51,10 +51,7 @@ class _MemoryBase:
         PostgreSQL one failed statement poisons the session (``25P02``).
         Called while ``self._manager._lock`` is held.
         """
-        try:
-            self._manager._get_connection().rollback()
-        except Exception:  # noqa: BLE001 - never mask the original error
-            pass
+        self._manager._rollback_connection()
 
     @staticmethod
     def _now() -> str:
