@@ -38,8 +38,8 @@ It is still **not production-ready** for these reasons:
 | Staging runtime drill | **NOT RUN** | requires a running staging stack and credentials |
 | Telegram live E2E | **BLOCKED** | no credentials/safe chat |
 | OpenRouter live eval | **BLOCKED** | no API key; local fallback only |
-| Secret scan (TruffleHog) | **PASS (main push CI)** | passed in run `43531570063` |
-| Backup/restore integration | **PASS (main push CI)** | encrypted backup and disposable PostgreSQL 16 restore passed in run `43531570063` |
+| Secret scan (TruffleHog) | **PASS (PR candidate CI)** | passed in run `43531570063` on the audit candidate branch; this is not part of the post-merge push run |
+| Backup/restore integration | **PASS (main push CI)** | encrypted backup and disposable PostgreSQL 16 restore passed in post-merge push run `43599696751` |
 | CI matrix + post-merge gates (3.10–3.14) | **PASS (main)** | Push-triggered GitHub Actions run `43599696751` on `85e9a53a04c7205b29c64722d3796ac322d9d6cb`; all 9 jobs passed, including matrix, dependency audit, performance, staging compose/images, and encrypted PostgreSQL 16 backup/restore |
 | PR #18 review/merge | **COMPLETE** | PR #18 merged; merge commit and `main` ref both equal `85e9a53a04c7205b29c64722d3796ac322d9d6cb` |
 | Follow-up regression-test improvement | **PENDING** | Direct repository-path test for nullable legacy counters and documentation reconciliation are planned for a separate PR |
