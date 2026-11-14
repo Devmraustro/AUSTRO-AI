@@ -1,21 +1,21 @@
 # AUSTRO AI — Production Readiness
 
 - **Date:** 2026-11-14
-- **Audited base:** `63ae400b2a4f4310f944bb8f6b9f32f89fe53753` (PR #16)
-- **Audit branch:** `arena/8aa8f7e9-austro-ai`
-- **Verified branch head:** `bc8724419b865d92589377f2e5e70987acdb682b`
-- **GitHub Actions:** [Run 43531570063](https://github.com/Devmraustro/AUSTRO-AI/actions/runs/43531570063) — 9/9 jobs passed
+- **Current audited branch:** `main`
+- **Current main SHA:** `85e9a53a04c7205b29c64722d3796ac322d9d6cb` (PR #18 merge commit)
+- **Post-merge GitHub Actions:** [Run 43599696751](https://github.com/Devmraustro/AUSTRO-AI/actions/runs/43599696751) — 9/9 jobs passed (`push` event)
+- **Earlier audit candidate:** `arena/8aa8f7e9-austro-ai` (historical; its PR #18 is now merged)
 - **Verdict:** **NOT READY — NO-GO**
 - **Production deployment performed:** **NO**
 - **Production data/infrastructure/secrets changed:** **NO**
 
 ## 1. Verdict summary
 
-The merged code is materially healthier after this audit: four High and four Medium defects were found and fixed, plus follow-up `_rollback_connection()` and `COALESCE` hardening on `arena/8aa8f7e9-austro-ai`, with 20 new regression tests (1100 passed, 143 skipped, 0 failed on Linux). The PostgreSQL suite, privacy/erasure tests, learning tests, security tests, performance benchmarks, lint, compile, SAST, and dependency audit pass.
+The post-merge `main` includes the privacy, retention, PostgreSQL recovery, and learning hardening from PR #18. Its push-triggered CI run `43599696751` completed successfully with all 9/9 jobs passing, including the Python 3.10–3.14 matrix, dependency audit, performance tests, staging image/compose checks, and encrypted PostgreSQL 16 backup/restore. The earlier audit branch reported 1100 passed, 143 skipped, and 0 failed locally; that local result is historical evidence, not a fresh run on the current main SHA.
 
 It is still **not production-ready** for these reasons:
 
-1. The fixes remain unmerged. PR #17 is the earlier, incomplete review branch; the proposed replacement PR will use `arena/8aa8f7e9-austro-ai`, which includes the follow-up rollback and COALESCE hardening.
+1. The PR #18 fixes are merged. A follow-up test-quality/documentation PR is still pending: the nullable-counter regression should exercise `LearningProgressRepository.record()` directly against a legacy-compatible nullable table, rather than a hand-written SQL copy.
 2. Live Telegram end-to-end behavior was not exercised (no valid bot token or safe chat).
 3. Live OpenRouter behavior was not exercised (no real API key).
 4. The staging runtime drill (`staging_validate.py --execute`) was not run; only compose resolution, static isolation, image builds, and guard checks were performed.
@@ -43,8 +43,9 @@ It is still **not production-ready** for these reasons:
 | OpenRouter live eval | **BLOCKED** | no API key; local fallback only |
 | Secret scan (TruffleHog) | **PASS (arena branch CI)** | passed in run `43531570063` |
 | Backup/restore integration | **PASS (arena branch CI)** | encrypted backup and disposable PostgreSQL 16 restore passed in run `43531570063` |
-| CI matrix (3.10–3.14) | **PASS (arena branch)** | GitHub Actions run `43531570063`, head `bc8724419b865d92589377f2e5e70987acdb682b`; all 9 jobs passed, including matrix, PostgreSQL, backup/restore, dependency, security, secret scan, staging and performance gates |
-| PR review/merge | **NOT DONE** | PR not yet merged into `main` |
+| CI matrix + post-merge gates (3.10–3.14) | **PASS (main)** | Push-triggered GitHub Actions run `43599696751` on `85e9a53a04c7205b29c64722d3796ac322d9d6cb`; all 9 jobs passed, including matrix, dependency audit, performance, staging compose/images, and encrypted PostgreSQL 16 backup/restore |
+| PR #18 review/merge | **COMPLETE** | PR #18 merged; merge commit and `main` ref both equal `85e9a53a04c7205b29c64722d3796ac322d9d6cb` |
+| Follow-up regression-test improvement | **PENDING** | Direct repository-path test for nullable legacy counters and documentation reconciliation are planned for a separate PR |
 
 ## 3. Configuration requirements for production
 
@@ -98,8 +99,7 @@ Additional operational requirements:
 
 ## 5. Required actions before production
 
-1. Review the replacement PR from `arena/8aa8f7e9-austro-ai` to `main`; its current head has a green 9/9 CI run (`43531570063`). Re-run/confirm required checks on the exact PR head after creation.
-2. Obtain explicit approval and merge through the repository's normal review process. **This audit does not merge it.**
+1. Review the follow-up PR that updates these readiness records and strengthens the nullable-counter regression test; require green checks on its exact head before considering merge.
 3. Run the staging runtime drill with real staging credentials:
    `python scripts/staging_validate.py --env-file .env.staging --execute`
    and confirm cold start, migrations, healthcheck, DB identity, storage marker, restart.
@@ -133,6 +133,6 @@ Do not deploy if any of the following is true:
 
 **Production deployment: NO.**
 
-No production database, data, infrastructure, secret, or deployment was touched. No PR was merged, and nothing was pushed to `main`. The staging stack was not started; only compose validation and image builds were performed.
+No production database, data, infrastructure, secret, or deployment was touched. PR #18 was merged to `main`; this audit did not deploy production. The post-merge CI staging job built/validated the staging stack and images, but did not start a hosted staging runtime.
 
-**Next action:** review the replacement PR on `arena/8aa8f7e9-austro-ai`, confirm CI on its exact head, then execute the staging runtime and live E2E gates above before any production decision.
+**Next action:** complete the follow-up documentation/test-quality PR, then execute the staging runtime and live E2E gates above before any production decision.
