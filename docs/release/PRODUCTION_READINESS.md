@@ -16,7 +16,10 @@ The post-merge `main` includes the privacy, retention, PostgreSQL recovery, and 
 It is still **not production-ready** for these reasons:
 
 1. The PR #18 fixes are merged. A follow-up test-quality/documentation PR is still pending: the nullable-counter regression should exercise `LearningProgressRepository.record()` directly against a legacy-compatible nullable table, rather than a hand-written SQL copy.
-2. Live Telegram end-to-end behavior was not exercised (no valid bot token or safe chat).\n2. Live OpenRouter behavior was not exercised (no real API key).\n3. The staging runtime drill (`staging_validate.py --execute`) was not run; only compose resolution, static isolation, image builds, and guard checks were performed.\n4. Production validation does not force PostgreSQL; a deploy must explicitly set `DB_ENGINE=postgresql` or the app will use SQLite.
+2. Live Telegram end-to-end behavior was not exercised (no valid bot token or safe chat).
+2. Live OpenRouter behavior was not exercised (no real API key).
+3. The staging runtime drill (`staging_validate.py --execute`) was not run; only compose resolution, static isolation, image builds, and guard checks were performed.
+4. Production validation does not force PostgreSQL; a deploy must explicitly set `DB_ENGINE=postgresql` or the app will use SQLite.
 
 ## 2. Readiness gates
 
@@ -101,7 +104,11 @@ Additional operational requirements:
    `python scripts/staging_validate.py --env-file .env.staging --execute`
    and confirm cold start, migrations, healthcheck, DB identity, storage marker, restart.
 4. Execute the live Telegram E2E procedure from `TELEGRAM_E2E_PROCEDURE.md` with a dedicated staging bot and test chat: `/start`, a goal flow, `/export`, `/delete` cancel/confirm, source deletion, reminder delivery.
-5. Run at least one live OpenRouter generation and one provider-error/rate-limit check with a real key; confirm no secret is logged and telemetry records only metadata.\n5. Run the encrypted backup and disposable restore drill against staging (or rely on the CI job with evidence attached to the release).\n6. Set `DB_ENGINE=postgresql` explicitly and verify `DB_SSLMODE=verify-full` with the production CA bundle.\n7. Prepare the rollback image/tag and confirm the healthcheck against the previous release.\n8. Attach the CI run URL, staging drill output, and E2E evidence to the release record.
+5. Run at least one live OpenRouter generation and one provider-error/rate-limit check with a real key; confirm no secret is logged and telemetry records only metadata.
+5. Run the encrypted backup and disposable restore drill against staging (or rely on the CI job with evidence attached to the release).
+6. Set `DB_ENGINE=postgresql` explicitly and verify `DB_SSLMODE=verify-full` with the production CA bundle.
+7. Prepare the rollback image/tag and confirm the healthcheck against the previous release.
+8. Attach the CI run URL, staging drill output, and E2E evidence to the release record.
 
 ## 6. Stop conditions
 
