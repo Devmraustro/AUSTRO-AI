@@ -1,25 +1,25 @@
 # AUSTRO AI — Production Readiness
 
 - **Date:** 2026-11-14
-- **Audited base:** `63ae400b2a4f4310f944bb8f6b9f32f89fe53753` (PR #16)
-- **Audit branch:** `arena/8aa8f7e9-austro-ai`
-- **Verified branch head:** `bc8724419b865d92589377f2e5e70987acdb682b`
-- **GitHub Actions:** [Run 43531570063](https://github.com/Devmraustro/AUSTRO-AI/actions/runs/43531570063) — 9/9 jobs passed
+- **Current audited branch:** `main`
+- **Current main SHA:** `85e9a53a04c7205b29c64722d3796ac322d9d6cb` (PR #18 merge commit)
+- **Post-merge GitHub Actions:** [Run 43599696751](https://github.com/Devmraustro/AUSTRO-AI/actions/runs/43599696751) — 9/9 jobs passed (`push` event)
+- **Earlier audit candidate:** `arena/8aa8f7e9-austro-ai` (historical; its PR #18 is now merged)
 - **Verdict:** **NOT READY — NO-GO**
 - **Production deployment performed:** **NO**
 - **Production data/infrastructure/secrets changed:** **NO**
 
 ## 1. Verdict summary
 
-The merged code is materially healthier after this audit: four High and four Medium defects were found and fixed, plus follow-up `_rollback_connection()` and `COALESCE` hardening on `arena/8aa8f7e9-austro-ai`, with 20 new regression tests (1100 passed, 143 skipped, 0 failed on Linux). The PostgreSQL suite, privacy/erasure tests, learning tests, security tests, performance benchmarks, lint, compile, SAST, and dependency audit pass.
+The post-merge `main` includes the privacy, retention, PostgreSQL recovery, and learning hardening from PR #18. Its push-triggered CI run `43599696751` completed successfully with all 9/9 jobs passing, including the Python 3.10–3.14 matrix, dependency audit, performance tests, staging image/compose checks, and encrypted PostgreSQL 16 backup/restore. The earlier audit branch reported 1100 passed, 143 skipped, and 0 failed locally; that local result is historical evidence, not a fresh run on the current main SHA.
 
 It is still **not production-ready** for these reasons:
 
-1. The fixes remain unmerged. PR #17 is the earlier, incomplete review branch; the proposed replacement PR will use `arena/8aa8f7e9-austro-ai`, which includes the follow-up rollback and COALESCE hardening.
-2. Live Telegram end-to-end behavior was not exercised (no valid bot token or safe chat).
-3. Live OpenRouter behavior was not exercised (no real API key).
-4. The staging runtime drill (`staging_validate.py --execute`) was not run; only compose resolution, static isolation, image builds, and guard checks were performed.
-5. Production validation does not force PostgreSQL; a deploy must explicitly set `DB_ENGINE=postgresql` or the app will use SQLite.
+1. Live Telegram end-to-end behavior was not exercised (no valid staging bot token or safe test chat).
+2. Live OpenRouter behavior was not exercised (no real staging API key).
+3. The staging runtime drill (`staging_validate.py --execute`) was not run; only compose resolution, static isolation, and image builds were verified in CI.
+4. Production validation does not force PostgreSQL; a deploy must explicitly set `DB_ENGINE=postgresql` or the app will use SQLite.
+5. The nullable-counter regression is now exercised through `LearningProgressRepository.record()` against a legacy-compatible nullable schema; the exact-head PR CI passed. This code-level regression does not replace the live staging, OpenRouter, and Telegram release gates below.
 
 ## 2. Readiness gates
 
@@ -41,10 +41,11 @@ It is still **not production-ready** for these reasons:
 | Staging runtime drill | **NOT RUN** | requires a running staging stack and credentials |
 | Telegram live E2E | **BLOCKED** | no credentials/safe chat |
 | OpenRouter live eval | **BLOCKED** | no API key; local fallback only |
-| Secret scan (TruffleHog) | **PASS (arena branch CI)** | passed in run `43531570063` |
-| Backup/restore integration | **PASS (arena branch CI)** | encrypted backup and disposable PostgreSQL 16 restore passed in run `43531570063` |
-| CI matrix (3.10–3.14) | **PASS (arena branch)** | GitHub Actions run `43531570063`, head `bc8724419b865d92589377f2e5e70987acdb682b`; all 9 jobs passed, including matrix, PostgreSQL, backup/restore, dependency, security, secret scan, staging and performance gates |
-| PR review/merge | **NOT DONE** | PR not yet merged into `main` |
+| Secret scan (TruffleHog) | **PASS (PR candidate CI)** | passed in run `43531570063` on the audit candidate branch; this is not part of the post-merge push run |
+| Backup/restore integration | **PASS (main push CI)** | encrypted backup and disposable PostgreSQL 16 restore passed in post-merge push run `43599696751` |
+| CI matrix + post-merge gates (3.10–3.14) | **PASS (main)** | Push-triggered GitHub Actions run `43599696751` on `85e9a53a04c7205b29c64722d3796ac322d9d6cb`; all 9 jobs passed, including matrix, dependency audit, performance, staging compose/images, and encrypted PostgreSQL 16 backup/restore |
+| PR #18 review/merge | **COMPLETE** | PR #18 merged; merge commit and `main` ref both equal `85e9a53a04c7205b29c64722d3796ac322d9d6cb` |
+| Nullable-counter repository regression | **PASS (PR CI)** | The test invokes `LearningProgressRepository.record()` against a legacy-compatible nullable SQLite schema; exact-head CI run `43601276918` passed |
 
 ## 3. Configuration requirements for production
 
@@ -98,17 +99,15 @@ Additional operational requirements:
 
 ## 5. Required actions before production
 
-1. Review the replacement PR from `arena/8aa8f7e9-austro-ai` to `main`; its current head has a green 9/9 CI run (`43531570063`). Re-run/confirm required checks on the exact PR head after creation.
-2. Obtain explicit approval and merge through the repository's normal review process. **This audit does not merge it.**
-3. Run the staging runtime drill with real staging credentials:
+1. Run the staging runtime drill with real staging credentials:
    `python scripts/staging_validate.py --env-file .env.staging --execute`
    and confirm cold start, migrations, healthcheck, DB identity, storage marker, restart.
-4. Execute the live Telegram E2E procedure from `TELEGRAM_E2E_PROCEDURE.md` with a dedicated staging bot and test chat: `/start`, a goal flow, `/export`, `/delete` cancel/confirm, source deletion, reminder delivery.
-5. Run at least one live OpenRouter generation and one provider-error/rate-limit check with a real key; confirm no secret is logged and telemetry records only metadata.
-6. Run the encrypted backup and disposable restore drill against staging (or rely on the CI job with evidence attached to the release).
-7. Set `DB_ENGINE=postgresql` explicitly and verify `DB_SSLMODE=verify-full` with the production CA bundle.
-8. Prepare the rollback image/tag and confirm the healthcheck against the previous release.
-9. Attach the CI run URL, staging drill output, and E2E evidence to the release record.
+2. Execute the live Telegram E2E procedure from `TELEGRAM_E2E_PROCEDURE.md` with a dedicated staging bot and test chat: `/start`, a goal flow, `/export`, `/delete` cancel/confirm, source deletion, reminder delivery.
+3. Run at least one live OpenRouter generation and one provider-error/rate-limit check with a real key; confirm no secret is logged and telemetry records only metadata.
+4. Run the encrypted backup and disposable restore drill against staging (or rely on the CI job with evidence attached to the release).
+5. Set `DB_ENGINE=postgresql` explicitly and verify `DB_SSLMODE=verify-full` with the production CA bundle.
+6. Prepare the rollback image/tag and confirm the healthcheck against the previous release.
+7. Attach the CI run URL, staging drill output, and E2E evidence to the release record.
 
 ## 6. Stop conditions
 
@@ -133,6 +132,6 @@ Do not deploy if any of the following is true:
 
 **Production deployment: NO.**
 
-No production database, data, infrastructure, secret, or deployment was touched. No PR was merged, and nothing was pushed to `main`. The staging stack was not started; only compose validation and image builds were performed.
+No production database, data, infrastructure, secret, or deployment was touched. PR #18 was merged to `main`; this audit did not deploy production. The post-merge CI staging job built/validated the staging stack and images, but did not start a hosted staging runtime.
 
-**Next action:** review the replacement PR on `arena/8aa8f7e9-austro-ai`, confirm CI on its exact head, then execute the staging runtime and live E2E gates above before any production decision.
+**Next action:** execute the hosted staging runtime drill and live OpenRouter/Telegram E2E gates above before any production decision.
