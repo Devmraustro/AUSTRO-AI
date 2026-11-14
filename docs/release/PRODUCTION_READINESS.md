@@ -19,7 +19,7 @@ It is still **not production-ready** for these reasons:
 2. Live OpenRouter behavior was not exercised (no real staging API key).
 3. The staging runtime drill (`staging_validate.py --execute`) was not run; only compose resolution, static isolation, and image builds were verified in CI.
 4. Production validation does not force PostgreSQL; a deploy must explicitly set `DB_ENGINE=postgresql` or the app will use SQLite.
-5. The nullable-counter repository regression and documentation reconciliation are under review in PR #19; they are not merged yet.
+5. The nullable-counter regression is now exercised through `LearningProgressRepository.record()` against a legacy-compatible nullable schema; the exact-head PR CI passed. This code-level regression does not replace the live staging, OpenRouter, and Telegram release gates below.
 
 ## 2. Readiness gates
 
@@ -45,7 +45,7 @@ It is still **not production-ready** for these reasons:
 | Backup/restore integration | **PASS (main push CI)** | encrypted backup and disposable PostgreSQL 16 restore passed in post-merge push run `43599696751` |
 | CI matrix + post-merge gates (3.10–3.14) | **PASS (main)** | Push-triggered GitHub Actions run `43599696751` on `85e9a53a04c7205b29c64722d3796ac322d9d6cb`; all 9 jobs passed, including matrix, dependency audit, performance, staging compose/images, and encrypted PostgreSQL 16 backup/restore |
 | PR #18 review/merge | **COMPLETE** | PR #18 merged; merge commit and `main` ref both equal `85e9a53a04c7205b29c64722d3796ac322d9d6cb` |
-| Follow-up regression-test improvement | **PENDING** | Direct repository-path test for nullable legacy counters and documentation reconciliation are planned for a separate PR |
+| Nullable-counter repository regression | **PASS (PR CI)** | The test invokes `LearningProgressRepository.record()` against a legacy-compatible nullable SQLite schema; exact-head CI run `43601276918` passed |
 
 ## 3. Configuration requirements for production
 
@@ -99,16 +99,15 @@ Additional operational requirements:
 
 ## 5. Required actions before production
 
-1. Review PR #19 and require green checks on its exact head before considering merge.
-2. Run the staging runtime drill with real staging credentials:
+1. Run the staging runtime drill with real staging credentials:
    `python scripts/staging_validate.py --env-file .env.staging --execute`
    and confirm cold start, migrations, healthcheck, DB identity, storage marker, restart.
-3. Execute the live Telegram E2E procedure from `TELEGRAM_E2E_PROCEDURE.md` with a dedicated staging bot and test chat: `/start`, a goal flow, `/export`, `/delete` cancel/confirm, source deletion, reminder delivery.
-4. Run at least one live OpenRouter generation and one provider-error/rate-limit check with a real key; confirm no secret is logged and telemetry records only metadata.
-5. Run the encrypted backup and disposable restore drill against staging (or rely on the CI job with evidence attached to the release).
-6. Set `DB_ENGINE=postgresql` explicitly and verify `DB_SSLMODE=verify-full` with the production CA bundle.
-7. Prepare the rollback image/tag and confirm the healthcheck against the previous release.
-8. Attach the CI run URL, staging drill output, and E2E evidence to the release record.
+2. Execute the live Telegram E2E procedure from `TELEGRAM_E2E_PROCEDURE.md` with a dedicated staging bot and test chat: `/start`, a goal flow, `/export`, `/delete` cancel/confirm, source deletion, reminder delivery.
+3. Run at least one live OpenRouter generation and one provider-error/rate-limit check with a real key; confirm no secret is logged and telemetry records only metadata.
+4. Run the encrypted backup and disposable restore drill against staging (or rely on the CI job with evidence attached to the release).
+5. Set `DB_ENGINE=postgresql` explicitly and verify `DB_SSLMODE=verify-full` with the production CA bundle.
+6. Prepare the rollback image/tag and confirm the healthcheck against the previous release.
+7. Attach the CI run URL, staging drill output, and E2E evidence to the release record.
 
 ## 6. Stop conditions
 
@@ -135,4 +134,4 @@ Do not deploy if any of the following is true:
 
 No production database, data, infrastructure, secret, or deployment was touched. PR #18 was merged to `main`; this audit did not deploy production. The post-merge CI staging job built/validated the staging stack and images, but did not start a hosted staging runtime.
 
-**Next action:** complete the follow-up documentation/test-quality PR, then execute the staging runtime and live E2E gates above before any production decision.
+**Next action:** execute the hosted staging runtime drill and live OpenRouter/Telegram E2E gates above before any production decision.
