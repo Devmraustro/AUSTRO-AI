@@ -1,8 +1,10 @@
 # AUSTRO AI — External Dependencies and Verification Status
 
-- **Date:** 2026-11-13
+- **Date:** 2026-11-14
 - **Audited base:** `63ae400b2a4f4310f944bb8f6b9f32f89fe53753`
-- **Audit branch:** `release/post-merge-audit`
+- **Verified branch:** `arena/8aa8f7e9-austro-ai`
+- **Verified head:** `bc8724419b865d92589377f2e5e70987acdb682b`
+- **GitHub Actions:** [Run 43531570063](https://github.com/Devmraustro/AUSTRO-AI/actions/runs/43531570063) — 9/9 jobs passed
 - **Production deployment:** **NO**
 
 This document separates what was **locally verified** from what is **awaiting credentials**, **partial**, **missing**, or **blocked by infrastructure**. No external result is presented as passing when it did not run.
@@ -18,10 +20,10 @@ This document separates what was **locally verified** from what is **awaiting cr
 | Docker Engine | Image build and staging checks | **Locally verified (build)** | Docker 29.9.2; staging app image built; compose resolves |
 | Hosted staging environment | Runtime cold start/health/restart | **Blocked by infrastructure** | No staging host; only local static + build checks |
 | `pip-audit` advisory database | Dependency vulnerabilities | **Locally verified** | 33 packages, no known vulnerabilities, exit 0 |
-| TruffleHog | Secret scanning | **Passed in PR #17 CI / missing locally** | Binary not installed locally; passed in CI run `43493434771` (`release/post-merge-audit`) and re-runs on push |
-| Encrypted backup + restore | Disaster recovery | **Passed in PR #17 CI / not locally run** | Passed in CI run `43493434771` (PG 16 service); re-runs on push |
-| GitHub Actions CI | Full matrix and gates | **Passed on PR #17 / pending push on this branch** | PR #17 run `43493434771` green across all 9 jobs; re-running on `arena/8aa8f7e9-austro-ai` push |
-| GitHub CLI authentication | PR creation/monitoring | **Blocked (invalid gh token)** | `gh auth status` reports invalid keyring token; git remote access still works |
+| TruffleHog | Secret scanning | **Passed in arena branch CI / missing locally** | Binary not installed locally; passed in GitHub Actions run `43531570063` on `arena/8aa8f7e9-austro-ai` (`bc872441...`) |
+| Encrypted backup + restore | Disaster recovery | **Passed in arena branch CI / not locally run** | Passed in GitHub Actions run `43531570063` using the PostgreSQL 16 service |
+| GitHub Actions CI | Full matrix and gates | **PASS on arena branch** | Run `43531570063` on SHA `bc8724419b865d92589377f2e5e70987acdb682b`; all 9 jobs completed successfully, including Python 3.10–3.14, PostgreSQL 16, encrypted backup/restore, dependency audit, performance, security, secret scan and staging stack |
+| GitHub PR API | PR creation/monitoring | **Verified through GitHub integration** | Replacement PR creation and review are performed through the authenticated GitHub integration; local GitHub CLI status is not a release gate |
 
 ## 2. OpenRouter
 
@@ -77,9 +79,9 @@ This document separates what was **locally verified** from what is **awaiting cr
 ## 8. GitHub / CI
 
 - **Configured:** `.github/workflows/ci.yml` has jobs for the 3.10–3.14 test matrix, PostgreSQL integration, encrypted backup/restore, dependency audit, performance, security tests, secret scan, and staging compose/image validation.
-- **Status:** PR #17 (`release/post-merge-audit`) completed CI run `43493434771` with all 9 jobs passing (`test (3.10..3.14)`, `Staging stack (compose + images)`, `Encrypted backup and disposable restore (PostgreSQL 16)`, `dependency-audit`, `performance-tests`). Branch `arena/8aa8f7e9-austro-ai` carries those fixes forward with follow-up `_rollback_connection()` and `COALESCE` hardening and awaits its own CI run on push.
-- **Blocking level:** merge blocker until CI is green on the target branch; production blocker until the release record includes the final merged CI URL.
-- **Required to close:** push `arena/8aa8f7e9-austro-ai`, verify the CI run is green, and record the CI run URL and SHA.
+- **Status:** Branch `arena/8aa8f7e9-austro-ai` completed GitHub Actions run `43531570063` on SHA `bc8724419b865d92589377f2e5e70987acdb682b`; all 9 jobs passed. This run includes the follow-up `_rollback_connection()` and `COALESCE` hardening. The earlier PR #17 run `43493434771` is historical evidence for the older `release/post-merge-audit` head, not the current candidate.
+- **Blocking level:** CI is green on the candidate branch; PR-specific required checks must still be confirmed against the exact head after replacement PR creation. Production remains blocked by live credentials and staging runtime verification.
+- **Required to close:** create/review the replacement PR from this branch and confirm its checks on the exact PR head.
 
 ## 9. Things intentionally not attempted
 
@@ -95,7 +97,7 @@ This document separates what was **locally verified** from what is **awaiting cr
 2. A dedicated staging `BOT_TOKEN` and a safe test chat ID.
 3. A staging PostgreSQL 16 endpoint with TLS and disposable restore target.
 4. A staging host (or permission to run the compose stack locally with real staging credentials).
-5. Re-authenticated GitHub CLI (or another approved way to open the PR).
-6. Approval to run the CI backup/restore job and attach its evidence.
+5. A replacement PR review and explicit merge approval.
+6. Staging credentials and host for the runtime drill; CI backup/restore evidence is already available from run `43531570063`.
 
 Until these are provided, the corresponding rows above remain **awaiting credentials**, **partial**, **missing**, or **blocked by infrastructure** — never “passed”.
