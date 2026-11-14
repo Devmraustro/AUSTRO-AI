@@ -23,7 +23,7 @@ This document separates what was **locally verified** from what is **awaiting cr
 | TruffleHog | Secret scanning | **Passed in PR candidate CI / missing locally** | Binary not installed locally; passed in GitHub Actions run `43531570063` on the earlier audit candidate branch (`bc872441...`); the post-merge push run did not include this job |
 | Encrypted backup + restore | Disaster recovery | **Passed in main push CI / not locally run** | Passed in post-merge GitHub Actions run `43599696751` using the PostgreSQL 16 service |
 | GitHub Actions CI | Full matrix and post-merge gates | **PASS on main** | Push run `43599696751` on SHA `85e9a53a04c7205b29c64722d3796ac322d9d6cb`; all 9 jobs completed successfully, including Python 3.10–3.14, dependency audit, performance, staging compose/images, and encrypted PostgreSQL 16 backup/restore |
-| GitHub PR state | PR #18 | **Merged** | PR #18 is closed/merged; `main` points to its merge commit. A separate follow-up PR is planned for documentation and test-quality improvements |
+| GitHub PR state | PR #18 | **Merged** | PR #18 is closed/merged; `main` points to its merge commit |
 
 ## 2. OpenRouter
 
@@ -81,7 +81,7 @@ This document separates what was **locally verified** from what is **awaiting cr
 - **Configured:** `.github/workflows/ci.yml` has jobs for the 3.10–3.14 test matrix, PostgreSQL integration, encrypted backup/restore, dependency audit, performance, security tests, secret scan, and staging compose/image validation.
 - **Status:** `main` completed push-triggered run `43599696751` on SHA `85e9a53a04c7205b29c64722d3796ac322d9d6cb`; all 9 jobs passed. This is post-merge evidence for the current main commit. The earlier candidate-branch run `43531570063` is historical evidence.
 - **Blocking level:** CI is green on `main`. Production remains blocked by live credentials and staging runtime verification.
-- **Required to close:** run the hosted staging drill and live OpenRouter/Telegram E2E gates; a separate follow-up PR will improve the nullable-counter regression test and reconcile documentation.
+- **Required to close:** run the hosted staging drill and live OpenRouter/Telegram E2E gates. The nullable-counter regression now invokes `LearningProgressRepository.record()` against a legacy-compatible nullable SQLite schema; its exact-head PR CI run passed.
 
 ## 9. Things intentionally not attempted
 
