@@ -15,11 +15,11 @@ The post-merge `main` includes the privacy, retention, PostgreSQL recovery, and 
 
 It is still **not production-ready** for these reasons:
 
-1. The PR #18 fixes are merged. A follow-up test-quality/documentation PR is still pending: the nullable-counter regression should exercise `LearningProgressRepository.record()` directly against a legacy-compatible nullable table, rather than a hand-written SQL copy.
-2. Live Telegram end-to-end behavior was not exercised (no valid bot token or safe chat).
-2. Live OpenRouter behavior was not exercised (no real API key).
-3. The staging runtime drill (`staging_validate.py --execute`) was not run; only compose resolution, static isolation, image builds, and guard checks were performed.
+1. Live Telegram end-to-end behavior was not exercised (no valid staging bot token or safe test chat).
+2. Live OpenRouter behavior was not exercised (no real staging API key).
+3. The staging runtime drill (`staging_validate.py --execute`) was not run; only compose resolution, static isolation, and image builds were verified in CI.
 4. Production validation does not force PostgreSQL; a deploy must explicitly set `DB_ENGINE=postgresql` or the app will use SQLite.
+5. The nullable-counter repository regression and documentation reconciliation are under review in PR #19; they are not merged yet.
 
 ## 2. Readiness gates
 
@@ -99,12 +99,12 @@ Additional operational requirements:
 
 ## 5. Required actions before production
 
-1. Review the follow-up PR that updates these readiness records and strengthens the nullable-counter regression test; require green checks on its exact head before considering merge.
+1. Review PR #19 and require green checks on its exact head before considering merge.
 2. Run the staging runtime drill with real staging credentials:
    `python scripts/staging_validate.py --env-file .env.staging --execute`
    and confirm cold start, migrations, healthcheck, DB identity, storage marker, restart.
-4. Execute the live Telegram E2E procedure from `TELEGRAM_E2E_PROCEDURE.md` with a dedicated staging bot and test chat: `/start`, a goal flow, `/export`, `/delete` cancel/confirm, source deletion, reminder delivery.
-5. Run at least one live OpenRouter generation and one provider-error/rate-limit check with a real key; confirm no secret is logged and telemetry records only metadata.
+3. Execute the live Telegram E2E procedure from `TELEGRAM_E2E_PROCEDURE.md` with a dedicated staging bot and test chat: `/start`, a goal flow, `/export`, `/delete` cancel/confirm, source deletion, reminder delivery.
+4. Run at least one live OpenRouter generation and one provider-error/rate-limit check with a real key; confirm no secret is logged and telemetry records only metadata.
 5. Run the encrypted backup and disposable restore drill against staging (or rely on the CI job with evidence attached to the release).
 6. Set `DB_ENGINE=postgresql` explicitly and verify `DB_SSLMODE=verify-full` with the production CA bundle.
 7. Prepare the rollback image/tag and confirm the healthcheck against the previous release.
