@@ -149,14 +149,20 @@ def test_replayed_review_grading_is_idempotent(container):
 
 
 def test_upsert_handles_null_counters_without_losing_increments(store):
-    """If an existing row has NULL counters, COALESCE prevents NULL + N."""
-    import sqlite3 as _sqlite3
+    """Exercise the real repository upsert against a legacy nullable schema.
 
-    # Prove the SQLite/PostgreSQL upsert SQL uses COALESCE on each counter by
-    # executing the exact conflict update against a nullable table schema.
-    conn = _sqlite3.connect(":memory:")
-    conn.execute(
+    Current migrations declare the counters NOT NULL, but older installations
+    may contain a compatible table where those columns are nullable. Recreate
+    that legacy shape on the fixture's own connection, then invoke the actual
+    LearningProgressRepository.record() method.
+    """
+    day = "2026-05-03"
+    conn = store._manager._get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DROP TABLE learning_progress")
+    cursor.execute(
         "CREATE TABLE learning_progress ("
+        "progress_id INTEGER PRIMARY KEY AUTOINCREMENT, "
         "owner_user_id INTEGER NOT NULL, "
         "record_date TEXT NOT NULL, "
         "study_minutes INTEGER, "
@@ -164,39 +170,38 @@ def test_upsert_handles_null_counters_without_losing_increments(store):
         "review_count INTEGER, "
         "assessment_count INTEGER, "
         "assessment_score_avg REAL, "
+        "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
         "UNIQUE (owner_user_id, record_date))"
     )
-    conn.execute(
-        "INSERT INTO learning_progress VALUES (?, ?, NULL, NULL, NULL, NULL, NULL)",
-        (OWNER, "2026-05-03"),
-    )
-    conn.execute(
+    cursor.execute(
         "INSERT INTO learning_progress "
         "(owner_user_id, record_date, study_minutes, practice_count, "
         "review_count, assessment_count, assessment_score_avg) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT (owner_user_id, record_date) DO UPDATE SET "
-        "study_minutes = COALESCE(learning_progress.study_minutes, 0) + excluded.study_minutes, "
-        "practice_count = COALESCE(learning_progress.practice_count, 0) + excluded.practice_count, "
-        "review_count = COALESCE(learning_progress.review_count, 0) + excluded.review_count, "
-        "assessment_count = COALESCE(learning_progress.assessment_count, 0) + excluded.assessment_count, "
-        "assessment_score_avg = COALESCE(excluded.assessment_score_avg, learning_progress.assessment_score_avg)",
-        (OWNER, "2026-05-03", 15, 2, 1, 0, None),
+        "VALUES (?, ?, NULL, NULL, NULL, NULL, NULL)",
+        (OWNER, day),
     )
-    row = conn.execute(
-        "SELECT study_minutes, practice_count, review_count, assessment_count, assessment_score_avg "
-        "FROM learning_progress WHERE owner_user_id = ? AND record_date = ?",
-        (OWNER, "2026-05-03"),
-    ).fetchone()
-    conn.close()
-    assert row == (15, 2, 1, 0, None)
+    conn.commit()
 
-    day = "2026-05-03"
-    assert store.progress.record(OWNER, day, study_minutes=15)
-    assert store.progress.record(OWNER, day, practice_count=3)
-    assert store.progress.record(OWNER, day, study_minutes=5, assessment_count=1, assessment_score_avg=0.0)
+    assert store.progress.record(
+        OWNER, day, study_minutes=15, practice_count=2, review_count=1
+    )
+    stored = store.progress.get(OWNER, day)
+    assert stored["study_minutes"] == 15
+    assert stored["practice_count"] == 2
+    assert stored["review_count"] == 1
+    assert stored["assessment_count"] == 0
+    assert stored["assessment_score_avg"] is None
+
+    # A subsequent assessment records a measured zero without losing earlier
+    # counters; a later non-assessment event must preserve that measured value.
+    assert store.progress.record(
+        OWNER, day, study_minutes=5, assessment_count=1,
+        assessment_score_avg=0.0,
+    )
+    assert store.progress.record(OWNER, day, review_count=1)
     stored = store.progress.get(OWNER, day)
     assert stored["study_minutes"] == 20
-    assert stored["practice_count"] == 3
+    assert stored["practice_count"] == 2
+    assert stored["review_count"] == 2
     assert stored["assessment_count"] == 1
     assert stored["assessment_score_avg"] == 0.0
